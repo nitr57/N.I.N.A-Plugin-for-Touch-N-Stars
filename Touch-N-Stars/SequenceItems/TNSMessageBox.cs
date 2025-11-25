@@ -33,18 +33,6 @@ namespace TouchNStars.SequenceItems {
             lock (templateLock) {
                 if (!templatesLoaded) {
                     try {
-                        // Load the MessageBox item template (for Sequencer UI)
-                        var itemTemplate = new ResourceDictionary {
-                            Source = new Uri("pack://application:,,,/TouchNStars;component/SequenceItems/Templates/TNSMessageBoxTemplate.xaml", UriKind.Absolute)
-                        };
-                        Application.Current?.Resources.MergedDictionaries.Add(itemTemplate);
-
-                        // Load the MessageBox result template (for Dialog window)
-                        var resultTemplate = new ResourceDictionary {
-                            Source = new Uri("pack://application:,,,/TouchNStars;component/SequenceItems/Templates/TNSMessageBoxResultTemplate.xaml", UriKind.Absolute)
-                        };
-                        Application.Current?.Resources.MergedDictionaries.Add(resultTemplate);
-
                         templatesLoaded = true;
                         Logger.Debug("TNSMessageBox templates loaded successfully");
                     } catch (Exception ex) {
