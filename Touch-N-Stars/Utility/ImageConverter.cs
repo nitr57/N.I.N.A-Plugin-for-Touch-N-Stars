@@ -32,7 +32,7 @@ namespace TouchNStars.Utility
                 // Find min/max for scaling
                 ushort minVal = pixels16.Min();
                 ushort maxVal = pixels16.Max();
-                
+
                 // Avoid division by zero
                 if (maxVal == minVal)
                 {
@@ -44,7 +44,7 @@ namespace TouchNStars.Utility
                 // Calculate target dimensions
                 int targetWidth = width;
                 int targetHeight = height;
-                
+
                 if (targetSize.HasValue && targetSize.Value > 0)
                 {
                     // Resize to target size while maintaining aspect ratio
@@ -77,21 +77,21 @@ namespace TouchNStars.Utility
                         {
                             var sourceData = sourceBitmap.LockBits(new Rectangle(0, 0, width, height),
                                 ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
-                            
+
                             try
                             {
                                 unsafe
                                 {
                                     byte* ptr = (byte*)sourceData.Scan0;
                                     int stride = sourceData.Stride;
-                                    
+
                                     for (int y = 0; y < height; y++)
                                     {
                                         for (int x = 0; x < width; x++)
                                         {
                                             int pixelIndex = y * width + x;
                                             ushort pixel16 = pixels16[pixelIndex];
-                                            
+
                                             // Scale 16-bit to 8-bit with gamma correction for better visibility
                                             double normalized = (double)(pixel16 - minVal) / (maxVal - minVal);
                                             normalized = Math.Pow(normalized, 0.5); // Gamma correction
@@ -100,7 +100,7 @@ namespace TouchNStars.Utility
                                             // Set RGB values (grayscale)
                                             byte* pixel = ptr + (y * stride) + (x * 3);
                                             pixel[0] = intensity; // Blue
-                                            pixel[1] = intensity; // Green  
+                                            pixel[1] = intensity; // Green
                                             pixel[2] = intensity; // Red
                                         }
                                     }
@@ -119,20 +119,31 @@ namespace TouchNStars.Utility
                     // Convert to JPG bytes
                     using (var stream = new MemoryStream())
                     {
-                        var jpegEncoder = ImageCodecInfo.GetImageEncoders()
-                            .FirstOrDefault(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
-                        
-                        if (jpegEncoder != null)
-                        {
-                            var encoderParams = new EncoderParameters(1);
-                            encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
-                            bitmap.Save(stream, jpegEncoder, encoderParams);
-                        }
-                        else
+                        // Try simple ImageFormat approach first
+                        try
                         {
                             bitmap.Save(stream, ImageFormat.Jpeg);
                         }
-                        
+                        catch (Exception saveEx)
+                        {
+                            Logger.Debug($"Simple ImageFormat save failed: {saveEx.Message}, trying with encoder");
+                            var jpegEncoder = ImageCodecInfo.GetImageEncoders()
+                                .FirstOrDefault(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
+
+                            if (jpegEncoder != null)
+                            {
+                                using (var encoderParams = new EncoderParameters(1))
+                                {
+                                    encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
+                                    bitmap.Save(stream, jpegEncoder, encoderParams);
+                                }
+                            }
+                            else
+                            {
+                                throw new InvalidOperationException("No JPEG encoder found on system", saveEx);
+                            }
+                        }
+
                         return stream.ToArray();
                     }
                 }

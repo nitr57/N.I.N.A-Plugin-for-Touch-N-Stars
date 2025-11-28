@@ -32,7 +32,7 @@ namespace TouchNStars.Server.Services
         public PHD2ImageService(PHD2Service phd2Service)
         {
             this.phd2Service = phd2Service;
-            
+
             // Create cache directory
             cacheDirectory = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -44,14 +44,14 @@ namespace TouchNStars.Server.Services
         public async Task<bool> RefreshImageAsync()
         {
             if (isDisposed) return false;
-            
+
             // Prevent overlapping refresh operations
-            if (isRefreshing) 
+            if (isRefreshing)
             {
                 Logger.Debug("Refresh already in progress, skipping");
                 return false;
             }
-            
+
             isRefreshing = true;
             try
             {
@@ -70,7 +70,7 @@ namespace TouchNStars.Server.Services
 
                 // Get image from PHD2
                 string fitsFilePath = await phd2Service.SaveImageAsync();
-                
+
                 if (string.IsNullOrEmpty(fitsFilePath))
                 {
                     lastError = "PHD2 returned empty file path";
@@ -87,7 +87,7 @@ namespace TouchNStars.Server.Services
 
                 // Convert FITS to JPG and cache it
                 string jpgPath = await ConvertFitsToJpgAsync(fitsFilePath);
-                
+
                 if (!string.IsNullOrEmpty(jpgPath))
                 {
                     lock (lockObject)
@@ -97,15 +97,15 @@ namespace TouchNStars.Server.Services
                         {
                             try { File.Delete(currentImagePath); } catch { }
                         }
-                        
+
                         currentImagePath = jpgPath;
                         lastImageTime = DateTime.Now;
                         lastError = null;
                     }
-                    
+
                     // Clean up the FITS file
                     try { File.Delete(fitsFilePath); } catch { }
-                    
+
                     return true;
                 }
                 else
@@ -122,7 +122,7 @@ namespace TouchNStars.Server.Services
                 {
                     lastError = ex.Message;
                 }
-                
+
                 // "no image available" is expected when PHD2 hasn't captured an image yet
                 if (ex.Message.Contains("no image available"))
                 {
@@ -157,18 +157,18 @@ namespace TouchNStars.Server.Services
                         // Use NINA's ImageDataFactory to load the FITS file
                         var imageDataFactory = TouchNStars.Mediators.ImageDataFactory;
                         IImageData imageData = await imageDataFactory.CreateFromFile(fitsFilePath, 16, false, RawConverterEnum.FREEIMAGE);
-                        
+
                         if (imageData != null)
                         {
                             // Render the image
                             IRenderedImage renderedImage = imageData.RenderImage();
-                            
+
                             // Apply basic stretching for better visibility
                             renderedImage = await renderedImage.Stretch(2.5, 0.1, false);
 
                             // Convert to bitmap and save as JPG
                             BitmapSource bitmapSource = renderedImage.Image;
-                            
+
                             // Create JPG encoder
                             JpegBitmapEncoder encoder = new JpegBitmapEncoder();
                             encoder.QualityLevel = 95;
@@ -212,13 +212,13 @@ namespace TouchNStars.Server.Services
                 }
 
                 var result = await ConvertFitsDataToJpgAsync(fitsData, jpgPath);
-                
+
                 if (string.IsNullOrEmpty(result))
                 {
                     Logger.Debug("FITS to JPG conversion failed, creating placeholder");
                     return await CreatePlaceholderImageAsync(jpgPath);
                 }
-                
+
                 return result;
             }
             catch (Exception ex)
@@ -297,7 +297,7 @@ namespace TouchNStars.Server.Services
                         int bytesPerPixel = Math.Abs(bitpix) / 8;
                         long expectedDataSize = (long)width * height * bytesPerPixel;
                         long availableData = fileStream.Length - dataStart;
-                        
+
                         if (availableData < expectedDataSize)
                         {
                             Logger.Error($"FITS file truncated. Expected {expectedDataSize} bytes but only {availableData} available");
@@ -408,34 +408,34 @@ namespace TouchNStars.Server.Services
                 foreach (string line in lines)
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
-                    
+
                     // Check if this line starts with our keyword
                     if (line.StartsWith(keyword))
                     {
                         // Look for the equals sign
                         int equalsIndex = line.IndexOf('=');
                         if (equalsIndex < 0) continue;
-                        
+
                         // Extract value part (between = and / or end of meaningful content)
                         string valuePart = line.Substring(equalsIndex + 1);
-                        
+
                         // Find comment separator or end
                         int commentIndex = valuePart.IndexOf('/');
                         if (commentIndex >= 0)
                         {
                             valuePart = valuePart.Substring(0, commentIndex);
                         }
-                        
+
                         // Clean up the value
                         string valueText = valuePart.Trim();
-                        
+
                         if (int.TryParse(valueText, out int value))
                         {
                             return value;
                         }
                     }
                 }
-                
+
                 return 0;
             }
             catch (Exception ex)
@@ -451,6 +451,17 @@ namespace TouchNStars.Server.Services
             {
                 try
                 {
+                    // Ensure jpgPath is valid and directory exists
+                    if (string.IsNullOrEmpty(jpgPath))
+                    {
+                        throw new ArgumentNullException(nameof(jpgPath), "JPG path cannot be null or empty");
+                    }
+
+                    string directory = Path.GetDirectoryName(jpgPath);
+                    if (!Directory.Exists(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
                     // Find min/max values for scaling
                     float minVal = float.MaxValue;
                     float maxVal = float.MinValue;
@@ -479,20 +490,20 @@ namespace TouchNStars.Server.Services
                     {
                         var bitmapData = bitmap.LockBits(new Rectangle(0, 0, fitsData.Width, fitsData.Height),
                             ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
-                        
+
                         try
                         {
                             unsafe
                             {
                                 byte* ptr = (byte*)bitmapData.Scan0;
                                 int stride = bitmapData.Stride;
-                                
+
                                 for (int y = 0; y < fitsData.Height; y++)
                                 {
                                     for (int x = 0; x < fitsData.Width; x++)
                                     {
                                         float value = fitsData.ImageData[x, y];
-                                        
+
                                         // Handle NaN/Infinity values
                                         if (float.IsNaN(value) || float.IsInfinity(value))
                                         {
@@ -501,18 +512,18 @@ namespace TouchNStars.Server.Services
 
                                         // Apply simple linear stretch
                                         float normalized = (value - minVal) / (maxVal - minVal);
-                                        
+
                                         // Apply gamma correction for better visibility
                                         normalized = (float)Math.Pow(normalized, 0.5);
-                                        
+
                                         byte intensity = (byte)Math.Round(255.0f * Math.Max(0, Math.Min(1, normalized)));
 
                                         // Use Y coordinate directly (no flipping needed)
                                         byte* pixel = ptr + (y * stride) + (x * 3);
-                                        
+
                                         // Set RGB values (grayscale, so all same)
                                         pixel[0] = intensity; // Blue
-                                        pixel[1] = intensity; // Green  
+                                        pixel[1] = intensity; // Green
                                         pixel[2] = intensity; // Red
                                     }
                                 }
@@ -522,20 +533,31 @@ namespace TouchNStars.Server.Services
                         {
                             bitmap.UnlockBits(bitmapData);
                         }
-                        
-                        // Save as JPG
-                        var jpegEncoder = ImageCodecInfo.GetImageEncoders()
-                            .FirstOrDefault(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
-                        
-                        if (jpegEncoder != null)
+
+                        // Save as JPG - use ImageFormat.Jpeg directly (simpler, more reliable)
+                        try
                         {
-                            var encoderParams = new EncoderParameters(1);
-                            encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
-                            bitmap.Save(jpgPath, jpegEncoder, encoderParams);
-                        }
-                        else
-                        {
+                            Logger.Debug($"Saving bitmap to {jpgPath}");
                             bitmap.Save(jpgPath, ImageFormat.Jpeg);
+                        }
+                        catch (Exception saveEx)
+                        {
+                            Logger.Error($"Direct ImageFormat save failed: {saveEx.Message}, trying with encoder");
+                            var jpegEncoder = ImageCodecInfo.GetImageEncoders()
+                                .FirstOrDefault(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
+
+                            if (jpegEncoder != null)
+                            {
+                                using (var encoderParams = new EncoderParameters(1))
+                                {
+                                    encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
+                                    bitmap.Save(jpgPath, jpegEncoder, encoderParams);
+                                }
+                            }
+                            else
+                            {
+                                throw new InvalidOperationException("No JPEG encoder found on this system", saveEx);
+                            }
                         }
                     }
 
@@ -555,13 +577,25 @@ namespace TouchNStars.Server.Services
             {
                 try
                 {
+                    // Ensure jpgPath is valid and directory exists
+                    if (string.IsNullOrEmpty(jpgPath))
+                    {
+                        throw new ArgumentNullException(nameof(jpgPath), "JPG path cannot be null or empty");
+                    }
+
+                    string directory = Path.GetDirectoryName(jpgPath);
+                    if (!Directory.Exists(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
+
                     // Create a 640x480 placeholder image
                     using (var bitmap = new Bitmap(640, 480, PixelFormat.Format24bppRgb))
                     using (var graphics = Graphics.FromImage(bitmap))
                     {
                         // Fill with dark gray background
                         graphics.Clear(Color.FromArgb(32, 32, 32));
-                        
+
                         // Add text indicating this is a placeholder
                         using (var font = new Font("Arial", 16, FontStyle.Bold))
                         using (var brush = new SolidBrush(Color.White))
@@ -570,29 +604,40 @@ namespace TouchNStars.Server.Services
                             var textBounds = graphics.MeasureString(text, font);
                             float x = (bitmap.Width - textBounds.Width) / 2;
                             float y = (bitmap.Height - textBounds.Height) / 2;
-                            
+
                             graphics.DrawString(text, font, brush, x, y);
                         }
-                        
+
                         // Draw a simple border
                         using (var pen = new Pen(Color.Gray, 2))
                         {
                             graphics.DrawRectangle(pen, 10, 10, bitmap.Width - 20, bitmap.Height - 20);
                         }
-                        
-                        // Save as JPG
-                        var jpegEncoder = ImageCodecInfo.GetImageEncoders()
-                            .FirstOrDefault(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
-                        
-                        if (jpegEncoder != null)
+
+                        // Save as JPG - use ImageFormat.Jpeg directly (simpler, more reliable)
+                        try
                         {
-                            var encoderParams = new EncoderParameters(1);
-                            encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
-                            bitmap.Save(jpgPath, jpegEncoder, encoderParams);
-                        }
-                        else
-                        {
+                            Logger.Debug($"Saving placeholder bitmap to {jpgPath}");
                             bitmap.Save(jpgPath, ImageFormat.Jpeg);
+                        }
+                        catch (Exception saveEx)
+                        {
+                            Logger.Error($"Direct ImageFormat save failed: {saveEx.Message}, trying with encoder");
+                            var jpegEncoder = ImageCodecInfo.GetImageEncoders()
+                                .FirstOrDefault(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
+
+                            if (jpegEncoder != null)
+                            {
+                                using (var encoderParams = new EncoderParameters(1))
+                                {
+                                    encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 95L);
+                                    bitmap.Save(jpgPath, jpegEncoder, encoderParams);
+                                }
+                            }
+                            else
+                            {
+                                throw new InvalidOperationException("No JPEG encoder found on this system", saveEx);
+                            }
                         }
                     }
 
@@ -611,7 +656,7 @@ namespace TouchNStars.Server.Services
         {
             // Always fetch a fresh image on demand
             await RefreshImageAsync();
-            
+
             string imagePath;
             lock (lockObject)
             {
@@ -637,24 +682,24 @@ namespace TouchNStars.Server.Services
         public void Dispose()
         {
             if (isDisposed) return;
-            
+
             isDisposed = true;
-            
+
             // Wait for any ongoing refresh to complete
             while (isRefreshing)
             {
                 Thread.Sleep(50);
             }
-            
+
             lock (lockObject)
             {
                 // Clean up cached image
                 if (!string.IsNullOrEmpty(currentImagePath) && File.Exists(currentImagePath))
                 {
-                    try 
-                    { 
-                        File.Delete(currentImagePath); 
-                    } 
+                    try
+                    {
+                        File.Delete(currentImagePath);
+                    }
                     catch { }
                 }
             }
