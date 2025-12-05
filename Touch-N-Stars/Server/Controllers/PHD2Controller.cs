@@ -163,6 +163,46 @@ public class PHD2Controller : WebApiController
     }
 
     /// <summary>
+    /// POST /api/phd2/inject-profile - Inject a PHD2 profile
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/inject-profile")]
+    public async Task<ApiResponse> InjectPHD2Profile() {
+        try {
+            EnsurePHD2ServicesInitialized();
+            
+            // Get PHD2 path from active profile settings
+            var phd2Path = TouchNStars.Mediators?.Profile?.ActiveProfile?.GuiderSettings?.PHD2Path;
+            if (string.IsNullOrEmpty(phd2Path)) {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse {
+                    Success = false,
+                    Error = "PHD2 path not configured",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            bool result = await phd2Service.InjectProfilesAsync(phd2Path);
+
+            return new ApiResponse {
+                Success = result,
+                Response = new { Injected = result },
+                StatusCode = result ? 200 : 400,
+                Type = "PHD2ProfileInjection"
+            };
+        } catch (Exception ex) {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
     /// GET /api/phd2/profiles - Get equipment profiles
     /// </summary>
     [Route(HttpVerbs.Get, "/phd2/profiles")]

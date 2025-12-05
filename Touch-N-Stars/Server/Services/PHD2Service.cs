@@ -1,5 +1,8 @@
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using NINA.Core.Utility;
 using TouchNStars.PHD2;
@@ -71,7 +74,7 @@ namespace TouchNStars.Server.Services
         {
             return await Task.Run(() =>
             {
-                const int maxRetries = 3;
+                const int maxRetries = 10;
                 int attemptCount = 0;
 
                 while (attemptCount < maxRetries)
@@ -162,6 +165,53 @@ namespace TouchNStars.Server.Services
                     Logger.Error($"Error disconnecting from PHD2: {ex}");
                 }
             });
+        }
+
+        public async Task<bool> InjectProfilesAsync(string fileName, CancellationToken ct = default) {
+            // If we are connected, we cannot inject profiles
+            if (IsConnected) {
+                return false;
+            }
+
+            // If PHD2 instance is running, we cannot inject profiles
+            try
+            {
+                // Check if PHD2 is already started with the expected instance number
+                var names = new[] { "phd2", "phd2.bin" };
+                var p = Process.GetProcesses().Where(p => names.Contains(p.ProcessName, StringComparer.OrdinalIgnoreCase)).ToArray();
+                if (p.Length > 0)
+                {
+                    NINA.Core.Utility.Logger.Error($"phd2 already running");
+                    return false;
+                }
+
+                if (!File.Exists(fileName))
+                {
+                    NINA.Core.Utility.Logger.Error($"phd2 not found at {fileName}");
+                    throw new FileNotFoundException();
+                }
+
+                var process = new Process
+                {
+                    StartInfo = {
+                        FileName = fileName,
+                        Arguments = $"-l={Path.Combine(CoreUtil.APPLICATIONTEMPPATH, "phd2", "profiles.phd")}"
+                    }
+                };
+
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+                process?.Start();
+                await process.WaitForExitAsync(linkedCts.Token);
+
+                return process.ExitCode == 0;
+            }
+            catch(Exception ex)
+            {
+                NINA.Core.Utility.Logger.Error($"phd2 error {ex.Message}");
+                return false;
+            }
         }
 
         public async Task<bool> StartGuidingAsync(double settlePixels = 2.0, double settleTime = 10.0, double settleTimeout = 100.0)
