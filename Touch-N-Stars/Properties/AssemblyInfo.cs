@@ -6,8 +6,8 @@ using System.Runtime.InteropServices;
 
 // [MANDATORY] The assembly versioning
 //Should be incremented for each new release build of a plugin
-[assembly: AssemblyVersion("1.2.1.1")]
-[assembly: AssemblyFileVersion("1.2.1.1")]
+[assembly: AssemblyVersion("1.2.3.2")]
+[assembly: AssemblyFileVersion("1.2.3.2")]
 
 // [MANDATORY] The name of your plugin
 [assembly: AssemblyTitle("Touch 'N' Stars")]
@@ -83,6 +83,8 @@ Available at [App Store](https://apps.apple.com/us/app/touch-n-stars/id674490285
 My thanks go to the entire **NINA** development team, whose great work makes this web app possible.
 A special thank you to **Christian**, the developer of the **Advanced API**, for his efforts and support. 
 His work has significantly enabled the development of this web app.
+
+Thanks to https://github.com/CanardConfit/BahtiFocus for the Bahtinov mask analysis code.
 
 ")]
 

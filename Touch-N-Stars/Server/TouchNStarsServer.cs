@@ -20,7 +20,7 @@ namespace TouchNStars.Server {
         private CancellationTokenSource apiToken;
         public WebServer WebServer;
 
-        private readonly List<string> appEndPoints = ["equipment", "camera", "autofocus", "mount", "guider", "sequence", "settings", "seq-mon", "flat", "dome", "logs", "switch", "flats", "stellarium", "settings", "rotator", "filterwheel", "plugin1", "plugin2", "plugin3", "plugin4", "plugin5", "plugin6", "plugin7", "plugin8", "plugin9"];
+        private readonly List<string> appEndPoints = ["equipment", "camera", "autofocus", "mount", "guider", "sequence", "settings", "seq-mon", "flat", "dome", "logs", "switch", "flats", "stellarium", "settings", "rotator", "filterwheel", "bahtinov", "plugin1", "plugin2", "plugin3", "plugin4", "plugin5", "plugin6", "plugin7", "plugin8", "plugin9"];
 
         private int port;
         public TouchNStarsServer(int port) => this.port = port;
@@ -51,7 +51,9 @@ namespace TouchNStars.Server {
                 .WithController<FavoritesController>()   // Favorites management
                 .WithController<TargetSearchController>() // NGC search and target pictures
                 .WithController<FramingController>()     // Framing Assistant control
-                .WithController<UtilityController>());   // Logs, version, api-port
+                .WithController<MetricsController>()     // System metrics
+                .WithController<UtilityController>()    // Logs, version, api-port
+                .WithController<BahtinovController>());  // Bahtinov mask analysis
             WebServer = WebServer.WithStaticFolder("/", webAppDir, false); // Register the static folder, which will be used to serve the web app
         }
 
