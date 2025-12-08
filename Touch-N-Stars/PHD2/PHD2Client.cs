@@ -645,6 +645,49 @@ namespace TouchNStars.PHD2
             return profiles;
         }
 
+        public int CreateProfile(string profileName)
+        {
+            CheckConnected();
+            
+            if (string.IsNullOrEmpty(profileName))
+                throw new PHD2Exception("Profile name cannot be empty");
+
+            var parameters = new JObject { ["name"] = profileName };
+            
+            try
+            {
+                var result = Call("create_profile", parameters);
+                return (int)result["result"];
+            }
+            catch (PHD2Exception ex)
+            {
+                if (ex.Message.Contains("profile already exists"))
+                {
+                    // Profile already exists, get its ID
+                    var profiles = Call("get_profiles");
+                    foreach (var profile in profiles["result"])
+                    {
+                        if ((string)profile["name"] == profileName)
+                        {
+                            return (int)profile["id"];
+                        }
+                    }
+                }
+                throw;
+            }
+        }
+
+        public void DeleteProfile(string profileName)
+        {
+            CheckConnected();
+            
+            if (string.IsNullOrEmpty(profileName))
+                throw new PHD2Exception("Profile name cannot be empty");
+
+            var parameters = new JObject { ["name"] = profileName };
+            Call("delete_profile", parameters);
+        }
+
         public void ConnectEquipment(string profileName)
         {
             CheckConnected();

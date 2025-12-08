@@ -222,6 +222,152 @@ public class PHD2Controller : WebApiController
     }
 
     /// <summary>
+    /// POST /api/phd2/profile/create - Create a new equipment profile
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/profile/create")]
+    public async Task<ApiResponse> CreatePHD2Profile()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            
+            if (requestData == null || !requestData.ContainsKey("name") || requestData["name"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile name is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            string profileName = requestData["name"].ToString();
+            
+            if (string.IsNullOrEmpty(profileName))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile name cannot be empty",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            int profileId = await phd2Service.CreateProfileAsync(profileName);
+
+            if (profileId < 0)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = phd2Service.LastError ?? "Failed to create profile",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { ProfileId = profileId, ProfileName = profileName },
+                StatusCode = 200,
+                Type = "PHD2Profile"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/profile/delete - Delete an equipment profile
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/profile/delete")]
+    public async Task<ApiResponse> DeletePHD2Profile()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            
+            if (requestData == null || !requestData.ContainsKey("name") || requestData["name"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile name is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            string profileName = requestData["name"].ToString();
+            
+            if (string.IsNullOrEmpty(profileName))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile name cannot be empty",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            bool result = await phd2Service.DeleteProfileAsync(profileName);
+
+            if (!result)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = phd2Service.LastError ?? "Failed to delete profile",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { ProfileName = profileName, Deleted = true },
+                StatusCode = 200,
+                Type = "PHD2Profile"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
     /// POST /api/phd2/connect-equipment - Connect equipment with profile
     /// </summary>
     [Route(HttpVerbs.Post, "/phd2/connect-equipment")]
