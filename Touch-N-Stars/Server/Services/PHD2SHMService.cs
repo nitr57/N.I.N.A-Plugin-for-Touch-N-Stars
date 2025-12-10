@@ -72,6 +72,22 @@ namespace TouchNStars.Server.Services
             public string name;
         }
 
+        // EquipmentListSHM structure for mounts (matching shm_mount.h layout)
+        // Mount structure is much simpler than camera - just header (24 bytes) + equipment list
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1)]
+        private struct EquipmentListSHM
+        {
+            public uint version;
+            public uint num_equipment;
+            public uint selected_equipment_index;
+            public uint timestamp;
+            public uint list_update_counter;
+            public uint selected_change_counter;
+            // Mount list starts at offset 24 (64 items max @ 256 bytes each)
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = MAX_CAMERAS_SHM)]
+            public EquipmentEntry[] equipment;
+        }
+
         // CameraConfigOption structure matching shm_camera_config.h
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1)]
         private struct CameraConfigOption
@@ -407,18 +423,35 @@ namespace TouchNStars.Server.Services
                     return mounts;
                 }
 
-                // Marshal the mount list structure
-                uint structSize = (uint)Marshal.SizeOf(typeof(CameraListSHM)); // Reuse same structure
-                var mountData = Marshal.PtrToStructure<CameraListSHM>(mountShmAddr);
+                // Read header manually (24 bytes)
+                uint version = (uint)Marshal.ReadInt32(mountShmAddr, 0);
+                uint num_equipment = (uint)Marshal.ReadInt32(mountShmAddr, 4);
+                uint selected_idx = (uint)Marshal.ReadInt32(mountShmAddr, 8);
 
-                if (mountData.cameras != null && mountData.num_cameras > 0)
+                Logger.Debug($"Mount SHM: version={version}, num_equipment={num_equipment}, selected={selected_idx}");
+
+                // Mount list starts at offset 64 (not 24!), each entry is 256 bytes
+                int equipmentStartOffset = 64;
+                
+                for (int i = 0; i < num_equipment && i < MAX_CAMERAS_SHM; i++)
                 {
-                    for (int i = 0; i < mountData.num_cameras && i < mountData.cameras.Length; i++)
+                    try
                     {
-                        if (!string.IsNullOrEmpty(mountData.cameras[i].name))
+                        int equipmentOffset = equipmentStartOffset + (i * 256);
+                        IntPtr equipmentAddr = new IntPtr(mountShmAddr.ToInt64() + equipmentOffset);
+                        
+                        // Read equipment name as null-terminated string
+                        string equipmentName = Marshal.PtrToStringAnsi(equipmentAddr);
+                        
+                        if (!string.IsNullOrEmpty(equipmentName))
                         {
-                            mounts.Add(mountData.cameras[i].name);
+                            Logger.Debug($"  Equipment[{i}]: {equipmentName}");
+                            mounts.Add(equipmentName);
                         }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug($"Error reading equipment {i}: {ex.Message}");
                     }
                 }
 
@@ -442,14 +475,15 @@ namespace TouchNStars.Server.Services
                     return null;
                 }
 
-                var mountData = Marshal.PtrToStructure<CameraListSHM>(mountShmAddr);
+                // Read selected_equipment_index at offset 8
+                uint selectedIndex = (uint)Marshal.ReadInt32(mountShmAddr, 8);
 
-                if (mountData.selected_camera_index == INVALID_CAMERA_INDEX)
+                if (selectedIndex == INVALID_CAMERA_INDEX)
                 {
                     return null;
                 }
 
-                return mountData.selected_camera_index;
+                return selectedIndex;
             }
             catch (Exception ex)
             {
@@ -469,19 +503,25 @@ namespace TouchNStars.Server.Services
                     return false;
                 }
 
-                var mountData = Marshal.PtrToStructure<CameraListSHM>(mountShmAddr);
+                // Read num_equipment at offset 4
+                uint num_equipment = (uint)Marshal.ReadInt32(mountShmAddr, 4);
 
-                if (index >= mountData.num_cameras)
+                if (index >= num_equipment)
                 {
-                    Logger.Error($"Mount index {index} out of range (max: {mountData.num_cameras})");
+                    Logger.Error($"Mount index {index} out of range (max: {num_equipment})");
                     return false;
                 }
 
-                mountData.selected_camera_index = index;
-                mountData.selected_change_counter++;
-                mountData.timestamp = (uint)(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-
-                Marshal.StructureToPtr(mountData, mountShmAddr, false);
+                // Write selected_equipment_index at offset 8
+                Marshal.WriteInt32(mountShmAddr, 8, (int)index);
+                
+                // Increment selected_change_counter at offset 20
+                int counter = Marshal.ReadInt32(mountShmAddr, 20);
+                Marshal.WriteInt32(mountShmAddr, 20, counter + 1);
+                
+                // Update timestamp at offset 12
+                uint timestamp = (uint)(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                Marshal.WriteInt32(mountShmAddr, 12, (int)timestamp);
 
                 Logger.Debug($"Set selected mount index to {index}");
                 return true;
