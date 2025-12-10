@@ -368,6 +368,150 @@ public class PHD2Controller : WebApiController
     }
 
     /// <summary>
+    /// POST /api/phd2/profile/rename - Rename the current equipment profile
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/profile/rename")]
+    public async Task<ApiResponse> RenamePHD2Profile()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            
+            if (requestData == null || !requestData.ContainsKey("name") || requestData["name"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "New profile name is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            string newName = requestData["name"].ToString();
+            
+            if (string.IsNullOrEmpty(newName))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile name cannot be empty",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            bool result = await phd2Service.RenameProfileAsync(newName);
+
+            if (!result)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = phd2Service.LastError ?? "Failed to rename profile",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { NewName = newName, Renamed = true },
+                StatusCode = 200,
+                Type = "PHD2Profile"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/phd2/profile/select - Select an equipment profile by ID
+    /// </summary>
+    [Route(HttpVerbs.Put, "/phd2/profile/select")]
+    public async Task<ApiResponse> SelectPHD2Profile()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            
+            if (requestData == null || !requestData.ContainsKey("id") || requestData["id"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile ID is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            if (!int.TryParse(requestData["id"].ToString(), out int profileId) || profileId <= 0)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Profile ID must be a valid positive integer",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            bool result = await phd2Service.SetProfileAsync(profileId);
+
+            if (!result)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = phd2Service.LastError ?? "Failed to select profile",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { ProfileId = profileId, Selected = true },
+                StatusCode = 200,
+                Type = "PHD2Profile"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
     /// POST /api/phd2/connect-equipment - Connect equipment with profile
     /// </summary>
     [Route(HttpVerbs.Post, "/phd2/connect-equipment")]

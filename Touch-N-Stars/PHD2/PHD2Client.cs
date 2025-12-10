@@ -688,6 +688,17 @@ namespace TouchNStars.PHD2
             Call("delete_profile", parameters);
         }
 
+        public void RenameProfile(string newName)
+        {
+            CheckConnected();
+            
+            if (string.IsNullOrEmpty(newName))
+                throw new PHD2Exception("Profile name cannot be empty");
+
+            var parameters = new JObject { ["name"] = newName };
+            Call("rename_profile", parameters);
+        }
+
         public void ConnectEquipment(string profileName)
         {
             CheckConnected();

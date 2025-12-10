@@ -418,6 +418,64 @@ namespace TouchNStars.Server.Services
             });
         }
 
+        public async Task<bool> RenameProfileAsync(string newName)
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                        {
+                            lastError = "PHD2 is not connected";
+                            return false;
+                        }
+
+                        client.RenameProfile(newName);
+                        lastError = null;
+                        Logger.Info($"Renamed PHD2 profile to '{newName}'");
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to rename profile to '{newName}': {ex}");
+                    return false;
+                }
+            });
+        }
+
+        public async Task<bool> SetProfileAsync(int profileId)
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                        {
+                            lastError = "PHD2 is not connected";
+                            return false;
+                        }
+
+                        client.SetProfile(profileId);
+                        lastError = null;
+                        Logger.Info($"Selected PHD2 profile ID {profileId}");
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to set profile to ID {profileId}: {ex}");
+                    return false;
+                }
+            });
+        }
+
         public async Task<bool> ConnectEquipmentAsync(string profileName)
         {
             return await Task.Run(() =>
