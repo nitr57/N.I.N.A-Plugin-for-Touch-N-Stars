@@ -2,6 +2,7 @@ using EmbedIO;
 using EmbedIO.Routing;
 using EmbedIO.WebApi;
 using NINA.Core.Utility;
+using PHD2.SHMGuider;
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -2531,7 +2532,7 @@ public class PHD2Controller : WebApiController
                 {
                     Cameras = cameras,
                     Count = cameras.Count,
-                    SelectedIndex = selectedIndex ?? uint.MaxValue
+                    SelectedIndex = selectedIndex >= 0 ? selectedIndex : -1
                 },
                 StatusCode = 200,
                 Type = "PHD2Cameras"
@@ -2628,7 +2629,7 @@ public class PHD2Controller : WebApiController
                     };
                 }
 
-                bool result = shmService.SetSelectedCameraIndex(cameraIndex);
+                bool result = shmService.SetSelectedCameraIndex((int)cameraIndex);
 
                 return new ApiResponse
                 {
@@ -2650,7 +2651,7 @@ public class PHD2Controller : WebApiController
                 var cameras = shmService.GetCameraList();
                 var selectedIndex = shmService.GetSelectedCameraIndex();
 
-                if (selectedIndex == null || selectedIndex >= cameras.Count)
+                if (selectedIndex < 0 || selectedIndex >= cameras.Count)
                 {
                     HttpContext.Response.StatusCode = 404;
                     return new ApiResponse
@@ -2668,7 +2669,7 @@ public class PHD2Controller : WebApiController
                     Response = new
                     {
                         Index = selectedIndex,
-                        Name = cameras[(int)selectedIndex.Value]
+                        Name = cameras[selectedIndex]
                     },
                     StatusCode = 200,
                     Type = "PHD2SelectedCamera"
@@ -2887,7 +2888,7 @@ public class PHD2Controller : WebApiController
                 {
                     Mounts = mounts,
                     Count = mounts.Count,
-                    SelectedIndex = selectedIndex ?? uint.MaxValue
+                    SelectedIndex = selectedIndex >= 0 ? selectedIndex : -1
                 },
                 StatusCode = 200,
                 Type = "PHD2Mounts"
@@ -2984,7 +2985,7 @@ public class PHD2Controller : WebApiController
                     };
                 }
 
-                bool result = shmService.SetSelectedMountIndex(mountIndex);
+                bool result = shmService.SetSelectedMountIndex((int)mountIndex);
 
                 return new ApiResponse
                 {
@@ -3006,7 +3007,7 @@ public class PHD2Controller : WebApiController
                 var mounts = shmService.GetMountList();
                 var selectedIndex = shmService.GetSelectedMountIndex();
 
-                if (selectedIndex == null || selectedIndex >= mounts.Count)
+                if (selectedIndex < 0 || selectedIndex >= mounts.Count)
                 {
                     HttpContext.Response.StatusCode = 404;
                     return new ApiResponse
@@ -3024,7 +3025,7 @@ public class PHD2Controller : WebApiController
                     Response = new
                     {
                         Index = selectedIndex,
-                        Name = mounts[(int)selectedIndex.Value]
+                        Name = mounts[selectedIndex]
                     },
                     StatusCode = 200,
                     Type = "PHD2SelectedMount"
