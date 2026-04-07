@@ -5,6 +5,7 @@ using NINA.Core.Utility;
 using NINA.Equipment.Interfaces;
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace TouchNStars.Server.Controllers;
 
@@ -191,6 +192,42 @@ public class LocationController : WebApiController
                 { "latitude",  latitude },
                 { "longitude", longitude },
                 { "elevation", elevation }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>
+            {
+                { "success", false },
+                { "error", ex.Message }
+            };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/location/horizon
+    /// Sets the custom horizon from a file path on the server.
+    /// Body: { "filePath": "/absolute/path/to/horizon.hrz" }
+    /// Send an empty string or omit filePath to clear the horizon.
+    /// </summary>
+    [Route(HttpVerbs.Post, "/location/horizon")]
+    public async Task<object> SetHorizonFromFilePath()
+    {
+        try
+        {
+            var body = await HttpContext.GetRequestDataAsync<Dictionary<string, string>>();
+            body.TryGetValue("filePath", out var filePath);
+            filePath = filePath?.Trim() ?? string.Empty;
+
+            TouchNStars.Mediators.Profile.ChangeHorizon(filePath);
+
+            var currentPath = TouchNStars.Mediators.Profile.ActiveProfile.AstrometrySettings.HorizonFilePath;
+            return new Dictionary<string, object>
+            {
+                { "success", true },
+                { "horizonFilePath", currentPath }
             };
         }
         catch (Exception ex)
