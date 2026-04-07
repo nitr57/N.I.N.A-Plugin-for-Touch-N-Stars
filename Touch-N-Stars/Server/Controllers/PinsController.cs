@@ -343,7 +343,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapPowerPorts(powerPorts);
+            int actualPowerPortCount = GetPropertyInt(powerBox, "ActualPowerPortCount", -1);
+            var ports = MapPowerPorts(powerPorts, actualPowerPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -806,7 +807,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapPowerPorts(usbPorts);
+            int actualUSBPortCount = GetPropertyInt(powerBox, "ActualUSBPortCount", -1);
+            var ports = MapPowerPorts(usbPorts, actualUSBPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -1269,7 +1271,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapDewPorts(dewPorts);
+            int actualDewPortCount = GetPropertyInt(powerBox, "ActualDewPortCount", -1);
+            var ports = MapDewPorts(dewPorts, actualDewPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -2013,7 +2016,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapBuckPorts(buckPorts);
+            int actualBuckPortCount = GetPropertyInt(powerBox, "ActualBuckPortCount", -1);
+            var ports = MapBuckPorts(buckPorts, actualBuckPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -2592,7 +2596,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapPWMPorts(pwmPorts);
+            int actualPWMPortCount = GetPropertyInt(powerBox, "ActualPWMPortCount", -1);
+            var ports = MapPWMPorts(pwmPorts, actualPWMPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -4076,9 +4081,10 @@ public class PinsController : WebApiController
 
     #region Helper Methods
 
-    private PowerPortsInfo MapPowerPorts(object powerPorts)
+    private PowerPortsInfo MapPowerPorts(object powerPorts, int maxPorts = -1)
     {
         if (powerPorts == null) return new PowerPortsInfo { MaxPorts = 0, Ports = new PortInfo[0] };
+        if (maxPorts == 0) return new PowerPortsInfo { MaxPorts = 0, Ports = new PortInfo[0] };
 
         try
         {
@@ -4091,6 +4097,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new PortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4118,9 +4125,10 @@ public class PinsController : WebApiController
         }
     }
 
-    private DewPortsInfo MapDewPorts(object dewPorts)
+    private DewPortsInfo MapDewPorts(object dewPorts, int maxPorts = -1)
     {
         if (dewPorts == null) return new DewPortsInfo { MaxPorts = 0, Ports = new DewPortInfo[0] };
+        if (maxPorts == 0) return new DewPortsInfo { MaxPorts = 0, Ports = new DewPortInfo[0] };
 
         try
         {
@@ -4133,6 +4141,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new DewPortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4163,9 +4172,10 @@ public class PinsController : WebApiController
         }
     }
 
-    private BuckPortsInfo MapBuckPorts(object buckPorts)
+    private BuckPortsInfo MapBuckPorts(object buckPorts, int maxPorts = -1)
     {
         if (buckPorts == null) return new BuckPortsInfo { MaxPorts = 0, Ports = new BuckPortInfo[0] };
+        if (maxPorts == 0) return new BuckPortsInfo { MaxPorts = 0, Ports = new BuckPortInfo[0] };
 
         try
         {
@@ -4178,6 +4188,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new BuckPortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4206,9 +4217,10 @@ public class PinsController : WebApiController
         }
     }
 
-    private PWMPortsInfo MapPWMPorts(object pwmPorts)
+    private PWMPortsInfo MapPWMPorts(object pwmPorts, int maxPorts = -1)
     {
         if (pwmPorts == null) return new PWMPortsInfo { MaxPorts = 0, Ports = new PWMPortInfo[0] };
+        if (maxPorts == 0) return new PWMPortsInfo { MaxPorts = 0, Ports = new PWMPortInfo[0] };
 
         try
         {
@@ -4221,6 +4233,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new PWMPortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
