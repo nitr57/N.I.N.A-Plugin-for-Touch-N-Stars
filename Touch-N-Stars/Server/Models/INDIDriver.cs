@@ -31,11 +31,34 @@ public static class INDIDriverRegistry
     private static readonly string DriverDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "INDI");
     private static readonly string ThirdPartyFilePath = Path.Combine(DriverDirectory, "3rdparty.json");
+    private static readonly object PrepareLock = new();
+    private static bool prepared;
 
     private static readonly Assembly _assembly = Assembly.GetExecutingAssembly();
     // Embedded resource name format: TouchNStars.Server.Models.indi_drivers.<type>.json
     private static string ResourceName(string driverType) =>
         $"TouchNStars.Server.Models.indi_drivers.{driverType}.json";
+
+    public static void PrepareDriverFiles(bool force = false)
+    {
+        lock (PrepareLock)
+        {
+            if (prepared && !force)
+            {
+                return;
+            }
+
+            EnsureDriverDirectory();
+
+            foreach (string builtInType in BuiltInDriverTypes)
+            {
+                SyncBuiltInDriverFile(builtInType);
+            }
+
+            EnsureThirdPartyFile();
+            prepared = true;
+        }
+    }
 
     public static List<INDIDriver> GetDrivers(string driverType)
     {
@@ -45,9 +68,7 @@ public static class INDIDriverRegistry
             return new List<INDIDriver>();
         }
 
-        EnsureDriverDirectory();
-        SyncBuiltInDriverFile(driverType);
-        EnsureThirdPartyFile();
+        PrepareDriverFiles();
 
         var filePath = Path.Combine(DriverDirectory, $"{driverType}.json");
         var drivers = ReadDriverListFromFile(filePath);

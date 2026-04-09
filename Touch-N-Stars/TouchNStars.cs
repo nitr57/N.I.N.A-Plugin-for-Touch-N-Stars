@@ -22,6 +22,7 @@ using System.Text;
 using TouchNStars.Utility;
 using TouchNStars.Server;
 using TouchNStars.Server.Controllers;
+using TouchNStars.Server.Models;
 using Settings = TouchNStars.Properties.Settings;
 using System.Windows;
 
@@ -128,6 +129,9 @@ namespace TouchNStars {
             });
 
             Communicator = new Communicator();
+
+            // Pre-populate INDI JSON files on startup instead of first INDI API request.
+            INDIDriverRegistry.PrepareDriverFiles(force: true);
 
             SetHostNames();
 
