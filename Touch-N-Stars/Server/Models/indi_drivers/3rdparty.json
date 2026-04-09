@@ -1,0 +1,11 @@
+{
+  "filterwheel": [
+    { "Name": "indi_example", "Label": "Example Filter Wheel", "Type": "filterwheel" }
+  ],
+  "flatpanel": [],
+  "focuser": [],
+  "rotator": [],
+  "switches": [],
+  "telescope": [],
+  "weather": []
+}
