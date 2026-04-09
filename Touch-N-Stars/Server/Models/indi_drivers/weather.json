@@ -1,6 +1,19 @@
 [
+  { "Name": "indi_aagsolo_weather", "Label": "AAG Solo Weather", "Type": "weather" },
+  { "Name": "indi_hitech_weather", "Label": "Hitech Weather", "Type": "weather" },
   { "Name": "indi_mbox_weather", "Label": "MBox Weather", "Type": "weather" },
+  { "Name": "indi_meta_weather", "Label": "Meta Weather", "Type": "weather" },
+  { "Name": "indi_openweathermap_weather", "Label": "OpenWeatherMap Weather", "Type": "weather" },
+  { "Name": "indi_planewave_deltat", "Label": "PlaneWave DeltaT", "Type": "weather" },
+  { "Name": "indi_safetymonitor", "Label": "Safety Monitor", "Type": "weather" },
   { "Name": "indi_simulator_weather", "Label": "Simulator Weather", "Type": "weather" },
   { "Name": "indi_sqm_weather", "Label": "SQM Weather", "Type": "weather" },
-  { "Name": "indi_uranus_weather", "Label": "Uranus Weather", "Type": "weather" }
+  { "Name": "indi_ups_safety", "Label": "UPS Safety", "Type": "weather" },
+  { "Name": "indi_uranus_weather", "Label": "Uranus Weather", "Type": "weather" },
+  { "Name": "indi_usbdewpoint", "Label": "USB Dew Point", "Type": "weather" },
+  { "Name": "indi_vantage_weather", "Label": "Vantage Weather", "Type": "weather" },
+  { "Name": "indi_watcher_weather", "Label": "Watcher Weather", "Type": "weather" },
+  { "Name": "indi_weather_safety_alpaca", "Label": "Weather Safety Alpaca", "Type": "weather" },
+  { "Name": "indi_weather_safety_proxy", "Label": "Weather Safety Proxy", "Type": "weather" },
+  { "Name": "indi_weatherflow_weather", "Label": "WeatherFlow Weather", "Type": "weather" }
 ]

@@ -1,4 +1,10 @@
 [
+  { "Name": "indi_ioptron_wheel", "Label": "iOptron Filter Wheel", "Type": "filterwheel" },
+  { "Name": "indi_manual_wheel", "Label": "Manual Filter Wheel", "Type": "filterwheel" },
+  { "Name": "indi_optec_wheel", "Label": "Optec Filter Wheel", "Type": "filterwheel" },
   { "Name": "indi_pegasusindigo_wheel", "Label": "Pegasus Indigo Filter Wheel", "Type": "filterwheel" },
-  { "Name": "indi_simulator_wheel", "Label": "Simulator Filter Wheel", "Type": "filterwheel" }
+  { "Name": "indi_quantum_wheel", "Label": "Quantum Filter Wheel", "Type": "filterwheel" },
+  { "Name": "indi_simulator_wheel", "Label": "Simulator Filter Wheel", "Type": "filterwheel" },
+  { "Name": "indi_trutech_wheel", "Label": "Trutech Filter Wheel", "Type": "filterwheel" },
+  { "Name": "indi_xagyl_wheel", "Label": "Xagyl Filter Wheel", "Type": "filterwheel" }
 ]
