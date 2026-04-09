@@ -49,10 +49,18 @@ public static class INDIDriverRegistry
             }
 
             EnsureDriverDirectory();
+            Logger.Info($"Preparing INDI driver files in '{DriverDirectory}' (force={force})");
 
             foreach (string builtInType in BuiltInDriverTypes)
             {
-                SyncBuiltInDriverFile(builtInType);
+                try
+                {
+                    SyncBuiltInDriverFile(builtInType);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Failed to prepare INDI file for type '{builtInType}': {ex.Message}");
+                }
             }
 
             EnsureThirdPartyFile();
@@ -117,7 +125,7 @@ public static class INDIDriverRegistry
         {
             Directory.CreateDirectory(DriverDirectory);
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
             Logger.Error($"Failed to create INDI driver directory '{DriverDirectory}': {ex.Message}");
         }
@@ -162,7 +170,7 @@ public static class INDIDriverRegistry
             using var fs = File.Create(dest);
             fs.Write(embeddedBytes, 0, embeddedBytes.Length);
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
             Logger.Error($"Failed to sync INDI driver file '{dest}': {ex.Message}");
         }
@@ -178,21 +186,36 @@ public static class INDIDriverRegistry
 
         var resourceName = ResourceName("3rdparty");
         using var stream = _assembly.GetManifestResourceStream(resourceName);
-        if (stream == null)
-        {
-            Logger.Warning($"No embedded default found for INDI third-party file (resource '{resourceName}')");
-            return;
-        }
-
         try
         {
             using var fs = File.Create(ThirdPartyFilePath);
+
+            if (stream == null)
+            {
+                Logger.Warning($"No embedded default found for INDI third-party file (resource '{resourceName}'). Writing inline default template.");
+                WriteDefaultThirdPartyTemplate(fs);
+                return;
+            }
+
             stream.CopyTo(fs);
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
             Logger.Error($"Failed to seed INDI third-party file '{ThirdPartyFilePath}': {ex.Message}");
         }
+    }
+
+    private static void WriteDefaultThirdPartyTemplate(Stream targetStream)
+    {
+        var template = new Dictionary<string, List<INDIDriver>>(StringComparer.OrdinalIgnoreCase);
+        foreach (string type in BuiltInDriverTypes)
+        {
+            template[type] = new List<INDIDriver>();
+        }
+
+        using var writer = new StreamWriter(targetStream);
+        string json = JsonConvert.SerializeObject(template, Formatting.Indented);
+        writer.Write(json);
     }
 
     private static List<INDIDriver> ReadDriverListFromFile(string filePath)

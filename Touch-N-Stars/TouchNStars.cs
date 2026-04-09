@@ -131,7 +131,11 @@ namespace TouchNStars {
             Communicator = new Communicator();
 
             // Pre-populate INDI JSON files on startup instead of first INDI API request.
-            INDIDriverRegistry.PrepareDriverFiles(force: true);
+            try {
+                INDIDriverRegistry.PrepareDriverFiles(force: true);
+            } catch (Exception ex) {
+                Logger.Warning($"Failed to prepare INDI driver files during startup: {ex.Message}");
+            }
 
             SetHostNames();
 
@@ -221,6 +225,12 @@ namespace TouchNStars {
                 RaisePropertyChanged();
 
                 if (value) {
+                    try {
+                        INDIDriverRegistry.PrepareDriverFiles(force: true);
+                    } catch (Exception ex) {
+                        Logger.Warning($"Failed to prepare INDI driver files when enabling app: {ex.Message}");
+                    }
+
                     CachedPort = CoreUtility.GetNearestAvailablePort(Port);
                     server = new TouchNStarsServer(CachedPort);
                     server.Start();
