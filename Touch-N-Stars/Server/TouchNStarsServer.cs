@@ -29,10 +29,8 @@ namespace TouchNStars.Server {
             string assemblyFolder = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             string webAppDir = Path.Combine(assemblyFolder, "app");
 
-            try {
-                // Suppress EmbedIO verbose logging by unregistering the logger
-                Swan.Logging.Logger.UnregisterLogger<Swan.Logging.ConsoleLogger>();
-            } catch { }
+            // Suppress EmbedIO verbose logging by unregistering the logger
+            try { Swan.Logging.Logger.UnregisterLogger<Swan.Logging.ConsoleLogger>(); } catch { }
 
             WebServer = new WebServer(o => o
                 .WithUrlPrefix($"http://*:{port}")
@@ -64,7 +62,8 @@ namespace TouchNStars.Server {
                 .WithController<TenMicronController>()   // 10micron model builder integration
                 .WithController<LocationController>()    // Profile & mount site location
                 .WithController<FlatDeviceController>()  // Flat device multi-filter capture
-                .WithController<ProxyController>());     // Generic proxy for external URLs
+                .WithController<ProxyController>()       // Generic proxy for external URLs
+                .WithController<FilesystemController>());
             WebServer = WebServer.WithStaticFolder("/", webAppDir, false); // Register the static folder, which will be used to serve the web app
         }
 
