@@ -64,7 +64,8 @@ namespace TouchNStars.Server {
                 .WithController<FlatDeviceController>()  // Flat device multi-filter capture
                 .WithController<FilterOffsetController>() // DarksCustoms filter offset calculator
                 .WithController<ProxyController>()       // Generic proxy for external URLs
-                .WithController<FilesystemController>());
+                .WithController<FilesystemController>()
+                .WithController<FitsAnalysisController>());
             WebServer = WebServer.WithStaticFolder("/", webAppDir, false); // Register the static folder, which will be used to serve the web app
         }
 
