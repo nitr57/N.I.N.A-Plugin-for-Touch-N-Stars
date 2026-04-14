@@ -62,6 +62,7 @@ namespace TouchNStars.Server {
                 .WithController<TenMicronController>()   // 10micron model builder integration
                 .WithController<LocationController>()    // Profile & mount site location
                 .WithController<FlatDeviceController>()  // Flat device multi-filter capture
+                .WithController<FilterOffsetController>() // DarksCustoms filter offset calculator
                 .WithController<ProxyController>()       // Generic proxy for external URLs
                 .WithController<FilesystemController>());
             WebServer = WebServer.WithStaticFolder("/", webAppDir, false); // Register the static folder, which will be used to serve the web app
@@ -125,7 +126,7 @@ namespace TouchNStars.Server {
 
             if (context.Request.HttpVerb == HttpVerbs.Options) {
                 context.Response.StatusCode = 200;
-                await context.SendStringAsync(string.Empty, "text/plain", Encoding.UTF8); 
+                await context.SendStringAsync(string.Empty, "text/plain", Encoding.UTF8);
                 return;
             }
         }
