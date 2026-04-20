@@ -16,7 +16,9 @@ namespace TouchNStars.Server.Controllers;
 /// Controller for browsing and managing the local filesystem.
 /// Routes:
 ///   GET    /api/filesystem/browse?path=...         — list directories and files
+///   GET    /api/filesystem/file?path=...           — stream a file (images, FITS, etc.)
 ///   POST   /api/filesystem/directory               — create a directory (body: { "path": "..." })
+///   PUT    /api/filesystem/rename                  — rename/move file or directory
 ///   DELETE /api/filesystem/directory?path=...      — delete a directory (recursive)
 ///   DELETE /api/filesystem/file?path=...           — delete a file
 /// </summary>
@@ -27,6 +29,25 @@ public class FilesystemController : WebApiController
         HttpContext.Response.StatusCode = statusCode;
         string json = JsonConvert.SerializeObject(data);
         return HttpContext.SendStringAsync(json, "application/json", Encoding.UTF8);
+    }
+
+    private static string GetContentType(string path)
+    {
+        string extension = Path.GetExtension(path)?.ToLowerInvariant() ?? string.Empty;
+        return extension switch
+        {
+            ".fit" => "application/fits",
+            ".fits" => "application/fits",
+            ".jpg" => "image/jpeg",
+            ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".tif" => "image/tiff",
+            ".tiff" => "image/tiff",
+            ".bmp" => "image/bmp",
+            ".webp" => "image/webp",
+            _ => "application/octet-stream"
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -111,6 +132,51 @@ public class FilesystemController : WebApiController
     }
 
     // -------------------------------------------------------------------------
+    // GET /api/filesystem/file?path=...
+    // -------------------------------------------------------------------------
+    [Route(HttpVerbs.Get, "/filesystem/file")]
+    public async Task GetFile()
+    {
+        try
+        {
+            string pathParam = HttpContext.Request.QueryString["path"];
+            if (string.IsNullOrWhiteSpace(pathParam))
+            {
+                await SendJson(new { success = false, error = "Missing 'path' query parameter" }, 400);
+                return;
+            }
+
+            string fullPath = Path.GetFullPath(Uri.UnescapeDataString(pathParam));
+
+            if (!File.Exists(fullPath))
+            {
+                await SendJson(new { success = false, error = "File does not exist" }, 404);
+                return;
+            }
+
+            var fileInfo = new FileInfo(fullPath);
+            HttpContext.Response.StatusCode = 200;
+            HttpContext.Response.ContentType = GetContentType(fullPath);
+            HttpContext.Response.Headers["Content-Length"] = fileInfo.Length.ToString();
+
+            string fileName = fileInfo.Name;
+            HttpContext.Response.Headers["Content-Disposition"] = $"inline; filename=\"{fileName}\"";
+
+            using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            await stream.CopyToAsync(Response.OutputStream);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            await SendJson(new { success = false, error = "Access denied" }, 403);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[FilesystemController.GetFile] {ex.Message}", ex);
+            await SendJson(new { success = false, error = ex.Message }, 500);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // POST /api/filesystem/directory  body: { "path": "C:\\some\\new\\dir" }
     // -------------------------------------------------------------------------
     [Route(HttpVerbs.Post, "/filesystem/directory")]
@@ -145,6 +211,82 @@ public class FilesystemController : WebApiController
         catch (Exception ex)
         {
             Logger.Error($"[FilesystemController.CreateDirectory] {ex.Message}", ex);
+            await SendJson(new { success = false, error = ex.Message }, 500);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // PUT /api/filesystem/rename  body: { "sourcePath": "...", "targetPath": "..." }
+    // -------------------------------------------------------------------------
+    [Route(HttpVerbs.Put, "/filesystem/rename")]
+    public async Task Rename()
+    {
+        try
+        {
+            var body = await HttpContext.GetRequestDataAsync<Dictionary<string, string>>();
+            if (body == null
+                || !body.TryGetValue("sourcePath", out var sourcePath)
+                || !body.TryGetValue("targetPath", out var targetPath)
+                || string.IsNullOrWhiteSpace(sourcePath)
+                || string.IsNullOrWhiteSpace(targetPath))
+            {
+                await SendJson(new { success = false, error = "Missing 'sourcePath' or 'targetPath' in request body" }, 400);
+                return;
+            }
+
+            string sourceFullPath = Path.GetFullPath(sourcePath);
+            string targetFullPath = Path.GetFullPath(targetPath);
+
+            bool sourceIsFile = File.Exists(sourceFullPath);
+            bool sourceIsDirectory = Directory.Exists(sourceFullPath);
+
+            if (!sourceIsFile && !sourceIsDirectory)
+            {
+                await SendJson(new { success = false, error = "Source path does not exist" }, 404);
+                return;
+            }
+
+            if (File.Exists(targetFullPath) || Directory.Exists(targetFullPath))
+            {
+                await SendJson(new { success = false, error = "Target path already exists" }, 409);
+                return;
+            }
+
+            string targetParent = sourceIsFile
+                ? Path.GetDirectoryName(targetFullPath)
+                : Directory.GetParent(targetFullPath)?.FullName;
+
+            if (!string.IsNullOrWhiteSpace(targetParent) && !Directory.Exists(targetParent))
+            {
+                Directory.CreateDirectory(targetParent);
+            }
+
+            if (sourceIsFile)
+            {
+                File.Move(sourceFullPath, targetFullPath);
+                Logger.Info($"[FilesystemController] Renamed/moved file: {sourceFullPath} -> {targetFullPath}");
+            }
+            else
+            {
+                Directory.Move(sourceFullPath, targetFullPath);
+                Logger.Info($"[FilesystemController] Renamed/moved directory: {sourceFullPath} -> {targetFullPath}");
+            }
+
+            await SendJson(new
+            {
+                success = true,
+                sourcePath = sourceFullPath,
+                targetPath = targetFullPath,
+                itemType = sourceIsFile ? "file" : "directory"
+            });
+        }
+        catch (UnauthorizedAccessException)
+        {
+            await SendJson(new { success = false, error = "Access denied" }, 403);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[FilesystemController.Rename] {ex.Message}", ex);
             await SendJson(new { success = false, error = ex.Message }, 500);
         }
     }
