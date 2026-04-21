@@ -1,0 +1,18 @@
+[
+  { "Name": "indi_alpaca_dome", "Label": "ALPACA Dome", "Type": "dome" },
+  { "Name": "indi_baader_dome", "Label": "Baader Planetarium Dome", "Type": "dome" },
+  { "Name": "indi_beaver_dome", "Label": "Beaver Dome", "Type": "dome" },
+  { "Name": "indi_ddw_dome", "Label": "DDW Dome", "Type": "dome" },
+  { "Name": "indi_domepro2_dome", "Label": "DomePro2 Dome", "Type": "dome" },
+  { "Name": "indi_dragonfly_dome", "Label": "Dragonfly Dome", "Type": "dome" },
+  { "Name": "indi_dragonlair_dome", "Label": "Dragonlair Dome", "Type": "dome" },
+  { "Name": "indi_maxdomeii", "Label": "MaxDome II", "Type": "dome" },
+  { "Name": "indi_nexdome", "Label": "NexDome", "Type": "dome" },
+  { "Name": "indi_nexdome_beaver", "Label": "NexDome Beaver", "Type": "dome" },
+  { "Name": "indi_rigel_dome", "Label": "Rigel Dome", "Type": "dome" },
+  { "Name": "indi_rolloff_dome", "Label": "Rolloff Roof", "Type": "dome" },
+  { "Name": "indi_scopedome_dome", "Label": "ScopeDome", "Type": "dome" },
+  { "Name": "indi_script_dome", "Label": "Script Dome", "Type": "dome" },
+  { "Name": "indi_simulator_dome", "Label": "Simulator Dome", "Type": "dome" },
+  { "Name": "indi_universalror_dome", "Label": "Universal ROR (Roll-Off Roof)", "Type": "dome" }
+]
