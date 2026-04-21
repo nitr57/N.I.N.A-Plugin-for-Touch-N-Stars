@@ -80,6 +80,24 @@ public class INDIController : WebApiController
     }
 
     /// <summary>
+    /// GET /api/indi/safetymonitor - Get available INDI safety monitor drivers
+    /// </summary>
+    [Route(HttpVerbs.Get, "/indi/safetymonitor")]
+    public ApiResponse GetSafetymonitorDrivers()
+    {
+        return GetDriversByType("safetymonitor");
+    }
+
+    /// <summary>
+    /// GET /api/indi/dome - Get available INDI dome drivers
+    /// </summary>
+    [Route(HttpVerbs.Get, "/indi/dome")]
+    public ApiResponse GetDomeDrivers()
+    {
+        return GetDriversByType("dome");
+    }
+
+    /// <summary>
     /// GET /api/indi/serialports - Get available serial ports for INDI connections
     /// Returns objects with port name and description (manufacturer/product from sysfs on Linux)
     /// </summary>
