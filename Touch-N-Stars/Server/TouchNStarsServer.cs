@@ -63,6 +63,7 @@ namespace TouchNStars.Server {
                 .WithController<LocationController>()    // Profile & mount site location
                 .WithController<FlatDeviceController>()  // Flat device multi-filter capture
                 .WithController<FilterOffsetController>() // DarksCustoms filter offset calculator
+                .WithController<AlpacaDirectController>() // AlpacaDirect static-IP Alpaca device settings
                 .WithController<ProxyController>()       // Generic proxy for external URLs
                 .WithController<FilesystemController>()
                 .WithController<FitsAnalysisController>()
