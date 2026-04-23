@@ -18,10 +18,6 @@ namespace TouchNStars.Server.Controllers;
 /// Settings are stored via NINA's PluginOptionsAccessor, keyed by the per-device GUID
 /// that each AlpacaDirect* class uses as its plugin options namespace.
 ///
-/// Note: AlpacaDirectRotator and AlpacaDirectSafetyMonitor share the same GUID
-/// (7F937C44-9ECE-49A7-B56E-8090FF8267A8) due to a bug in NINA, so their settings
-/// also share storage. Use the "rotator" and "safetymonitor" device type names
-/// to access them — they map to the same underlying data.
 /// </summary>
 public class AlpacaDirectController : WebApiController
 {
@@ -34,9 +30,8 @@ public class AlpacaDirectController : WebApiController
         ["focuser"] = Guid.Parse("75ABC27F-85F6-4993-B42C-C66E1F5726E3"),
         ["filterwheel"] = Guid.Parse("2F95FB1C-46ED-4F2C-8072-273F07567DD7"),
         ["dome"] = Guid.Parse("C09F1563-4B7A-4300-B460-058ACD7952ED"),
-        // rotator and safetymonitor share a GUID — NINA bug
         ["rotator"] = Guid.Parse("7F937C44-9ECE-49A7-B56E-8090FF8267A8"),
-        ["safetymonitor"] = Guid.Parse("7F937C44-9ECE-49A7-B56E-8090FF8267A8"),
+        ["safetymonitor"] = Guid.Parse("C4DB7AFB-8092-45F9-9CB1-AB7992977234"),
         ["switch"] = Guid.Parse("F889ED92-DC36-4A8F-A24E-788E3AD3E780"),
         ["flatdevice"] = Guid.Parse("DE702D3C-8D66-462A-A4AB-19FA5A0C7E84"),
         ["weather"] = Guid.Parse("6BD8BCE9-C199-401A-AAF8-47EA8EE5AE32"),
