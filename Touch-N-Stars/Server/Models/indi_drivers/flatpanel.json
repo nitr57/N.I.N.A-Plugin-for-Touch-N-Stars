@@ -1,5 +1,6 @@
 [
   { "Name": "indi_deepskydad_fp", "Label": "DeepSkyDad Flat Panel", "Type": "flatpanel" },
+  { "Name": "indi_Excalibur", "Label": "RBfocus Excalibur", "Type": "flatpanel" },
   { "Name": "indi_flipflat", "Label": "Flip-Flat", "Type": "flatpanel" },
   { "Name": "indi_gemini_flatpanel", "Label": "Gemini Flat Panel", "Type": "flatpanel" },
   { "Name": "indi_giotto", "Label": "GIOTTO Flat Panel", "Type": "flatpanel" },
