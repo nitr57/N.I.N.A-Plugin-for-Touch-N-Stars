@@ -2944,6 +2944,20 @@ namespace TouchNStars.Server.Controllers
             if (type == typeof(bool))
                 return value;
 
+            // Handle ISequenceContainer (e.g. BeforeFlipActions/AfterFlipActions on
+            // ProgrammableMeridianFlipTrigger) using the dedicated sequence machinery to avoid
+            // infinite recursion through IEnumerable + [JsonProperty] reflection.
+            if (value is SequenceContainer seqContainer)
+            {
+                var containerTable = new Hashtable
+                {
+                    { "Items", getSequenceRecursively(seqContainer) },
+                    { "Conditions", getConditions(seqContainer) },
+                    { "Triggers", getTriggers(seqContainer) }
+                };
+                return containerTable;
+            }
+
             // Handle collections/IEnumerable (convert to array)
             if (value is System.Collections.IEnumerable enumerable && !(value is string))
             {
