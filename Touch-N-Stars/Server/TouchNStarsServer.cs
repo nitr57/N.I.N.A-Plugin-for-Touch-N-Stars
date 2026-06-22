@@ -44,6 +44,7 @@ namespace TouchNStars.Server {
                 .WithController<AutofocusController>()   // Autofocus control
                 .WithController<DialogController>()      // Dialog endpoints
                 .WithController<PHD2Controller>()        // PHD2 guiding endpoints
+                .WithController<Phd2GuiController>()     // Native PHD2 GUI embed (xpra) lifecycle
                 .WithController<TelescopiusController>() // Telescopius PIAAPI proxy
                 .WithController<MessageBoxController>()  // TNS MessageBox management
                 .WithController<SystemController>()      // System control (shutdown/restart)
