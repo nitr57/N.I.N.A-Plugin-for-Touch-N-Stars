@@ -90,6 +90,7 @@ namespace TouchNStars.Server {
                     BackgroundWorker.MonitorLogForEvents();
                     BackgroundWorker.MonitorLastAF();
                     AutofocusWatcher.Start();
+                    FlatTargetNameService.Start();
                 }
             } catch (Exception ex) {
                 Logger.Error($"failed to start web server: {ex}");
@@ -98,6 +99,7 @@ namespace TouchNStars.Server {
 
         public void Stop() {
             try {
+                FlatTargetNameService.Stop();
                 apiToken?.Cancel();
                 WebServer?.Dispose();
                 WebServer = null;
