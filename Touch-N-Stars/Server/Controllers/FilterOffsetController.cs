@@ -35,6 +35,11 @@ namespace TouchNStars.Server.Controllers;
 public class FilterOffsetController : WebApiController
 {
     // ── Shared state ─────────────────────────────────────────────────────────
+    // All of this is static and reachable from every HTTP entry point at once (several browser tabs,
+    // a stale bundle, a script). Guards the state-machine transitions in start/apply/discard; the
+    // background calculation itself runs outside it, so a running calculation never blocks polling.
+    private static readonly object _stateLock = new object();
+
     private static Task _offsetTask;
     private static CancellationTokenSource _cts;
 
@@ -111,6 +116,22 @@ public class FilterOffsetController : WebApiController
             return new ApiResponse { Success = false, Error = "Calculation already running", StatusCode = 409, Type = "Error" };
         }
 
+        // The task completes as soon as a result is ready, so IsCompleted alone does not mean the
+        // controller is free. Restarting while a result is pending would capture the offsets this
+        // run zeroed in the profile as the "old" values, making the user's real offsets
+        // unrecoverable — /discard would then restore zeros. Force accept or discard first.
+        if (_state == "PendingResult")
+        {
+            HttpContext.Response.StatusCode = 409;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "A calculated result is still pending — accept or discard it before starting a new calculation",
+                StatusCode = 409,
+                Type = "Error"
+            };
+        }
+
         FilterOffsetStartRequest payload;
         try
         {
@@ -155,39 +176,66 @@ public class FilterOffsetController : WebApiController
             return new ApiResponse { Success = false, Error = "No matching filters found in profile", StatusCode = 400, Type = "Error" };
         }
 
-        _cts?.Dispose();
-        _cts = new CancellationTokenSource();
-        var token = _cts.Token;
+        CancellationToken token;
+        lock (_stateLock)
+        {
+            // Re-check under the lock: the guards above ran before the request body was read, so two
+            // near-simultaneous starts could both have passed them. Go by _state rather than the
+            // task handle — _state flips to Running here, while _offsetTask is only assigned after
+            // the lock is released and would still look completed to a racing second start.
+            if (_state == "Running" || _state == "PendingResult")
+            {
+                HttpContext.Response.StatusCode = 409;
+                return new ApiResponse { Success = false, Error = "Calculation already running", StatusCode = 409, Type = "Error" };
+            }
 
-        _state = "Running";
-        _currentLoop = 0;
-        _totalLoops = payload.Loops;
-        _currentFilterIndex = 0;
-        _totalFilters = selectedFilters.Count;
-        _currentFilterName = "";
-        _errorMessage = "";
-        _result = null;
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+            token = _cts.Token;
 
+            _state = "Running";
+            _currentLoop = 0;
+            _totalLoops = payload.Loops;
+            _currentFilterIndex = 0;
+            _totalFilters = selectedFilters.Count;
+            _currentFilterName = "";
+            _errorMessage = "";
+            _result = null;
+        }
+
+        // Deliberately NOT Task.Run(..., token): with a token, a cancel that lands before the
+        // threadpool picks the delegate up completes the task as Canceled without ever running it,
+        // so none of the recovery below happens and _state stays "Running" forever — which the
+        // restart guard then reads as "busy" for the rest of the process's life. The delegate
+        // observes cancellation through RunCalculation's own ThrowIfCancellationRequested instead.
         _offsetTask = Task.Run(async () =>
         {
             try
             {
                 await RunCalculation(selectedFilters, payload.Loops, token);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
                 Logger.Info("FilterOffset: calculation cancelled");
-                RestoreOldValues();
-                _state = "Idle";
+                lock (_stateLock)
+                {
+                    RestoreOldValues();
+                    _state = "Idle";
+                }
             }
             catch (Exception ex)
             {
+                // Includes the TaskCanceledException HttpClient raises on its own timeout — that is
+                // a failure, not a user cancellation, and must not be reported as one.
                 Logger.Error($"FilterOffset: calculation failed: {ex}");
-                RestoreOldValues();
-                _state = "Error";
-                _errorMessage = ex.Message;
+                lock (_stateLock)
+                {
+                    RestoreOldValues();
+                    _state = "Error";
+                    _errorMessage = ex.Message;
+                }
             }
-        }, token);
+        });
 
         return new ApiResponse { Success = true, Response = "Filter offset calculation started", StatusCode = 200, Type = "Success" };
     }
@@ -220,7 +268,13 @@ public class FilterOffsetController : WebApiController
     {
         try
         {
-            _cts?.Cancel();
+            // Under the lock so this can't land between StartCalculation disposing the old source
+            // and installing the new one — cancelling a disposed source throws, and cancelling the
+            // brand new one would abort a run that has not begun.
+            lock (_stateLock)
+            {
+                _cts?.Cancel();
+            }
             return new ApiResponse { Success = true, Response = "Stop requested", StatusCode = 200, Type = "Success" };
         }
         catch (Exception ex)
@@ -237,6 +291,7 @@ public class FilterOffsetController : WebApiController
     {
         if (_state != "PendingResult" || _result == null)
         {
+            HttpContext.Response.StatusCode = 404;
             return new ApiResponse { Success = false, Error = "No result pending", StatusCode = 404, Type = "Error" };
         }
 
@@ -273,49 +328,88 @@ public class FilterOffsetController : WebApiController
             return new ApiResponse { Success = false, Error = $"Invalid request body: {ex.Message}", StatusCode = 400, Type = "Error" };
         }
 
+        // Everything below mutates the shared state machine and the profile, so it runs under the
+        // same lock as start/discard: two clients hitting Accept, or Accept racing Discard, must not
+        // both get past the pending check and write the profile twice. Re-check inside the lock —
+        // the check above happened before the request body was read.
         try
         {
-            var profile = TouchNStars.Mediators?.Profile?.ActiveProfile;
-            if (profile == null)
+            lock (_stateLock)
             {
-                HttpContext.Response.StatusCode = 503;
-                return new ApiResponse { Success = false, Error = "Profile not available", StatusCode = 503, Type = "Error" };
-            }
+                if (_state != "PendingResult" || _result == null)
+                {
+                    HttpContext.Response.StatusCode = 409;
+                    return new ApiResponse { Success = false, Error = "No result pending", StatusCode = 409, Type = "Error" };
+                }
 
-            // Build the list of offsets to write; apply relative shift if requested
-            var newOffsets = _result.NewOffsets
-                .Select(o => (o.Position, o.Name, o.FocusOffset))
-                .ToList();
+                var profile = TouchNStars.Mediators?.Profile?.ActiveProfile;
+                if (profile == null)
+                {
+                    HttpContext.Response.StatusCode = 503;
+                    return new ApiResponse { Success = false, Error = "Profile not available", StatusCode = 503, Type = "Error" };
+                }
 
-            if (payload?.UseRelativeOffsets == true && payload.NewDefaultFilterPosition.HasValue)
-            {
-                var base_ = newOffsets.FirstOrDefault(o => o.Position == payload.NewDefaultFilterPosition.Value);
-                int baseVal = base_.FocusOffset;
-                newOffsets = newOffsets
-                    .Select(o => (o.Position, o.Name, o.FocusOffset - baseVal))
+                // NewOffsets are already relative to the base filter (see ComputeOffsets). Shifting the
+                // whole set by a constant never changes the spacing between the measured filters, which
+                // is all the focuser move between two calibrated filters depends on — but it does change
+                // how the measured block lines up with any filter that was left out of the calibration,
+                // since those still carry offsets on the old zero point. So always anchor the set on one
+                // measured filter's PREVIOUS offset: that filter's moves to and from the uncalibrated
+                // ones stay exactly as they were, and the recalibration only redistributes the rest.
+                //
+                // Any measured filter works as the anchor. Prefer the one the user is selecting as the
+                // new AutoFocus filter, since keeping that one where it was is the least surprising
+                // outcome, but fall back to the base filter whenever that selection is not part of
+                // this calibration — including "None". Picking an uncalibrated filter as the AutoFocus
+                // filter stays allowed; it just does not get to be the anchor.
+                var newOffsets = _result.NewOffsets
+                    .Select(o => (o.Position, o.Name, o.FocusOffset))
                     .ToList();
+
+                if (newOffsets.Count > 0)
+                {
+                    int anchorIndex = payload?.NewDefaultFilterPosition is int afPosition
+                        ? newOffsets.FindIndex(o => o.Position == afPosition)
+                        : -1;
+                    if (anchorIndex < 0) anchorIndex = 0;
+
+                    var (anchorPosition, _, measured) = newOffsets[anchorIndex];
+                    int anchor = _result.OldOffsets?.FirstOrDefault(o => o.Position == anchorPosition)?.FocusOffset ?? 0;
+                    if (measured != anchor)
+                    {
+                        newOffsets = newOffsets
+                            .Select(o => (o.Position, o.Name, o.FocusOffset - measured + anchor))
+                            .ToList();
+                    }
+
+                    Logger.Info($"FilterOffset: anchoring offsets on filter position {anchorPosition} at its " +
+                                $"previous offset {anchor} (measured {measured})");
+                }
+
+                // Write offsets to profile
+                profile.FocuserSettings.UseFilterWheelOffsets = true;
+                foreach (var (Position, Name, FocusOffset) in newOffsets)
+                {
+                    var f = profile.FilterWheelSettings.FilterWheelFilters
+                        .FirstOrDefault(x => x.Position == Position);
+                    if (f != null)
+                        f.FocusOffset = FocusOffset;
+                }
+
+                // Set new AutoFocus filter
+                foreach (var f in profile.FilterWheelSettings.FilterWheelFilters)
+                    f.AutoFocusFilter = f.Position == (payload?.NewDefaultFilterPosition ?? -1);
+
+                // Profile.Save() swallows its own IO exceptions and returns normally, so a successful
+                // return here does not mean anything reached disk — don't claim it did. The in-memory
+                // profile is authoritative either way, and ProfileService's save timer retries.
+                profile.Save();
+
+                _result = null;
+                _state = "Idle";
+
+                return new ApiResponse { Success = true, Response = "Offsets applied", StatusCode = 200, Type = "Success" };
             }
-
-            // Write offsets to profile
-            profile.FocuserSettings.UseFilterWheelOffsets = true;
-            foreach (var (Position, Name, FocusOffset) in newOffsets)
-            {
-                var f = profile.FilterWheelSettings.FilterWheelFilters
-                    .FirstOrDefault(x => x.Position == Position);
-                if (f != null)
-                    f.FocusOffset = FocusOffset;
-            }
-
-            // Set new AutoFocus filter
-            foreach (var f in profile.FilterWheelSettings.FilterWheelFilters)
-                f.AutoFocusFilter = f.Position == (payload?.NewDefaultFilterPosition ?? -1);
-
-            profile.Save();
-
-            _result = null;
-            _state = "Idle";
-
-            return new ApiResponse { Success = true, Response = "Offsets applied and profile saved", StatusCode = 200, Type = "Success" };
         }
         catch (Exception ex)
         {
@@ -337,10 +431,21 @@ public class FilterOffsetController : WebApiController
 
         try
         {
-            RestoreOldValues();
-            _result = null;
-            _state = "Idle";
-            return new ApiResponse { Success = true, Response = "Discarded; old values restored", StatusCode = 200, Type = "Success" };
+            lock (_stateLock)
+            {
+                // Re-check under the lock: a concurrent /apply may already have consumed the result,
+                // and restoring the old values on top of a completed apply would undo it.
+                if (_state != "PendingResult")
+                {
+                    HttpContext.Response.StatusCode = 409;
+                    return new ApiResponse { Success = false, Error = "No result pending", StatusCode = 409, Type = "Error" };
+                }
+
+                RestoreOldValues();
+                _result = null;
+                _state = "Idle";
+                return new ApiResponse { Success = true, Response = "Discarded; old values restored", StatusCode = 200, Type = "Success" };
+            }
         }
         catch (Exception ex)
         {
@@ -379,9 +484,11 @@ public class FilterOffsetController : WebApiController
         var apiUrl = await CoreUtility.GetApiUrl();
         using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
 
-        // 3. Run loops × filters
-        for (_currentLoop = 1; _currentLoop <= loops; _currentLoop++)
+        // 3. Run loops × filters. The status field tracks the counter rather than being the counter,
+        // so it never reports loops + 1 after the last iteration increments past the bound.
+        for (int loop = 1; loop <= loops; loop++)
         {
+            _currentLoop = loop;
             _currentFilterIndex = 0;
 
             foreach (var filter in selectedFilters)
@@ -411,20 +518,30 @@ public class FilterOffsetController : WebApiController
         // 4. Compute new offsets using the same algorithm as FilterOffsetCalculator.Execute()
         var newOffsets = ComputeOffsets(selectedFilters, calculatedPositions, profile);
 
-        // 5. Store result and move to PendingResult state
-        _result = new FilterOffsetResult
+        // 5. Store result and move to PendingResult state. This is the only transition INTO the state
+        // the HTTP handlers wait on, so it publishes under the same lock they read under — otherwise
+        // the handlers hold a lock that the writer ignores, and the freshly built result has no
+        // release barrier pairing with their acquire (which matters on the ARM targets).
+        //
+        // Keeping the existing AutoFocus filter is always a valid choice, including when it was not
+        // one of the calibrated filters, so it is suggested unchanged — the apply step then anchors
+        // on the base filter instead.
+        lock (_stateLock)
         {
-            OldOffsets = _oldOffsets
-                .Select(o => new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset })
-                .ToList(),
-            NewOffsets = newOffsets
-                .Select(o => new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset })
-                .ToList(),
-            OldDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
-            SuggestedDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
-        };
+            _result = new FilterOffsetResult
+            {
+                OldOffsets = _oldOffsets
+                    .Select(o => new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset })
+                    .ToList(),
+                NewOffsets = newOffsets
+                    .Select(o => new FilterOffsetEntry { Position = o.Position, Name = o.Name, FocusOffset = o.FocusOffset })
+                    .ToList(),
+                OldDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
+                SuggestedDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
+            };
 
-        _state = "PendingResult";
+            _state = "PendingResult";
+        }
     }
 
     // Runs AF for one filter and returns its settled focuser position, guaranteeing the wheel was
@@ -604,61 +721,213 @@ public class FilterOffsetController : WebApiController
         throw new TimeoutException("AutoFocus did not complete within 20 minutes");
     }
 
+    // Never returns a sentinel on failure. A position of 0 is indistinguishable from a real reading,
+    // and every offset in the result is a difference against these numbers — one unreadable position
+    // silently turns the whole calibration into garbage (a failed read for the base filter alone
+    // would push every other filter's offset up to a near-absolute focuser position). Failing the
+    // run instead costs the user a repeat, which is the cheaper of the two outcomes by far.
     private static async Task<int> GetFocuserPositionAsync(string apiUrl, HttpClient client, CancellationToken token)
     {
-        try
-        {
-            var resp = await client.GetAsync($"{apiUrl}/equipment/focuser/info", token);
-            if (!resp.IsSuccessStatusCode) return 0;
+        const int maxAttempts = 3;
+        string lastError = "unknown error";
 
-            var json = await resp.Content.ReadAsStringAsync(token);
-            using var doc = JsonDocument.Parse(json);
-
-            if (doc.RootElement.TryGetProperty("Response", out var response) &&
-                response.TryGetProperty("Position", out var pos))
-                return pos.GetInt32();
-        }
-        catch (Exception ex)
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            Logger.Warning($"FilterOffset: could not read focuser position: {ex.Message}");
+            token.ThrowIfCancellationRequested();
+
+            try
+            {
+                var resp = await client.GetAsync($"{apiUrl}/equipment/focuser/info", token);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync(token);
+                    using var doc = JsonDocument.Parse(json);
+
+                    if (doc.RootElement.TryGetProperty("Response", out var response) &&
+                        response.TryGetProperty("Position", out var pos))
+                        return pos.GetInt32();
+
+                    lastError = "response contained no focuser position";
+                }
+                else
+                {
+                    lastError = $"HTTP {(int)resp.StatusCode}";
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex.Message;
+            }
+
+            Logger.Warning($"FilterOffset: could not read focuser position ({lastError}) — attempt {attempt}/{maxAttempts}");
+            if (attempt < maxAttempts) await Task.Delay(1000, token);
         }
-        return 0;
+
+        throw new Exception($"Could not read the focuser position after {maxAttempts} attempts: {lastError}");
+    }
+
+    // Smallest deviation-from-median (in focuser steps) that may ever be treated as an outlier.
+    // Scaled from the AutoFocus step size so it tracks the setup rather than assuming one focuser:
+    // a run that lands within half an AF sampling step of the others is normal AF scatter, not a
+    // bad measurement. The absolute floor only guards against a nonsensically small step size.
+    private static double OutlierToleranceSteps(NINA.Profile.Interfaces.IProfile profile)
+        => Math.Max(5.0, profile.FocuserSettings.AutoFocusStepSize / 2.0);
+
+    private static double Median(IReadOnlyList<double> sorted)
+        => sorted.Count % 2 == 1
+            ? sorted[sorted.Count / 2]
+            : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2.0;
+
+    /// <summary>
+    /// Robustly aggregates one filter's per-loop AF positions into a single focus position.
+    ///
+    /// A plain mean lets a single bad loop drag the result by a fraction of its error, which is the
+    /// opposite of what running multiple loops is for. Instead: take the median, drop samples that
+    /// are both statistically extreme (&gt; 3 scaled MADs) and beyond the tolerance floor, then mean
+    /// what survives — the median resists the outlier, the mean of the survivors keeps the precision.
+    ///
+    /// Note this can only reject numerically outlying samples. A loop that measured through the
+    /// wrong filter still passes if that filter happens to be near-parfocal with the intended one.
+    ///
+    /// Survivors keep their zero-based loop index, because dropping a loop from the middle of the
+    /// series leaves a gap that the temperature-drift estimate has to account for.
+    ///
+    /// Rejections are reported through <paramref name="reportRejections"/> rather than straight to
+    /// Logger: touching NINA's Logger initialises it, which creates a log file and prunes the real
+    /// user log directory — not something a unit test of this arithmetic should do.
+    /// </summary>
+    internal static List<(int Loop, int Position)> RejectOutliers(
+        string filterName,
+        List<int> positions,
+        double tolerance,
+        Action<string> reportRejections = null)
+    {
+        var all = positions.Select((p, i) => (Loop: i, Position: p)).ToList();
+        if (positions.Count < 3) return all;
+
+        var sorted = positions.Select(p => (double)p).OrderBy(p => p).ToList();
+        double median = Median(sorted);
+
+        var deviations = positions.Select(p => Math.Abs(p - median)).OrderBy(d => d).ToList();
+        // 1.4826 rescales the MAD to be comparable to a standard deviation for normal data.
+        double cutoff = Math.Max(tolerance, 3.0 * 1.4826 * Median(deviations));
+
+        var accepted = new List<(int Loop, int Position)>();
+        var rejected = new List<string>();
+        for (int i = 0; i < positions.Count; i++)
+        {
+            if (Math.Abs(positions[i] - median) > cutoff)
+                rejected.Add($"loop {i + 1}: {positions[i]} ({positions[i] - median:+0.#;-0.#;0} from median)");
+            else
+                accepted.Add((i, positions[i]));
+        }
+
+        if (rejected.Count > 0)
+        {
+            reportRejections?.Invoke(
+                $"FilterOffset: discarded {rejected.Count} outlying measurement(s) for filter '{filterName}' " +
+                $"(median {median:0.#}, cutoff ±{cutoff:0.#} steps): {string.Join("; ", rejected)}. " +
+                "A loop this far off usually means the AutoFocus ran through a different filter than intended " +
+                "— check the filter wheel for slot slippage.");
+        }
+
+        // Defensive only: the median is at or between the samples, so at least one always survives
+        // the cutoff. Kept so a future change to the cutoff can't start returning an empty set and
+        // silently produce an offset out of no measurements at all.
+        return accepted.Count > 0 ? accepted : all;
     }
 
     /// <summary>
-    /// Replicates the offset-calculation math from FilterOffsetCalculator.Execute().
+    /// Mean per-loop focus drift of one filter's surviving samples, positive when the focus position
+    /// moves down over the run.
+    ///
+    /// The divisor is the loop span, not the sample count: the samples are one per loop, but outlier
+    /// rejection can punch a hole in the middle of the series, and a survivor pair that straddles a
+    /// discarded loop is still separated by every loop that sat between them.
+    /// </summary>
+    internal static double EstimatePerLoopDrift(IReadOnlyList<(int Loop, int Position)> samples)
+    {
+        if (samples.Count < 2) return 0.0;
+
+        int loopSpan = samples[^1].Loop - samples[0].Loop;
+        return loopSpan > 0
+            ? (samples[0].Position - samples[^1].Position) / (double)loopSpan
+            : 0.0;
+    }
+
+    /// <summary>
+    /// One filter's surviving samples, averaged and drift-corrected back to the start of the run so
+    /// that filters measured at different times are directly comparable.
+    ///
+    /// Two corrections, both in units of loops:
+    ///  * <paramref name="withinLoopRatio"/> is where in a loop this filter is measured — the later
+    ///    its turn, the more the focus has already moved since that loop began.
+    ///  * the mean loop index is which loops the samples actually came from. Outlier rejection runs
+    ///    per filter, so one filter can lose an early loop that its neighbours kept, which drags its
+    ///    mean later in time by an amount no within-loop term can see. With complete sample sets
+    ///    this term is the same constant for every filter and cancels out of the offsets entirely,
+    ///    which is why it was invisible before rejection existed.
+    /// </summary>
+    internal static double EstimateFocusAtRunStart(
+        IReadOnlyList<(int Loop, int Position)> samples,
+        double driftPerLoop,
+        double withinLoopRatio)
+        => samples.Average(p => p.Position)
+           + ((samples.Average(p => p.Loop) + withinLoopRatio) * driftPerLoop);
+
+    /// <summary>
+    /// Aggregates the per-loop AF results into focus offsets.
+    ///
+    /// Based on the offset math from FilterOffsetCalculator.Execute(), with two deliberate changes:
+    ///  * per-filter aggregation is a median with outlier rejection rather than a plain mean, so one
+    ///    bad loop out of several no longer corrupts every filter's result;
+    ///  * the values returned are offsets relative to the base filter — the lowest-position filter in
+    ///    the selection, which is also the one measured first in every loop — not absolute focuser
+    ///    positions. FocusOffset is a relative quantity everywhere else in NINA: it is displayed as
+    ///    one, compared against the existing offsets in OldOffsets, and pushed to hardware verbatim
+    ///    by some wheels (e.g. OasisFilterWheel.StoreFocusOffsets). The apply step can still
+    ///    re-reference these onto whichever filter the user picks as the new AutoFocus filter.
     /// </summary>
     private static List<(int Position, string Name, int FocusOffset)> ComputeOffsets(
         List<FilterInfo> selectedFilters,
         Dictionary<int, List<int>> calculatedPositions,
         NINA.Profile.Interfaces.IProfile profile)
     {
-        // Temperature drift: average drift per loop of the first (base) filter
-        int temperatureDrift = 0;
-        if (selectedFilters.Count > 0)
+        double tolerance = OutlierToleranceSteps(profile);
+
+        // Outlier-filtered samples per filter position, each tagged with the loop it came from.
+        var accepted = new Dictionary<int, List<(int Loop, int Position)>>();
+        foreach (var f in selectedFilters)
         {
-            var basePositions = calculatedPositions[(int)selectedFilters[0].Position];
-            if (basePositions.Count > 1)
-            {
-                var drifts = new List<int>();
-                for (int i = 0; i < basePositions.Count - 1; i++)
-                    drifts.Add(basePositions[i] - basePositions[i + 1]);
-                temperatureDrift = (int)Math.Ceiling(drifts.Average());
-            }
+            int pos = (int)f.Position;
+            accepted[pos] = RejectOutliers(f.Name, calculatedPositions[pos], tolerance, msg => Logger.Warning(msg));
         }
+
+        // Temperature drift is estimated from the first (base) filter, across surviving samples only
+        // so a rejected loop can't masquerade as thermal movement.
+        double temperatureDrift = selectedFilters.Count > 0
+            ? EstimatePerLoopDrift(accepted[(int)selectedFilters[0].Position])
+            : 0.0;
 
         double defaultAfTime = profile.FocuserSettings.AutoFocusExposureTime;
         double defaultFilterAfTime = new FilterInfo().AutoFocusExposureTime;
 
-        // Total exposure time across selected filters (used for ratio weighting)
-        int totalTime = (int)selectedFilters.Sum(f =>
+        // Total exposure time across selected filters (used for ratio weighting). Kept as a double:
+        // truncating it skews every within-loop ratio, and sub-second exposures would truncate the
+        // whole sum to 0 and silently fall back to the guard below.
+        double totalTime = selectedFilters.Sum(f =>
         {
             var pf = profile.FilterWheelSettings.FilterWheelFilters.FirstOrDefault(x => x.Position == f.Position);
             return pf?.AutoFocusExposureTime == defaultFilterAfTime ? defaultAfTime : (pf?.AutoFocusExposureTime ?? defaultAfTime);
         });
-        if (totalTime <= 0) totalTime = 1;
+        if (totalTime <= 0.0) totalTime = 1.0;
 
-        var result = new List<(int Position, string Name, int FocusOffset)>();
+        // Drift-corrected absolute focus position per filter, in selection order.
+        var absolutePositions = new List<(int Position, string Name, double? Focus)>();
         double totalRatio = 0.0;
 
         foreach (var filter in selectedFilters)
@@ -668,14 +937,37 @@ public class FilterOffsetController : WebApiController
                 ? defaultAfTime
                 : (pf?.AutoFocusExposureTime ?? defaultAfTime);
 
-            double filterRatio = filterTime / totalTime;
-            var positions = calculatedPositions[(int)filter.Position];
-            int focusOffset = positions.Count > 0
-                ? (int)Math.Ceiling(positions.Average() + (totalRatio * temperatureDrift))
+            var positions = accepted[(int)filter.Position];
+            double? focus = positions.Count > 0
+                ? EstimateFocusAtRunStart(positions, temperatureDrift, totalRatio)
+                : null;
+
+            absolutePositions.Add(((int)filter.Position, filter.Name, focus));
+            totalRatio += filterTime / totalTime;
+        }
+
+        // Convert to offsets relative to the base filter.
+        double? baseFocus = absolutePositions.Count > 0 ? absolutePositions[0].Focus : null;
+        if (baseFocus == null)
+        {
+            Logger.Warning("FilterOffset: base filter has no usable measurement — reporting all offsets as 0.");
+            return absolutePositions.Select(p => (p.Position, p.Name, 0)).ToList();
+        }
+
+        Logger.Info($"FilterOffset: computing offsets relative to base filter '{absolutePositions[0].Name}' " +
+                    $"at position {baseFocus.Value:0.#} (temperature drift {temperatureDrift:+0.##;-0.##;0} steps/loop)");
+
+        var result = new List<(int Position, string Name, int FocusOffset)>();
+        foreach (var (Position, Name, Focus) in absolutePositions)
+        {
+            int focusOffset = Focus.HasValue
+                ? (int)Math.Round(Focus.Value - baseFocus.Value, MidpointRounding.AwayFromZero)
                 : 0;
 
-            result.Add(((int)filter.Position, filter.Name, focusOffset));
-            totalRatio += filterRatio;
+            if (!Focus.HasValue)
+                Logger.Warning($"FilterOffset: no usable measurement for filter '{Name}' — offset set to 0.");
+
+            result.Add((Position, Name, focusOffset));
         }
 
         return result;
@@ -716,7 +1008,10 @@ public class FilterOffsetStartRequest
 
 public class FilterOffsetApplyRequest
 {
-    public bool UseRelativeOffsets { get; set; }
+    /// <summary>
+    /// Filter that becomes the AutoFocus filter, and the filter the new offsets are anchored on.
+    /// Null leaves no AutoFocus filter set and anchors on the base filter instead.
+    /// </summary>
     public int? NewDefaultFilterPosition { get; set; }
 }
 
