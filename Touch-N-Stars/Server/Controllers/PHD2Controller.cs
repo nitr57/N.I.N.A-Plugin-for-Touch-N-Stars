@@ -4,6 +4,7 @@ using EmbedIO.WebApi;
 using NINA.Core.Utility;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using TouchNStars.PHD2;
 using TouchNStars.Server.Models;
@@ -231,7 +232,7 @@ public class PHD2Controller : WebApiController
         {
             EnsurePHD2ServicesInitialized();
             var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
-            
+
             if (requestData == null || !requestData.ContainsKey("name") || requestData["name"] == null)
             {
                 HttpContext.Response.StatusCode = 400;
@@ -245,7 +246,7 @@ public class PHD2Controller : WebApiController
             }
 
             string profileName = requestData["name"].ToString();
-            
+
             if (string.IsNullOrEmpty(profileName))
             {
                 HttpContext.Response.StatusCode = 400;
@@ -304,7 +305,7 @@ public class PHD2Controller : WebApiController
         {
             EnsurePHD2ServicesInitialized();
             var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
-            
+
             if (requestData == null || !requestData.ContainsKey("name") || requestData["name"] == null)
             {
                 HttpContext.Response.StatusCode = 400;
@@ -318,7 +319,7 @@ public class PHD2Controller : WebApiController
             }
 
             string profileName = requestData["name"].ToString();
-            
+
             if (string.IsNullOrEmpty(profileName))
             {
                 HttpContext.Response.StatusCode = 400;
@@ -377,7 +378,7 @@ public class PHD2Controller : WebApiController
         {
             EnsurePHD2ServicesInitialized();
             var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
-            
+
             if (requestData == null || !requestData.ContainsKey("name") || requestData["name"] == null)
             {
                 HttpContext.Response.StatusCode = 400;
@@ -391,7 +392,7 @@ public class PHD2Controller : WebApiController
             }
 
             string newName = requestData["name"].ToString();
-            
+
             if (string.IsNullOrEmpty(newName))
             {
                 HttpContext.Response.StatusCode = 400;
@@ -450,7 +451,7 @@ public class PHD2Controller : WebApiController
         {
             EnsurePHD2ServicesInitialized();
             var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
-            
+
             if (requestData == null || !requestData.ContainsKey("id") || requestData["id"] == null)
             {
                 HttpContext.Response.StatusCode = 400;
@@ -955,67 +956,69 @@ public class PHD2Controller : WebApiController
     /// </summary>
     [Route(HttpVerbs.Get, "/phd2/calibration/focal-length")]
     public async Task<ApiResponse> GetPHD2FocalLength()
+    {
+        try
         {
-            try
-            {
-                EnsurePHD2ServicesInitialized();
-                var focalLength = await phd2Service.GetFocalLengthAsync();
+            EnsurePHD2ServicesInitialized();
+            var focalLength = await phd2Service.GetFocalLengthAsync();
 
-                return new ApiResponse
-                {
-                    Success = true,
-                    Response = new { FocalLength = focalLength },
-                    StatusCode = 200,
-                    Type = "PHD2FocalLength"
-                };
-            }
-            catch (Exception ex)
+            return new ApiResponse
             {
-                Logger.Error(ex);
-                HttpContext.Response.StatusCode = 500;
+                Success = true,
+                Response = new { FocalLength = focalLength },
+                StatusCode = 200,
+                Type = "PHD2FocalLength"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/phd2/focal-length - Set focal length
+    /// </summary>
+    [Route(HttpVerbs.Put, "/phd2/calibration/focal-length")]
+    public async Task<ApiResponse> SetPHD2FocalLength()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null || !requestData.ContainsKey("focalLength") || requestData["focalLength"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
                 return new ApiResponse
                 {
                     Success = false,
-                    Error = ex.Message,
-                    StatusCode = 500,
+                    Error = "focalLength parameter is required",
+                    StatusCode = 400,
                     Type = "Error"
                 };
             }
-        }
 
-        /// <summary>
-        /// PUT /api/phd2/focal-length - Set focal length
-        /// </summary>
-        [Route(HttpVerbs.Put, "/phd2/calibration/focal-length")]
-        public async Task<ApiResponse> SetPHD2FocalLength()
-        {
-            try
+            if (!int.TryParse(requestData["focalLength"].ToString(), out int focalLength))
             {
-                EnsurePHD2ServicesInitialized();
-                var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
-                if (requestData == null || !requestData.ContainsKey("focalLength") || requestData["focalLength"] == null)
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
                 {
-                    HttpContext.Response.StatusCode = 400;
-                    return new ApiResponse
-                    {
-                        Success = false,
-                        Error = "focalLength parameter is required",
-                        StatusCode = 400,
-                        Type = "Error"
-                    };
-                }
-
-                if (!int.TryParse(requestData["focalLength"].ToString(), out int focalLength))
-                {
-                    HttpContext.Response.StatusCode = 400;
-                    return new ApiResponse
-                    {
-                        Success = false,
-                        Error = "focalLength must be a valid integer",
-                        StatusCode = 400,
-                        Type = "Error"
-                    };
-                }            await phd2Service.SetFocalLengthAsync(focalLength);
+                    Success = false,
+                    Error = "focalLength must be a valid integer",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+            await phd2Service.SetFocalLengthAsync(focalLength);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2FocalLength = focalLength;
 
             return new ApiResponse
             {
@@ -1065,7 +1068,7 @@ public class PHD2Controller : WebApiController
             object starImageInfo = null;
             try
             {
-                if (phd2Service.IsConnected && (status?.AppState == "Guiding" || status?.AppState == "Looping"))
+                if (phd2Service.IsConnected && (status?.AppState == "Guiding" || status?.AppState == "Looping" || status?.AppState == "Calibrating" || status?.AppState == "Selected" || status?.AppState == "Paused"))
                 {
                     var starImage = await phd2Service.GetStarImageAsync(15); // Get minimal size star image for info
                     if (starImage != null)
@@ -1124,6 +1127,13 @@ public class PHD2Controller : WebApiController
                 Settling = settling,
                 PixelScale = pixelScale,
                 StarImage = starImageInfo,
+                StarInfo = status?.CurrentStar != null ? new
+                {
+                    SNR = status.CurrentStar.SNR,
+                    HFD = status.CurrentStar.HFD,
+                    StarMass = status.CurrentStar.StarMass,
+                    LastUpdate = status.CurrentStar.LastUpdate
+                } : null,
                 Capabilities = new
                 {
                     CanGuide = phd2Service.IsConnected && (status?.AppState == "Guiding" || status?.AppState == "Looping" || status?.AppState == "Stopped"),
@@ -1222,6 +1232,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetExposureAsync(exposureMs);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2ExposureMs = exposureMs;
 
             return new ApiResponse
             {
@@ -1302,6 +1313,7 @@ public class PHD2Controller : WebApiController
 
             string mode = requestData["mode"].ToString();
             await phd2Service.SetDecGuideModeAsync(mode);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2DecGuideMode = mode;
 
             return new ApiResponse
             {
@@ -1355,6 +1367,324 @@ public class PHD2Controller : WebApiController
                 StatusCode = 500,
                 Type = "Error"
             };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/get-max-ra-duration - Get max RA guide pulse duration (ms).
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/get-max-ra-duration")]
+    public async Task<ApiResponse> GetPHD2MaxRaDuration()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var value = await phd2Service.GetMaxRaDurationAsync();
+            return new ApiResponse { Success = true, Response = new { MaxRaDuration = value }, StatusCode = 200, Type = "PHD2Parameter" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/set-max-ra-duration - Set max RA guide pulse duration (ms).
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/set-max-ra-duration")]
+    public async Task<ApiResponse> SetPHD2MaxRaDuration()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null || !requestData.ContainsKey("ms") || requestData["ms"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse { Success = false, Error = "ms parameter is required", StatusCode = 400, Type = "Error" };
+            }
+            if (!int.TryParse(requestData["ms"].ToString(), out int ms))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse { Success = false, Error = "ms must be an integer", StatusCode = 400, Type = "Error" };
+            }
+            await phd2Service.SetMaxRaDurationAsync(ms);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2MaxRADuration = ms;
+            return new ApiResponse { Success = true, Response = new { MaxRaDurationSet = ms }, StatusCode = 200, Type = "PHD2Parameter" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/get-max-dec-duration - Get max DEC guide pulse duration (ms).
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/get-max-dec-duration")]
+    public async Task<ApiResponse> GetPHD2MaxDecDuration()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var value = await phd2Service.GetMaxDecDurationAsync();
+            return new ApiResponse { Success = true, Response = new { MaxDecDuration = value }, StatusCode = 200, Type = "PHD2Parameter" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/set-max-dec-duration - Set max DEC guide pulse duration (ms).
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/set-max-dec-duration")]
+    public async Task<ApiResponse> SetPHD2MaxDecDuration()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null || !requestData.ContainsKey("ms") || requestData["ms"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse { Success = false, Error = "ms parameter is required", StatusCode = 400, Type = "Error" };
+            }
+            if (!int.TryParse(requestData["ms"].ToString(), out int ms))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse { Success = false, Error = "ms must be an integer", StatusCode = 400, Type = "Error" };
+            }
+            await phd2Service.SetMaxDecDurationAsync(ms);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2MaxDecDuration = ms;
+            return new ApiResponse { Success = true, Response = new { MaxDecDurationSet = ms }, StatusCode = 200, Type = "PHD2Parameter" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/dark-library/info - Get dark library info
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/dark-library/info")]
+    public async Task<ApiResponse> GetPHD2DarkLibraryInfo()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var info = await phd2Service.GetDarkLibraryInfoAsync();
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new
+                {
+                    Exists = info.Value<bool>("exists"),
+                    Loaded = info.Value<bool>("loaded"),
+                    NumDarks = info.Value<int>("numDarks"),
+                    MinExposureSec = info.Value<double>("minExposureSec"),
+                    MaxExposureSec = info.Value<double>("maxExposureSec"),
+                },
+                StatusCode = 200,
+                Type = "PHD2DarkLibrary"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/dark-library/load - Load the dark library
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/dark-library/load")]
+    public async Task<ApiResponse> LoadPHD2DarkLibrary()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            await phd2Service.LoadDarkLibraryAsync();
+            return new ApiResponse { Success = true, Response = new { Loaded = true }, StatusCode = 200, Type = "PHD2DarkLibrary" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/dark-library/unload - Unload the dark library
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/dark-library/unload")]
+    public async Task<ApiResponse> UnloadPHD2DarkLibrary()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            await phd2Service.UnloadDarkLibraryAsync();
+            return new ApiResponse { Success = true, Response = new { Unloaded = true }, StatusCode = 200, Type = "PHD2DarkLibrary" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// DELETE /api/phd2/dark-library - Delete the dark library file
+    /// </summary>
+    [Route(HttpVerbs.Delete, "/phd2/dark-library")]
+    public async Task<ApiResponse> DeletePHD2DarkLibrary()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            await phd2Service.DeleteDarkLibraryAsync();
+            return new ApiResponse { Success = true, Response = new { Deleted = true }, StatusCode = 200, Type = "PHD2DarkLibrary" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/dark-library/build - Start building a dark library.
+    /// Body: { "expTimesMs": [500, 1000, 2000], "frameCount": 10 }
+    /// Returns immediately; progress arrives as PHD2 events DarkLibraryBuildProgress / DarkLibraryBuildComplete.
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/dark-library/build")]
+    public async Task<ApiResponse> StartPHD2DarkLibraryBuild()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null || !requestData.ContainsKey("expTimesMs") || requestData["expTimesMs"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse { Success = false, Error = "expTimesMs array is required", StatusCode = 400, Type = "Error" };
+            }
+
+            int[] expTimesMs;
+            try
+            {
+                var arrVal = requestData["expTimesMs"];
+                int[] parsed = null;
+                if (arrVal is System.Collections.Generic.List<object> list)
+                {
+                    parsed = list.Select(o => Convert.ToInt32(o)).ToArray();
+                }
+                else if (arrVal is object[] objArr)
+                {
+                    parsed = objArr.Select(o => Convert.ToInt32(o)).ToArray();
+                }
+                else if (arrVal is System.Text.Json.JsonElement je && je.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    parsed = je.EnumerateArray().Select(e => e.GetInt32()).ToArray();
+                }
+                if (parsed == null || parsed.Length == 0)
+                    throw new ArgumentException("empty");
+                expTimesMs = parsed;
+            }
+            catch (Exception innerEx)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse { Success = false, Error = "expTimesMs must be a non-empty array of integers (ms)", StatusCode = 400, Type = "Error" };
+            }
+
+            int frameCount = 5;
+            if (requestData.ContainsKey("frameCount") && requestData["frameCount"] != null)
+            {
+                if (!int.TryParse(requestData["frameCount"].ToString(), out frameCount) || frameCount < 1)
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new ApiResponse { Success = false, Error = "frameCount must be a positive integer", StatusCode = 400, Type = "Error" };
+                }
+            }
+
+            await phd2Service.StartBuildDarkLibraryAsync(expTimesMs, frameCount);
+            return new ApiResponse { Success = true, Response = new { Building = true }, StatusCode = 200, Type = "PHD2DarkLibrary" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/dark-library/cancel-build - Cancel an in-progress dark library build
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/dark-library/cancel-build")]
+    public async Task<ApiResponse> CancelPHD2DarkLibraryBuild()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            await phd2Service.CancelBuildDarkLibraryAsync();
+            return new ApiResponse { Success = true, Response = new { Cancelled = true }, StatusCode = 200, Type = "PHD2DarkLibrary" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/dark-library/build-status - Poll dark library build progress
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/dark-library/build-status")]
+    public Task<ApiResponse> GetPHD2DarkLibraryBuildStatus()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var status = phd2Service.GetDarkBuildStatus();
+            return Task.FromResult(new ApiResponse
+            {
+                Success = true,
+                Response = new
+                {
+                    status.Active,
+                    status.Complete,
+                    status.Success,
+                    status.Frame,
+                    status.TotalFrames,
+                    status.ExposureMs,
+                    status.Error
+                },
+                StatusCode = 200,
+                Type = "PHD2DarkLibraryBuildStatus"
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return Task.FromResult(new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" });
         }
     }
 
@@ -1659,6 +1989,43 @@ public class PHD2Controller : WebApiController
     }
 
     /// <summary>
+    /// GET /api/phd2/star-positions - Get primary and secondary guide star positions
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/star-positions")]
+    public async Task<ApiResponse> GetPHD2StarPositions()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+
+            var secondaryStars = await phd2Service.GetSecondaryStarsAsync();
+            var secondary = secondaryStars
+                .Select(s => new { X = s[0], Y = s[1] })
+                .ToList();
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Secondary = secondary },
+                StatusCode = 200,
+                Type = "PHD2StarPositions"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
     /// POST /api/phd2/set-lock-shift-enabled - Enable/disable lock shift
     /// </summary>
     [Route(HttpVerbs.Post, "/phd2/set-lock-shift-enabled")]
@@ -1890,6 +2257,27 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetAlgoParamAsync(axis, name, value);
+            var _gs = TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings;
+            if (axis == "ra" && name == "minMove") _gs.PHD2RAMinMove = value;
+            else if (axis == "dec" && name == "minMove") _gs.PHD2DecMinMove = value;
+            else if (axis == "ra" && name == "aggression") _gs.PHD2RAAggressiveness = value;
+            else if (axis == "dec" && name == "aggression") _gs.PHD2DecAggressiveness = value;
+            else if (axis == "ra" && name == "hysteresis") _gs.PHD2RAHysteresis = value;
+            else if (axis == "dec" && name == "hysteresis") _gs.PHD2DecHysteresis = value;
+            else if (axis == "dec" && name == "fastSwitch") _gs.PHD2DecFastSwitch = value != 0.0;
+            else if (axis == "ra" && name == "fastSwitch") _gs.PHD2RAFastSwitch = value != 0.0;
+            else if (axis == "ra" && name == "slopeWeight") _gs.PHD2RASlopeWeight = value;
+            else if (axis == "dec" && name == "slopeWeight") _gs.PHD2DecSlopeWeight = value;
+            else if (axis == "ra" && name == "aggressiveness") _gs.PHD2RALowpass2Aggressiveness = value;
+            else if (axis == "dec" && name == "aggressiveness") _gs.PHD2DecLowpass2Aggressiveness = value;
+            else if (axis == "ra" && name == "predictiveWeight") _gs.PHD2RAPredictiveWeight = value;
+            else if (axis == "dec" && name == "predictiveWeight") _gs.PHD2DecPredictiveWeight = value;
+            else if (axis == "ra" && name == "reactiveWeight") _gs.PHD2RAReactiveWeight = value;
+            else if (axis == "dec" && name == "reactiveWeight") _gs.PHD2DecReactiveWeight = value;
+            else if (axis == "ra" && name == "periodLength") { _gs.PHD2RAPeriodLength = value; _gs.PHD2RAGPAutoAdjustPeriod = false; }
+            else if (axis == "dec" && name == "periodLength") { _gs.PHD2DecPeriodLength = value; _gs.PHD2DecGPAutoAdjustPeriod = false; }
+            else if (axis == "ra" && name == "expFactor") _gs.PHD2RAExpFactor = value;
+            else if (axis == "dec" && name == "expFactor") _gs.PHD2DecExpFactor = value;
 
             return new ApiResponse
             {
@@ -2052,6 +2440,9 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetVariableDelaySettingsAsync(enabled, shortDelaySeconds, longDelaySeconds);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2VarDelayEnabled = enabled;
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2VarDelayShortSec = shortDelaySeconds;
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2VarDelayLongSec = longDelaySeconds;
 
             return new ApiResponse
             {
@@ -2116,6 +2507,98 @@ public class PHD2Controller : WebApiController
                 Error = ex.Message,
                 StatusCode = 400,
                 Type = "PHD2MethodNotFound"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/time-lapse - Get time lapse delay in ms
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/time-lapse")]
+    public async Task<ApiResponse> GetTimeLapse()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            int ms = await phd2Service.GetTimeLapseAsync();
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { TimeLapseMs = ms },
+                StatusCode = 200,
+                Type = "PHD2TimeLapse"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/phd2/time-lapse - Set time lapse delay in ms
+    /// </summary>
+    [Route(HttpVerbs.Put, "/phd2/time-lapse")]
+    public async Task<ApiResponse> SetTimeLapse()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null || !requestData.ContainsKey("ms"))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "ms parameter is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            if (!int.TryParse(requestData["ms"].ToString(), out int ms) || ms < 0)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "ms must be a non-negative integer",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            await phd2Service.SetTimeLapseAsync(ms);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2TimeLapseMs = ms;
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { TimeLapseMs = ms },
+                StatusCode = 200,
+                Type = "PHD2TimeLapse"
             };
         }
         catch (Exception ex)
@@ -2294,12 +2777,13 @@ public class PHD2Controller : WebApiController
     /// GET /api/phd2/current-image - Get current PHD2 image
     /// </summary>
     [Route(HttpVerbs.Get, "/phd2/current-image")]
-    public async Task GetPHD2CurrentImage()
+    public async Task GetPHD2CurrentImage([QueryField] double gamma)
     {
         try
         {
             EnsurePHD2ServicesInitialized();
-            var imageBytes = await phd2ImageService.GetCurrentImageBytesAsync();
+            double effectiveGamma = gamma > 0 ? gamma : 0.5;
+            var imageBytes = await phd2ImageService.GetCurrentImageBytesAsync(effectiveGamma);
 
             if (imageBytes == null)
             {
@@ -2418,6 +2902,44 @@ public class PHD2Controller : WebApiController
     }
 
     /// <summary>
+    /// GET /api/phd2/calibration-data - Get PHD2 mount calibration data
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/calibration-data")]
+    public async Task<ApiResponse> GetPHD2CalibrationData()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var data = await phd2Service.GetCalibrationDataAsync();
+            return new ApiResponse { Success = true, Response = data, StatusCode = 200, Type = "PHD2CalibrationData" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error getting PHD2 calibration data: {ex}");
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/phd2/clear-calibration - Clear PHD2 mount calibration
+    /// </summary>
+    [Route(HttpVerbs.Post, "/phd2/clear-calibration")]
+    public async Task<ApiResponse> ClearPHD2Calibration()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            await phd2Service.ClearMountCalibrationAsync();
+            return new ApiResponse { Success = true, Response = "Calibration cleared", StatusCode = 200, Type = "PHD2ClearCalibration" };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error clearing PHD2 calibration: {ex}");
+            return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
+        }
+    }
+
+    /// <summary>
     /// GET /api/phd2/star-image - Get PHD2 star image
     /// </summary>
     [Route(HttpVerbs.Get, "/phd2/star-image")]
@@ -2496,6 +3018,49 @@ public class PHD2Controller : WebApiController
                 Type = "Error"
             });
             Response.OutputStream.Write(System.Text.Encoding.UTF8.GetBytes(errorResponse));
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/camera/info - Get detailed info about the currently selected guide camera
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/camera/info")]
+    public async Task<ApiResponse> GetCameraInfo()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            if (!phd2Service.IsConnected)
+            {
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "PHD2 is not connected",
+                    StatusCode = 400,
+                    Type = "PHD2NotConnected"
+                };
+            }
+
+            var info = await phd2Service.GetCameraInfoAsync();
+            return new ApiResponse
+            {
+                Success = true,
+                Response = info,
+                StatusCode = 200,
+                Type = "PHD2CameraInfo"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
         }
     }
 
@@ -2613,6 +3178,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetCalibrationStepAsync(step);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2CalibrationStepMs = step;
 
             return new ApiResponse
             {
@@ -2620,6 +3186,98 @@ public class PHD2Controller : WebApiController
                 Response = new { CalibrationStep = step },
                 StatusCode = 200,
                 Type = "PHD2CalibrationStep"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/calibration/distance - Get calibration distance
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/calibration/distance")]
+    public async Task<ApiResponse> GetCalibrationDistance()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var distance = await phd2Service.GetCalibrationDistanceAsync();
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { CalibrationDistance = distance },
+                StatusCode = 200,
+                Type = "PHD2CalibrationDistance"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/phd2/calibration/distance - Set calibration distance
+    /// </summary>
+    [Route(HttpVerbs.Put, "/phd2/calibration/distance")]
+    public async Task<ApiResponse> SetCalibrationDistance()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null || !requestData.ContainsKey("calibrationDistance") || requestData["calibrationDistance"] == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "calibrationDistance parameter is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            if (!int.TryParse(requestData["calibrationDistance"].ToString(), out int distance))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "calibrationDistance must be a valid integer",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            await phd2Service.SetCalibrationDistanceAsync(distance);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2CalibrationDistancePx = distance;
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { CalibrationDistance = distance },
+                StatusCode = 200,
+                Type = "PHD2CalibrationDistance"
             };
         }
         catch (Exception ex)
@@ -2738,6 +3396,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetAutoRestoreCalibrationsAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2AutoRestoreCalibration = enabled;
 
             return new ApiResponse
             {
@@ -2830,6 +3489,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetAssumeDecOrthogonalAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2AssumeDecOrthogonal = enabled;
 
             return new ApiResponse
             {
@@ -2922,6 +3582,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetUseDecCompensationAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2UseDecCompensation = enabled;
 
             return new ApiResponse
             {
@@ -3014,6 +3675,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetSearchRegionAsync(pixels);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2SearchRegion = pixels;
 
             return new ApiResponse
             {
@@ -3106,6 +3768,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetMinStarHFRAsync(hfr);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2MinStarHFD = hfr;
 
             return new ApiResponse
             {
@@ -3198,6 +3861,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetMaxStarHFRAsync(hfr);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2MaxStarHFD = hfr;
 
             return new ApiResponse
             {
@@ -3290,6 +3954,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetBeepForLostStarAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2BeepForLostStar = enabled;
 
             return new ApiResponse
             {
@@ -3382,6 +4047,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetMassChangeThresholdEnabledAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2MassChangeThresholdEnabled = enabled;
 
             return new ApiResponse
             {
@@ -3473,6 +4139,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetMassChangeThresholdAsync(threshold / 100d);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2MassChangeThreshold = threshold / 100d;
 
             return new ApiResponse
             {
@@ -3565,6 +4232,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetAFMinStarSNRAsync(snr);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2AfMinStarSnr = snr;
 
             return new ApiResponse
             {
@@ -3657,6 +4325,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetUseMultipleStarsAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2UseMultipleStars = enabled;
 
             return new ApiResponse
             {
@@ -3750,6 +4419,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetAutoSelectDownsampleAsync(value);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2AutoSelectDownsample = value;
 
             return new ApiResponse
             {
@@ -3934,6 +4604,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetReverseDecAfterFlipAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2ReverseDecOnFlip = enabled;
 
             return new ApiResponse
             {
@@ -4026,6 +4697,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetFastRecenterEnabledAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2FastRecenter = enabled;
 
             return new ApiResponse
             {
@@ -4211,6 +4883,7 @@ public class PHD2Controller : WebApiController
                 };
             }
             await phd2Service.SetGuideAlgorithmRAAsync(algorithm);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2GuideAlgorithmRA = algorithm;
             return new ApiResponse
             {
                 Success = true,
@@ -4301,6 +4974,7 @@ public class PHD2Controller : WebApiController
                 };
             }
             await phd2Service.SetGuideAlgorithmDECAsync(algorithm);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2GuideAlgorithmDec = algorithm;
             return new ApiResponse
             {
                 Success = true,
@@ -4405,6 +5079,9 @@ public class PHD2Controller : WebApiController
                 aduValue = adu;
             }
             await phd2Service.SetSaturationByADUAsync(byADU, aduValue);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2SaturationByADU = byADU;
+            if (aduValue.HasValue)
+                TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2SaturationADUValue = aduValue.Value;
             return new ApiResponse
             {
                 Success = true,
@@ -4492,6 +5169,8 @@ public class PHD2Controller : WebApiController
                 };
             }
             await phd2Service.SetSaturationADUValueAsync(aduValue);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2SaturationByADU = true;
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2SaturationADUValue = aduValue;
             return new ApiResponse
             {
                 Success = true,
@@ -4580,6 +5259,7 @@ public class PHD2Controller : WebApiController
                 };
             }
             await phd2Service.SetDitherModeAsync(mode);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2DitherMode = mode;
             return new ApiResponse
             {
                 Success = true,
@@ -4667,6 +5347,7 @@ public class PHD2Controller : WebApiController
                 };
             }
             await phd2Service.SetDitherRaOnlyAsync(raOnly);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2DitherRAOnly = raOnly;
             return new ApiResponse
             {
                 Success = true,
@@ -4754,6 +5435,7 @@ public class PHD2Controller : WebApiController
                 };
             }
             await phd2Service.SetDitherScaleAsync(scale);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2DitherScale = scale;
             return new ApiResponse
             {
                 Success = true,
@@ -5104,6 +5786,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetCameraGainAsync(gain);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2CameraGain = gain;
 
             return new ApiResponse
             {
@@ -5377,6 +6060,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetCameraUseSubframesAsync(enabled);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2UseSubframes = enabled;
 
             return new ApiResponse
             {
@@ -5468,6 +6152,7 @@ public class PHD2Controller : WebApiController
             }
 
             await phd2Service.SetCameraBinningAsync(binning);
+            TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2CameraBinning = binning;
 
             return new ApiResponse
             {
@@ -5475,6 +6160,139 @@ public class PHD2Controller : WebApiController
                 Response = new { CameraBinning = binning },
                 StatusCode = 200,
                 Type = "PHD2CameraBinning"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/phd2/backlash/comp - Get backlash compensation settings
+    /// </summary>
+    [Route(HttpVerbs.Get, "/phd2/backlash/comp")]
+    public async Task<ApiResponse> GetBacklashComp()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var (enabled, pulseWidth, floor, ceiling) = await phd2Service.GetBacklashCompAsync();
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Enabled = enabled, PulseWidth = pulseWidth, Floor = floor, Ceiling = ceiling },
+                StatusCode = 200,
+                Type = "PHD2BacklashComp"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = ex.Message,
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/phd2/backlash/comp - Set backlash compensation settings
+    /// </summary>
+    [Route(HttpVerbs.Put, "/phd2/backlash/comp")]
+    public async Task<ApiResponse> SetBacklashComp()
+    {
+        try
+        {
+            EnsurePHD2ServicesInitialized();
+            var requestData = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
+            if (requestData == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Request body is required",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            bool? enabled = null;
+            int? pulseWidth = null;
+            int? floor = null;
+            int? ceiling = null;
+
+            if (requestData.ContainsKey("enabled") && requestData["enabled"] != null)
+            {
+                if (!bool.TryParse(requestData["enabled"].ToString(), out bool e))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new ApiResponse { Success = false, Error = "enabled must be a valid boolean", StatusCode = 400, Type = "Error" };
+                }
+                enabled = e;
+            }
+
+            if (requestData.ContainsKey("pulseWidth") && requestData["pulseWidth"] != null)
+            {
+                if (!int.TryParse(requestData["pulseWidth"].ToString(), out int pw))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new ApiResponse { Success = false, Error = "pulseWidth must be a valid integer", StatusCode = 400, Type = "Error" };
+                }
+                pulseWidth = pw;
+            }
+
+            if (requestData.ContainsKey("floor") && requestData["floor"] != null)
+            {
+                if (!int.TryParse(requestData["floor"].ToString(), out int f))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new ApiResponse { Success = false, Error = "floor must be a valid integer", StatusCode = 400, Type = "Error" };
+                }
+                floor = f;
+            }
+
+            if (requestData.ContainsKey("ceiling") && requestData["ceiling"] != null)
+            {
+                if (!int.TryParse(requestData["ceiling"].ToString(), out int c))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new ApiResponse { Success = false, Error = "ceiling must be a valid integer", StatusCode = 400, Type = "Error" };
+                }
+                ceiling = c;
+            }
+
+            await phd2Service.SetBacklashCompAsync(enabled, pulseWidth, floor, ceiling);
+
+            if (enabled.HasValue)
+                TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2BacklashCompEnabled = enabled.Value;
+            if (pulseWidth.HasValue)
+                TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2BacklashPulseWidth = pulseWidth.Value;
+            if (floor.HasValue)
+                TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2BacklashFloor = floor.Value;
+            if (ceiling.HasValue)
+                TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings.PHD2BacklashCeiling = ceiling.Value;
+
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Enabled = enabled, PulseWidth = pulseWidth, Floor = floor, Ceiling = ceiling },
+                StatusCode = 200,
+                Type = "PHD2BacklashComp"
             };
         }
         catch (Exception ex)

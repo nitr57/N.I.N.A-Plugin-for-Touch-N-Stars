@@ -1,22 +1,31 @@
-﻿using NINA.Core.Utility;
+﻿using NINA.Astrometry.Interfaces;
+using NINA.Core.Utility;
 using NINA.Core.Utility.Notification;
 using NINA.Equipment.Interfaces.Mediator;
+using NINA.Equipment.Equipment.MyTelescope;
 using NINA.Image.Interfaces;
 using NINA.Plugin;
 using NINA.Plugin.Interfaces;
 using NINA.Profile.Interfaces;
+using NINA.Sequencer.Interfaces.Mediator;
+using NINA.Sequencer.Logic;
+using NINA.WPF.Base.Interfaces.Mediator;
 using NINA.WPF.Base.Interfaces.ViewModel;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.Composition;
+using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 using System.Text;
 using TouchNStars.Utility;
 using TouchNStars.Server;
 using TouchNStars.Server.Controllers;
+using TouchNStars.Server.Models;
 using Settings = TouchNStars.Properties.Settings;
 using System.Windows;
 
@@ -28,20 +37,46 @@ namespace TouchNStars {
         IFramingAssistantVM framingAssistantVM,
         IProfileService profile,
         IGuiderMediator guider,
-        IMessageBroker broker) {
+        ITelescopeMediator telescope,
+        IMessageBroker broker,
+        ISequenceMediator sequence,
+        ICameraMediator camera,
+        IImagingMediator imaging,
+        IImageSaveMediator imageSaveMediator,
+        IImageHistoryVM imageHistory,
+        IFilterWheelMediator filterWheel,
+        IFlatDeviceMediator flatDevice,
+        ITwilightCalculator twilightCalculator,
+        ISymbolBroker symbolBroker,
+        IFocuserMediator focuser) {
 
         public readonly IDeepSkyObjectSearchVM DeepSkyObjectSearchVM = DeepSkyObjectSearchVM;
         public readonly IImageDataFactory ImageDataFactory = ImageDataFactory;
         public readonly IFramingAssistantVM FramingAssistantVM = framingAssistantVM;
         public readonly IProfileService Profile = profile;
         public readonly IGuiderMediator Guider = guider;
+        public readonly ITelescopeMediator Telescope = telescope;
         public readonly IMessageBroker MessageBroker = broker;
+        public readonly ISequenceMediator Sequence = sequence;
+        public readonly ICameraMediator Camera = camera;
+        public readonly IImagingMediator Imaging = imaging;
+        public readonly IImageSaveMediator ImageSaveMediator = imageSaveMediator;
+        public readonly IImageHistoryVM ImageHistory = imageHistory;
+        public readonly IFilterWheelMediator FilterWheel = filterWheel;
+        public readonly IFlatDeviceMediator FlatDevice = flatDevice;
+        public readonly ITwilightCalculator TwilightCalculator = twilightCalculator;
+        public readonly ISymbolBroker SymbolBroker = symbolBroker;
+        public readonly IFocuserMediator Focuser = focuser;
     }
 
     [Export(typeof(IPluginManifest))]
     public class TouchNStars : PluginBase, INotifyPropertyChanged {
         private const string MdnsServiceType = "_touchnstars._tcp.";
         private const string MdnsInstancePrefix = "touchnstars_";
+
+        // Machines sharing a hostname (e.g. identical Pi images) would otherwise advertise
+        // colliding mDNS instance/host names, hiding all but one instance from discovery.
+        private static readonly Lazy<string> mdnsMachineId = new(ComputeMdnsMachineId);
 
         private TouchNStarsServer server;
         private MdnsBroadcaster mdnsBroadcaster;
@@ -60,7 +95,18 @@ namespace TouchNStars {
                     IImageDataFactory imageDataFactory,
                     IFramingAssistantVM framingAssistantVM,
                     IGuiderMediator guider,
-                    IMessageBroker broker) {
+                    ITelescopeMediator telescope,
+                    IMessageBroker broker,
+                    ISequenceMediator sequence,
+                    ICameraMediator camera,
+                    IImagingMediator imagingMediator,
+                    IImageSaveMediator imageSaveMediator,
+                    IImageHistoryVM imageHistoryVM,
+                    IFilterWheelMediator filterWheelMediator,
+                    IFlatDeviceMediator flatDeviceMediator,
+                    ITwilightCalculator twilightCalculator,
+                    ISymbolBroker symbolBroker,
+                    IFocuserMediator focuserMediator) {
             if (Settings.Default.UpdateSettings) {
                 Settings.Default.Upgrade();
                 Settings.Default.UpdateSettings = false;
@@ -75,7 +121,18 @@ namespace TouchNStars {
                             framingAssistantVM,
                             profileService,
                             guider,
-                            broker);
+                            telescope,
+                            broker,
+                            sequence,
+                            camera,
+                            imagingMediator,
+                            imageSaveMediator,
+                            imageHistoryVM,
+                            filterWheelMediator,
+                            flatDeviceMediator,
+                            twilightCalculator,
+                            symbolBroker,
+                            focuserMediator);
 
             UpdateDefaultPortCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(() => {
                 Port = CachedPort;
@@ -83,6 +140,13 @@ namespace TouchNStars {
             });
 
             Communicator = new Communicator();
+
+            // Pre-populate INDI JSON files on startup instead of first INDI API request.
+            try {
+                INDIDriverRegistry.PrepareDriverFiles(force: true);
+            } catch (Exception ex) {
+                Logger.Warning($"Failed to prepare INDI driver files during startup: {ex.Message}");
+            }
 
             SetHostNames();
 
@@ -172,6 +236,12 @@ namespace TouchNStars {
                 RaisePropertyChanged();
 
                 if (value) {
+                    try {
+                        INDIDriverRegistry.PrepareDriverFiles(force: true);
+                    } catch (Exception ex) {
+                        Logger.Warning($"Failed to prepare INDI driver files when enabling app: {ex.Message}");
+                    }
+
                     CachedPort = CoreUtility.GetNearestAvailablePort(Port);
                     server = new TouchNStarsServer(CachedPort);
                     server.Start();
@@ -257,8 +327,18 @@ namespace TouchNStars {
             }
 
             try {
+                IPAddress address = ResolveMdnsAddress();
+                var txtProperties = new Dictionary<string, string> {
+                    ["instanceName"] = BuildMdnsDisplayName(),
+                    ["instanceId"] = mdnsMachineId.Value,
+                    ["port"] = CachedPort.ToString()
+                };
+                if (address != null) {
+                    txtProperties["ip"] = address.ToString();
+                }
+
                 mdnsBroadcaster ??= new MdnsBroadcaster(MdnsServiceType);
-                mdnsBroadcaster.StartOrUpdate(MdnsServiceInstance, CachedPort, ResolveMdnsAddress());
+                mdnsBroadcaster.StartOrUpdate(MdnsServiceInstance, CachedPort, address, txtProperties);
             } catch (Exception ex) {
                 Logger.Error($"Failed to advertise Touch 'N' Stars via mDNS: {ex}");
             }
@@ -273,6 +353,10 @@ namespace TouchNStars {
         }
 
         private string BuildMdnsInstanceName() {
+            return $"{MdnsInstancePrefix}{BuildMdnsDisplayName()}-{mdnsMachineId.Value}";
+        }
+
+        private string BuildMdnsDisplayName() {
             string suffix = SanitizeInstanceSuffix(GetInstanceNameOrDefault());
 
             if (!HasCustomInstanceName()) {
@@ -282,7 +366,28 @@ namespace TouchNStars {
                 }
             }
 
-            return $"{MdnsInstancePrefix}{suffix}";
+            return suffix;
+        }
+
+        private static string ComputeMdnsMachineId() {
+            try {
+                var macs = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(nic => nic.NetworkInterfaceType is not NetworkInterfaceType.Loopback and not NetworkInterfaceType.Tunnel)
+                    .Select(nic => nic.GetPhysicalAddress()?.ToString())
+                    .Where(mac => !string.IsNullOrEmpty(mac))
+                    .Distinct()
+                    .OrderBy(mac => mac, StringComparer.Ordinal)
+                    .ToList();
+
+                if (macs.Count > 0) {
+                    byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("|", macs)));
+                    return Convert.ToHexString(hash.AsSpan(0, 3)).ToLowerInvariant();
+                }
+            } catch (Exception ex) {
+                Logger.Debug($"Failed to derive mDNS machine id from network interfaces: {ex.Message}");
+            }
+
+            return Guid.NewGuid().ToString("N").Substring(0, 6);
         }
 
         private string GetInstanceNameOrDefault() {

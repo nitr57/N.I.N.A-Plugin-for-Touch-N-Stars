@@ -21,6 +21,7 @@ public class PinsController : WebApiController
     private static readonly Type PINSType = Type.GetType("NINA.PINS.PINS, NINA.PINS");
     private static readonly Type PowerBoxDriverType = Type.GetType("NINA.PINS.Drivers.PowerBoxDriver, NINA.PINS");
     private static readonly Type MeteoStationDriverType = Type.GetType("NINA.PINS.Drivers.MeteoStationDriver, NINA.PINS");
+    private static readonly Type LensControlDriverType = Type.GetType("NINA.PINS.Drivers.LensControlDriver, NINA.PINS");
 
     private static object GetPINSConnectedPowerBox()
     {
@@ -58,6 +59,22 @@ public class PinsController : WebApiController
         }
 
         return meteoStation;
+    }
+
+    private static object GetPINSConnectedLensControl()
+    {
+        if (PINSType == null) return null;
+
+        var property = PINSType.GetProperty("ConnectedLensControl", BindingFlags.Public | BindingFlags.Static);
+        if (property == null) return null;
+
+        var lensControl = property.GetValue(null);
+        if (lensControl == null) return null;
+
+        if (!GetPropertyBool(lensControl, "Connected"))
+            return null;
+
+        return lensControl;
     }
 
     private static object GetWeatherData(object mediator)
@@ -343,7 +360,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapPowerPorts(powerPorts);
+            int actualPowerPortCount = GetPropertyInt(powerBox, "ActualPowerPortCount", -1);
+            var ports = MapPowerPorts(powerPorts, actualPowerPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -806,7 +824,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapPowerPorts(usbPorts);
+            int actualUSBPortCount = GetPropertyInt(powerBox, "ActualUSBPortCount", -1);
+            var ports = MapPowerPorts(usbPorts, actualUSBPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -1269,7 +1288,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapDewPorts(dewPorts);
+            int actualDewPortCount = GetPropertyInt(powerBox, "ActualDewPortCount", -1);
+            var ports = MapDewPorts(dewPorts, actualDewPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -2013,7 +2033,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapBuckPorts(buckPorts);
+            int actualBuckPortCount = GetPropertyInt(powerBox, "ActualBuckPortCount", -1);
+            var ports = MapBuckPorts(buckPorts, actualBuckPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -2592,7 +2613,8 @@ public class PinsController : WebApiController
                 };
             }
 
-            var ports = MapPWMPorts(pwmPorts);
+            int actualPWMPortCount = GetPropertyInt(powerBox, "ActualPWMPortCount", -1);
+            var ports = MapPWMPorts(pwmPorts, actualPWMPortCount);
             
             HttpContext.Response.StatusCode = 200;
             return new ApiResponse
@@ -3904,11 +3926,13 @@ public class PinsController : WebApiController
         {
             var powerBox = GetPINSConnectedPowerBox();
             var meteoStation = GetPINSConnectedMeteoStation();
+            var lensControl = GetPINSConnectedLensControl();
 
             var devices = new
             {
                 powerBox = GetPropertyValue(powerBox, "Id", "not connected"),
-                meteoStation = GetPropertyValue(meteoStation, "Id", "not connected")
+                meteoStation = GetPropertyValue(meteoStation, "Id", "not connected"),
+                lensControl = GetPropertyValue(lensControl, "Id", "not connected")
             };
 
             HttpContext.Response.StatusCode = 200;
@@ -3999,11 +4023,87 @@ public class PinsController : WebApiController
         }
     }
 
+    /// <summary>
+    /// POST /api/pins/powerbox/beep - Make PowerBox beep with specified volume and duration
+    /// </summary>
+    [Route(HttpVerbs.Post, "/pins/powerbox/beep")]
+    public ApiResponse BeepPowerBox([QueryField] int volume = 100, [QueryField] int lengthMs = 1000)
+    {
+        try
+        {
+            var powerBox = GetPINSConnectedPowerBox();
+            if (powerBox == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "PowerBox device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            // Call the Beep method via reflection with volume and length parameters
+            var method = powerBox.GetType().GetMethod("Beep", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(int), typeof(int) }, null);
+            if (method == null)
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Beep method not available on PowerBox device",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            try
+            {
+                method.Invoke(powerBox, new object[] { volume, lengthMs });
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Error invoking Beep method: {ex}");
+                HttpContext.Response.StatusCode = 500;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = $"Error calling Beep method: {ex.InnerException?.Message ?? ex.Message}",
+                    StatusCode = 500,
+                    Type = "Error"
+                };
+            }
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Message = "PowerBox beep successful", Volume = volume, LengthMs = lengthMs },
+                StatusCode = 200,
+                Type = "Success"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error beeping PowerBox: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while beeping PowerBox",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
     #region Helper Methods
 
-    private PowerPortsInfo MapPowerPorts(object powerPorts)
+    private PowerPortsInfo MapPowerPorts(object powerPorts, int maxPorts = -1)
     {
         if (powerPorts == null) return new PowerPortsInfo { MaxPorts = 0, Ports = new PortInfo[0] };
+        if (maxPorts == 0) return new PowerPortsInfo { MaxPorts = 0, Ports = new PortInfo[0] };
 
         try
         {
@@ -4016,6 +4116,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new PortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4043,9 +4144,10 @@ public class PinsController : WebApiController
         }
     }
 
-    private DewPortsInfo MapDewPorts(object dewPorts)
+    private DewPortsInfo MapDewPorts(object dewPorts, int maxPorts = -1)
     {
         if (dewPorts == null) return new DewPortsInfo { MaxPorts = 0, Ports = new DewPortInfo[0] };
+        if (maxPorts == 0) return new DewPortsInfo { MaxPorts = 0, Ports = new DewPortInfo[0] };
 
         try
         {
@@ -4058,6 +4160,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new DewPortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4088,9 +4191,10 @@ public class PinsController : WebApiController
         }
     }
 
-    private BuckPortsInfo MapBuckPorts(object buckPorts)
+    private BuckPortsInfo MapBuckPorts(object buckPorts, int maxPorts = -1)
     {
         if (buckPorts == null) return new BuckPortsInfo { MaxPorts = 0, Ports = new BuckPortInfo[0] };
+        if (maxPorts == 0) return new BuckPortsInfo { MaxPorts = 0, Ports = new BuckPortInfo[0] };
 
         try
         {
@@ -4103,6 +4207,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new BuckPortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4131,9 +4236,10 @@ public class PinsController : WebApiController
         }
     }
 
-    private PWMPortsInfo MapPWMPorts(object pwmPorts)
+    private PWMPortsInfo MapPWMPorts(object pwmPorts, int maxPorts = -1)
     {
         if (pwmPorts == null) return new PWMPortsInfo { MaxPorts = 0, Ports = new PWMPortInfo[0] };
+        if (maxPorts == 0) return new PWMPortsInfo { MaxPorts = 0, Ports = new PWMPortInfo[0] };
 
         try
         {
@@ -4146,6 +4252,7 @@ public class PinsController : WebApiController
             {
                 foreach (var port in portsEnumerable)
                 {
+                    if (maxPorts >= 0 && portsList.Count >= maxPorts) break;
                     portsList.Add(new PWMPortInfo
                     {
                         Index = GetPropertyInt(port, "Index"),
@@ -4170,6 +4277,476 @@ public class PinsController : WebApiController
         {
             Logger.Debug($"Error mapping PWM ports: {ex.Message}");
             return new PWMPortsInfo { MaxPorts = 0, Ports = new PWMPortInfo[0] };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/pins/lenscontrol - Get LensControl device information
+    /// </summary>
+    [Route(HttpVerbs.Get, "/pins/lenscontrol")]
+    public ApiResponse GetLensControlInfo()
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var info = new
+            {
+                Name = GetPropertyValue(lensControl, "Name", ""),
+                DisplayName = GetPropertyValue(lensControl, "DisplayName", ""),
+                Id = GetPropertyValue(lensControl, "Id", ""),
+                UniqueId = GetPropertyValue(lensControl, "UniqueId", ""),
+                Firmware = GetPropertyValue(lensControl, "Firmware", ""),
+                DriverVersion = GetPropertyValue(lensControl, "DriverVersion", ""),
+                Connected = GetPropertyBool(lensControl, "Connected"),
+                LensName = GetPropertyValue(lensControl, "LensName", ""),
+                FocalLength = GetPropertyInt(lensControl, "FocalLength"),
+                Position = GetPropertyInt(lensControl, "Position"),
+                MaxStep = GetPropertyInt(lensControl, "MaxStep"),
+                Aperture = GetPropertyInt(lensControl, "Aperture"),
+                MinAperture = GetPropertyInt(lensControl, "MinAperture"),
+                MaxAperture = GetPropertyInt(lensControl, "MaxAperture"),
+            };
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = info,
+                StatusCode = 200,
+                Type = "LensControlInfo"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error retrieving LensControl information: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while retrieving LensControl information",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// GET /api/pins/lenscontrol/status - Get LensControl real-time status
+    /// </summary>
+    [Route(HttpVerbs.Get, "/pins/lenscontrol/status")]
+    public ApiResponse GetLensControlStatus()
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var status = new
+            {
+                Connected = GetPropertyBool(lensControl, "Connected"),
+                LensName = GetPropertyValue(lensControl, "LensName", ""),
+                FocalLength = GetPropertyInt(lensControl, "FocalLength"),
+                Position = GetPropertyInt(lensControl, "Position"),
+                MaxStep = GetPropertyInt(lensControl, "MaxStep"),
+                IsMoving = GetPropertyBool(lensControl, "IsMoving"),
+                Aperture = GetPropertyInt(lensControl, "Aperture"),
+                MinAperture = GetPropertyInt(lensControl, "MinAperture"),
+                MaxAperture = GetPropertyInt(lensControl, "MaxAperture"),
+            };
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = status,
+                StatusCode = 200,
+                Type = "LensControlStatus"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error retrieving LensControl status: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while retrieving LensControl status",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/pins/lenscontrol/move?position={int} - Move to absolute position (fire and forget)
+    /// </summary>
+    [Route(HttpVerbs.Put, "/pins/lenscontrol/move")]
+    public ApiResponse MoveLensControl([QueryField] int position)
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var maxStep = GetPropertyInt(lensControl, "MaxStep");
+            if (position < 0 || (maxStep > 0 && position > maxStep))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = $"Position must be between 0 and {maxStep}",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            var moveMethod = lensControl.GetType().GetMethod(
+                "Move", BindingFlags.Public | BindingFlags.Instance);
+            if (moveMethod == null)
+            {
+                HttpContext.Response.StatusCode = 501;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Move method not available on this device",
+                    StatusCode = 501,
+                    Type = "Error"
+                };
+            }
+
+            // Fire and forget — poll /status to track progress
+            moveMethod.Invoke(lensControl, new object[] { position, System.Threading.CancellationToken.None, 1000 });
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { TargetPosition = position },
+                StatusCode = 200,
+                Type = "MoveResult"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error moving LensControl: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while moving LensControl",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/pins/lenscontrol/halt - Halt any in-progress move
+    /// </summary>
+    [Route(HttpVerbs.Put, "/pins/lenscontrol/halt")]
+    public ApiResponse HaltLensControl()
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var haltMethod = lensControl.GetType().GetMethod(
+                "Halt", BindingFlags.Public | BindingFlags.Instance);
+            if (haltMethod == null)
+            {
+                HttpContext.Response.StatusCode = 501;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Halt method not available on this device",
+                    StatusCode = 501,
+                    Type = "Error"
+                };
+            }
+
+            haltMethod.Invoke(lensControl, null);
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Position = GetPropertyInt(lensControl, "Position") },
+                StatusCode = 200,
+                Type = "HaltResult"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error halting LensControl: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while halting LensControl",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// PUT /api/pins/lenscontrol/set-aperture?aperture={int} - Set lens aperture
+    /// </summary>
+    [Route(HttpVerbs.Put, "/pins/lenscontrol/set-aperture")]
+    public ApiResponse SetLensControlAperture([QueryField] int aperture)
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var minAperture = GetPropertyInt(lensControl, "MinAperture");
+            var maxAperture = GetPropertyInt(lensControl, "MaxAperture");
+            // maxAperture is widest (numerically smaller), minAperture is narrowest (numerically larger)
+            if (maxAperture > 0 && (aperture < maxAperture || aperture > minAperture))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = $"Aperture must be between {maxAperture} (widest) and {minAperture} (narrowest)",
+                    StatusCode = 400,
+                    Type = "Error"
+                };
+            }
+
+            var setApertureMethod = lensControl.GetType().GetMethod(
+                "SetAperture", BindingFlags.Public | BindingFlags.Instance);
+            if (setApertureMethod == null)
+            {
+                HttpContext.Response.StatusCode = 501;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "SetAperture method not available on this device",
+                    StatusCode = 501,
+                    Type = "Error"
+                };
+            }
+
+            var success = (bool)setApertureMethod.Invoke(lensControl, new object[] { aperture });
+            if (!success)
+            {
+                HttpContext.Response.StatusCode = 500;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Failed to set aperture on device",
+                    StatusCode = 500,
+                    Type = "Error"
+                };
+            }
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Aperture = GetPropertyInt(lensControl, "Aperture") },
+                StatusCode = 200,
+                Type = "ApertureResult"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error setting LensControl aperture: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while setting aperture",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/pins/lenscontrol/calibrate - Calibrate the LensControl device
+    /// </summary>
+    [Route(HttpVerbs.Post, "/pins/lenscontrol/calibrate")]
+    public ApiResponse CalibrateLensControl()
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var calibrateMethod = lensControl.GetType().GetMethod(
+                "Calibrate", BindingFlags.Public | BindingFlags.Instance);
+            if (calibrateMethod == null)
+            {
+                HttpContext.Response.StatusCode = 501;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Calibrate method not available on this device",
+                    StatusCode = 501,
+                    Type = "Error"
+                };
+            }
+
+            var success = (bool)calibrateMethod.Invoke(lensControl, null);
+            if (!success)
+            {
+                HttpContext.Response.StatusCode = 500;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Calibration failed on device",
+                    StatusCode = 500,
+                    Type = "Error"
+                };
+            }
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Message = "LensControl calibration initiated" },
+                StatusCode = 200,
+                Type = "CalibrateResult"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error calibrating LensControl: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while calibrating LensControl",
+                StatusCode = 500,
+                Type = "Error"
+            };
+        }
+    }
+
+    /// <summary>
+    /// POST /api/pins/lenscontrol/restart - Restart the LensControl device
+    /// </summary>
+    [Route(HttpVerbs.Post, "/pins/lenscontrol/restart")]
+    public ApiResponse RestartLensControl()
+    {
+        try
+        {
+            var lensControl = GetPINSConnectedLensControl();
+            if (lensControl == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "LensControl device not connected",
+                    StatusCode = 404,
+                    Type = "Error"
+                };
+            }
+
+            var rebootMethod = lensControl.GetType().GetMethod(
+                "Reboot", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (rebootMethod == null)
+            {
+                HttpContext.Response.StatusCode = 501;
+                return new ApiResponse
+                {
+                    Success = false,
+                    Error = "Restart method not available on this device",
+                    StatusCode = 501,
+                    Type = "Error"
+                };
+            }
+
+            rebootMethod.Invoke(lensControl, null);
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse
+            {
+                Success = true,
+                Response = new { Message = "LensControl restart initiated" },
+                StatusCode = 200,
+                Type = "RestartResult"
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Error restarting LensControl: {ex}");
+            HttpContext.Response.StatusCode = 500;
+            return new ApiResponse
+            {
+                Success = false,
+                Error = "An error occurred while restarting LensControl",
+                StatusCode = 500,
+                Type = "Error"
+            };
         }
     }
 

@@ -1,4 +1,4 @@
-﻿using EmbedIO;
+using EmbedIO;
 using EmbedIO.Actions;
 using EmbedIO.WebApi;
 using NINA.Core.Utility;
@@ -20,7 +20,7 @@ namespace TouchNStars.Server {
         private CancellationTokenSource apiToken;
         public WebServer WebServer;
 
-        private readonly List<string> appEndPoints = ["equipment", "camera", "autofocus", "mount", "guider", "sequence", "settings", "seq-mon", "flat", "dome", "logs", "switch", "flats", "stellarium", "settings", "rotator", "filterwheel", "bahtinov", "plugin1", "plugin2", "plugin3", "plugin4", "plugin5", "plugin6", "plugin7", "plugin8", "plugin9"];
+        private readonly List<string> appEndPoints = ["equipment", "camera", "autofocus", "mount", "guider", "sequence", "settings", "seq-mon", "flat", "dome", "logs", "switch", "flats", "stellarium", "settings", "rotator", "filterwheel", "bahtinov", "plugin1", "plugin2", "plugin3", "plugin4", "plugin5", "plugin6", "plugin7", "plugin8", "plugin9", "plugin10", "plugin11", "plugin12", "plugin13", "plugin14", "plugin15", "plugin16", "plugin17", "plugin18", "plugin19", "plugin20", "plugin21", "plugin22", "plugin23", "plugin24", "plugin25", "plugin26", "plugin27", "plugin28", "plugin29", "plugin30", "plugin31", "plugin32", "plugin33", "plugin34", "plugin35", "plugin36", "plugin37", "plugin38", "plugin39", "plugin40", "plugin41", "plugin42", "plugin43", "plugin44", "plugin45", "plugin46", "plugin47", "plugin48", "plugin49", "plugin50", "plugin51", "plugin52", "plugin53", "plugin54", "plugin55", "plugin56", "plugin57", "plugin58", "plugin59"];
 
         private int port;
         public TouchNStarsServer(int port) => this.port = port;
@@ -28,9 +28,11 @@ namespace TouchNStars.Server {
         public void CreateServer() {
             string assemblyFolder = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             string webAppDir = Path.Combine(assemblyFolder, "app");
+            string userLandscapesDir =
+                StellariumLandscapeService.ResolvePersistentLandscapesRoot(createIfMissing: true);
 
             // Suppress EmbedIO verbose logging by unregistering the logger
-            Swan.Logging.Logger.UnregisterLogger<Swan.Logging.ConsoleLogger>();
+            try { Swan.Logging.Logger.UnregisterLogger<Swan.Logging.ConsoleLogger>(); } catch { }
 
             WebServer = new WebServer(o => o
                 .WithUrlPrefix($"http://*:{port}")
@@ -56,7 +58,28 @@ namespace TouchNStars.Server {
                 .WithController<BahtinovController>()    // Bahtinov mask analysis
                 .WithController<INDIController>()        // INDI driver management
                 .WithController<HocusFocusController>()  // HocusFocus plugin integration
-                .WithController<PinsController>());      // PINS device management
+                .WithController<TPPAController>()        // TPPA / PolarAlignment plugin integration
+                .WithController<PinsController>()        // PINS device management
+                .WithController<SequenceController>()    // Sequence item discovery and management
+                .WithController<TenMicronController>()   // 10micron model builder integration
+                .WithController<LocationController>()    // Profile & mount site location
+                .WithController<ProfileController>()     // NINA profile management
+                .WithController<MountController>()       // Mount tracking rate control
+                .WithController<GuiderShiftController>() // Guider shift rate (comet tracking)
+                .WithController<FlatDeviceController>()  // Flat device multi-filter capture
+                .WithController<FilterOffsetController>() // DarksCustoms filter offset calculator
+                .WithController<AlpacaDirectController>() // AlpacaDirect static-IP Alpaca device settings
+                .WithController<ProxyController>()       // Generic proxy for external URLs
+                .WithController<FilesystemController>()
+                .WithController<FitsAnalysisController>()
+                .WithController<StellariumLandscapeController>()
+                .WithController<NightSummaryController>()
+                .WithController<GroundStationController>());
+            WebServer = WebServer.WithModule(new MountControlSocket("/ws/mount-control")); // Manual (press-hold) mount slewing, INDI-direct
+            WebServer = WebServer.WithStaticFolder(
+                StellariumLandscapeService.UserLandscapesRoute,
+                userLandscapesDir,
+                false);
             WebServer = WebServer.WithStaticFolder("/", webAppDir, false); // Register the static folder, which will be used to serve the web app
         }
 
@@ -72,6 +95,7 @@ namespace TouchNStars.Server {
                     serverThread.Start();
                     BackgroundWorker.MonitorLogForEvents();
                     BackgroundWorker.MonitorLastAF();
+                    AutofocusWatcher.Start();
                 }
             } catch (Exception ex) {
                 Logger.Error($"failed to start web server: {ex}");
@@ -84,6 +108,7 @@ namespace TouchNStars.Server {
                 WebServer?.Dispose();
                 WebServer = null;
                 BackgroundWorker.Cleanup();
+                AutofocusWatcher.Stop();
             } catch (Exception ex) {
                 Logger.Error($"failed to stop API: {ex}");
             }
@@ -112,13 +137,21 @@ namespace TouchNStars.Server {
         }
 
         protected override async Task OnRequestAsync(IHttpContext context) {
+            string requestHeaders = context.Request.Headers["Access-Control-Request-Headers"];
+            string allowHeaders = "Content-Type, Authorization, X-Suppress-Toast-404, X-Requested-With, X-Bahtinov-Metadata";
+
+            if (!string.IsNullOrWhiteSpace(requestHeaders)) {
+                allowHeaders = $"{allowHeaders}, {requestHeaders}";
+            }
+
             context.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-            context.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Suppress-Toast-404, X-Requested-With");
+            context.Response.Headers.Add("Access-Control-Allow-Headers", allowHeaders);
             context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
 
             if (context.Request.HttpVerb == HttpVerbs.Options) {
+                Logger.Info($"CORS preflight handled. RequestMethod={context.Request.Headers["Access-Control-Request-Method"] ?? "<none>"}; RequestHeaders={requestHeaders ?? "<none>"}");
                 context.Response.StatusCode = 200;
-                await context.SendStringAsync(string.Empty, "text/plain", Encoding.UTF8); 
+                await context.SendStringAsync(string.Empty, "text/plain", Encoding.UTF8);
                 return;
             }
         }

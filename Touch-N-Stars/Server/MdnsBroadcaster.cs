@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using Makaretu.Dns;
 using NINA.Core.Utility;
@@ -23,7 +24,7 @@ internal sealed class MdnsBroadcaster : IDisposable
         this.serviceType = serviceType ?? throw new ArgumentNullException(nameof(serviceType));
     }
 
-    public void StartOrUpdate(string instanceName, int port, IPAddress address)
+    public void StartOrUpdate(string instanceName, int port, IPAddress address, IReadOnlyDictionary<string, string> txtProperties = null)
     {
         if (string.IsNullOrWhiteSpace(instanceName))
         {
@@ -43,12 +44,23 @@ internal sealed class MdnsBroadcaster : IDisposable
             // lets the plugin keep publishing its dynamic service and port
             // without competing with Avahi for the same host records.
             bool sharedProfile = OperatingSystem.IsLinux();
-            UpdateAdvertisement(new ServiceProfile(
+            var profile = new ServiceProfile(
                 instanceName,
                 serviceType,
                 (ushort)port,
                 addresses,
-                sharedProfile));
+                sharedProfile);
+            if (txtProperties != null)
+            {
+                foreach (var pair in txtProperties)
+                {
+                    if (!string.IsNullOrWhiteSpace(pair.Key) && !string.IsNullOrEmpty(pair.Value))
+                    {
+                        profile.AddProperty(pair.Key, pair.Value);
+                    }
+                }
+            }
+            UpdateAdvertisement(profile);
         }
     }
 

@@ -1,0 +1,6 @@
+[
+  { "Name": "indi_safetymonitor", "Label": "Safety Monitor", "Type": "safetymonitor" },
+  { "Name": "indi_ups_safety", "Label": "UPS Safety Monitor", "Type": "safetymonitor" },
+  { "Name": "indi_weather_safety_alpaca", "Label": "Weather Safety ALPACA", "Type": "safetymonitor" },
+  { "Name": "indi_weather_safety_proxy", "Label": "Weather Safety Proxy", "Type": "safetymonitor" }
+]

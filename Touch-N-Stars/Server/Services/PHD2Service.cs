@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
 using NINA.Core.Utility;
 using TouchNStars.PHD2;
 
@@ -751,6 +752,60 @@ namespace TouchNStars.Server.Services
             });
         }
 
+        public async Task<int> GetCalibrationDistanceAsync()
+        {
+            await WaitForConnectionIfNeeded();
+
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                        {
+                            throw new InvalidOperationException("PHD2 not connected");
+                        }
+
+                        return client.GetCalibrationDistance();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to get calibration distance: {ex}");
+                    return 0;
+                }
+            });
+        }
+
+        public async Task SetCalibrationDistanceAsync(int distance)
+        {
+            await WaitForConnectionIfNeeded();
+
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                        {
+                            throw new InvalidOperationException("PHD2 not connected");
+                        }
+
+                        client.SetCalibrationDistance(distance);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to set calibration distance: {ex}");
+                    throw;
+                }
+            });
+        }
+
         public async Task ClearMountCalibrationAsync()
         {
             await WaitForConnectionIfNeeded();
@@ -1327,6 +1382,60 @@ namespace TouchNStars.Server.Services
         }
 
         // Multi-star mode method
+        public async Task<int> GetTimeLapseAsync()
+        {
+            await WaitForConnectionIfNeeded();
+
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                        {
+                            throw new InvalidOperationException("PHD2 not connected");
+                        }
+
+                        return client.GetTimeLapse();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to get time lapse: {ex}");
+                    return 0;
+                }
+            });
+        }
+
+        public async Task SetTimeLapseAsync(int ms)
+        {
+            await WaitForConnectionIfNeeded();
+
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                        {
+                            throw new InvalidOperationException("PHD2 not connected");
+                        }
+
+                        client.SetTimeLapse(ms);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to set time lapse: {ex}");
+                    throw;
+                }
+            });
+        }
+
         public async Task<bool> GetUseMultipleStarsAsync()
         {
             await WaitForConnectionIfNeeded();
@@ -1925,6 +2034,142 @@ namespace TouchNStars.Server.Services
                     throw;
                 }
             });
+        }
+
+        // Auto exposure methods
+        public async Task<object> GetCameraInfoAsync()
+        {
+            return await Task.Run(() =>
+            {
+                lock (lockObject)
+                {
+                    if (client == null || !client.IsConnected)
+                        throw new InvalidOperationException("PHD2 not connected");
+
+                    // Prefer the aggregated RPC added to the local PHD2 build.
+                    // Fall back to individual calls when running against an older PHD2.
+                    try
+                    {
+                        var rpc = client.GetCameraInfoRpc();
+                        if (rpc != null)
+                        {
+                            AppendExtraFields(rpc);
+                            return (object)rpc;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug($"get_camera_info RPC unavailable, falling back to individual calls: {ex.Message}");
+                    }
+
+                    // Individual-call fallback
+                    var info = new Dictionary<string, object>();
+
+                    try
+                    {
+                        var equipment = client.GetCurrentEquipment() as Dictionary<string, object>;
+                        if (equipment != null && equipment.TryGetValue("camera", out var camEntry))
+                        {
+                            if (camEntry is Dictionary<string, object> cam)
+                            {
+                                info["name"] = cam.TryGetValue("name", out var n) ? n : null;
+                                info["connected"] = cam.TryGetValue("connected", out var c) ? c : false;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (!info.ContainsKey("name")) info["name"] = null;
+                    if (!info.ContainsKey("connected")) info["connected"] = false;
+
+                    try { info["gain_pct"] = client.GetCameraGain(); } catch { info["gain_pct"] = null; }
+                    try { info["bits_per_pixel"] = client.GetCameraBitdepth(); } catch { info["bits_per_pixel"] = null; }
+                    try { info["binning"] = client.GetCameraBinning(); } catch { info["binning"] = null; }
+                    try { info["has_subframes"] = client.GetCameraUseSubframes(); } catch { info["has_subframes"] = null; }
+
+                    try
+                    {
+                        var fs = client.GetCameraFrameSize();
+                        info["frame_width"] = fs?.Width;
+                        info["frame_height"] = fs?.Height;
+                    }
+                    catch { info["frame_width"] = null; info["frame_height"] = null; }
+
+                    try { info["pixel_scale"] = client.GetPixelScale(); } catch { info["pixel_scale"] = null; }
+                    try { info["exposure_ms"] = client.GetExposure(); } catch { info["exposure_ms"] = null; }
+                    try { info["cooler_on"] = client.GetCameraCoolerOn(); } catch { info["cooler_on"] = null; }
+                    try { info["cooler_setpoint"] = client.GetCameraTemperatureSetpoint(); } catch { info["cooler_setpoint"] = null; }
+
+                    AppendExtraFields(info);
+
+                    return (object)info;
+                }
+            });
+        }
+
+        /// <summary>
+        /// Appends saturation, time-lapse (variable delay), and noise-reduction
+        /// fields to a camera-info dictionary. All fetches are best-effort.
+        /// </summary>
+        private void AppendExtraFields(Dictionary<string, object> info)
+        {
+            // Saturation: either by fixed ADU threshold or by star-profile analysis
+            try
+            {
+                bool byAdu = client.GetSaturationByADU();
+                info["saturation_by_adu"] = byAdu;
+                if (byAdu)
+                {
+                    int? aduValue = null;
+                    try { aduValue = client.GetSaturationADUValue(); info["saturation_adu_value"] = aduValue; } catch { info["saturation_adu_value"] = null; }
+
+                    // Warn when the ADU threshold does not match the camera's expected max ADU
+                    // for its bit depth (e.g. 255 on a 16-bit camera whose max is 65535).
+                    bool warning = false;
+                    if (aduValue.HasValue
+                        && info.TryGetValue("bits_per_pixel", out var bppObj)
+                        && bppObj != null)
+                    {
+                        try
+                        {
+                            int bpp = Convert.ToInt32(bppObj);
+                            int maxAdu = (1 << bpp) - 1;
+                            warning = aduValue.Value != maxAdu;
+                        }
+                        catch { }
+                    }
+                    info["saturation_adu_warning"] = warning;
+                }
+            }
+            catch { info["saturation_by_adu"] = null; }
+
+            // Time lapse: fixed ms delay between exposures (disabled when variable delay is active)
+            try { info["time_lapse_ms"] = client.GetTimeLapse(); } catch { info["time_lapse_ms"] = null; }
+
+            // Variable delay: state-dependent short/long delay (mutually exclusive with time lapse)
+            try
+            {
+                var vd = client.GetVariableDelaySettings();
+                if (vd != null)
+                {
+                    bool enabled = vd["Enabled"]?.ToObject<bool>() ?? false;
+                    info["variable_delay_enabled"] = enabled;
+                    if (enabled)
+                    {
+                        info["variable_delay_short_sec"] = vd["ShortDelaySeconds"]?.ToObject<int>();
+                        info["variable_delay_long_sec"] = vd["LongDelaySeconds"]?.ToObject<int>();
+                    }
+                }
+            }
+            catch { info["variable_delay_enabled"] = null; }
+
+            // Noise reduction: 0=None, 1=2x2Mean, 2=3x3Median
+            try { info["noise_reduction_method"] = client.GetNoiseReductionMethod(); } catch { info["noise_reduction_method"] = null; }
+
+            // Pixel scale (arcsec/px) — only present in fast-path (get_camera_info RPC) when appended here;
+            // the fallback path adds it directly before calling AppendExtraFields.
+            if (!info.ContainsKey("pixel_scale"))
+                try { info["pixel_scale"] = client.GetPixelScale(); } catch { info["pixel_scale"] = null; }
         }
 
         // Auto exposure methods
@@ -2771,6 +3016,234 @@ namespace TouchNStars.Server.Services
             });
         }
 
+        public async Task<int> GetMaxRaDurationAsync()
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        return client.GetMaxRaDuration();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to get max RA duration: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task SetMaxRaDurationAsync(int ms)
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.SetMaxRaDuration(ms);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to set max RA duration: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task<int> GetMaxDecDurationAsync()
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        return client.GetMaxDecDuration();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to get max DEC duration: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task SetMaxDecDurationAsync(int ms)
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.SetMaxDecDuration(ms);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to set max DEC duration: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task<JObject> GetDarkLibraryInfoAsync()
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        return client.GetDarkLibraryInfo();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to get dark library info: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task LoadDarkLibraryAsync()
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.LoadDarkLibrary();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to load dark library: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task UnloadDarkLibraryAsync()
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.UnloadDarkLibrary();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to unload dark library: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task DeleteDarkLibraryAsync()
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.DeleteDarkLibrary();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to delete dark library: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task StartBuildDarkLibraryAsync(int[] expTimesMs, int frameCount)
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.StartBuildDarkLibrary(expTimesMs, frameCount);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to start dark library build: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task CancelBuildDarkLibraryAsync()
+        {
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+                        client.CancelBuildDarkLibrary();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to cancel dark library build: {ex}");
+                    throw;
+                }
+            });
+        }
+
+        public DarkBuildStatus GetDarkBuildStatus()
+        {
+            lock (lockObject)
+            {
+                return client?.DarkBuild ?? new DarkBuildStatus();
+            }
+        }
+
         public async Task<bool> GetGuideOutputEnabledAsync()
         {
             return await Task.Run(() =>
@@ -3146,6 +3619,69 @@ namespace TouchNStars.Server.Services
                 }
             });
         }
+
+        public async Task<object> GetCalibrationDataAsync()
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+
+                        var result = client.GetCalibrationData("Mount");
+                        if (result == null)
+                            return (object)new { Calibrated = false };
+
+                        bool calibrated = result["calibrated"]?.ToObject<bool?>() == true;
+                        if (!calibrated)
+                            return (object)new { Calibrated = false };
+
+                        return (object)new
+                        {
+                            Calibrated = true,
+                            XAngle = result["xAngle"]?.ToObject<double?>() ?? 0,
+                            XRate = result["xRate"]?.ToObject<double?>() ?? 0,
+                            XParity = result["xParity"]?.ToObject<string>() ?? "",
+                            YAngle = result["yAngle"]?.ToObject<double?>() ?? 0,
+                            YRate = result["yRate"]?.ToObject<double?>() ?? 0,
+                            YParity = result["yParity"]?.ToObject<string>() ?? "",
+                            Declination = result["declination"]?.ToObject<double?>() ?? 0
+                        };
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Failed to get PHD2 calibration data: {ex.Message}");
+                    throw;
+                }
+            });
+        }
+
+        public async Task<List<double[]>> GetSecondaryStarsAsync()
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            return new List<double[]>();
+
+                        return client.GetSecondaryStars();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug($"Failed to get PHD2 secondary stars: {ex.Message}");
+                    return new List<double[]>();
+                }
+            });
+        }
+
         public async Task<Dictionary<string, List<CameraInfo>>> GetAllCameraIdsAsync()
         {
             return await Task.Run(() =>
@@ -3172,6 +3708,57 @@ namespace TouchNStars.Server.Services
         }
 
         private bool disposed = false;
+
+        // Backlash compensation
+        public async Task<(bool Enabled, int PulseWidth, int Floor, int Ceiling)> GetBacklashCompAsync()
+        {
+            await WaitForConnectionIfNeeded();
+
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+
+                        return client.GetBacklashComp();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to get backlash comp: {ex}");
+                    return (false, 0, 0, 0);
+                }
+            });
+        }
+
+        public async Task SetBacklashCompAsync(bool? enabled, int? pulseWidth, int? floor, int? ceiling)
+        {
+            await WaitForConnectionIfNeeded();
+
+            await Task.Run(() =>
+            {
+                try
+                {
+                    lock (lockObject)
+                    {
+                        if (client == null || !client.IsConnected)
+                            throw new InvalidOperationException("PHD2 not connected");
+
+                        client.SetBacklashComp(enabled, pulseWidth, floor, ceiling);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                    Logger.Error($"Failed to set backlash comp: {ex}");
+                    throw;
+                }
+            });
+        }
 
         public void Dispose()
         {

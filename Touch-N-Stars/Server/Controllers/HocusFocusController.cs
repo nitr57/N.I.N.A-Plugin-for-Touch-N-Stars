@@ -2,6 +2,7 @@ using EmbedIO;
 using EmbedIO.Routing;
 using EmbedIO.WebApi;
 using NINA.Core.Utility;
+using NINA.Plugins.TouchNStars.Tilter;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
@@ -171,10 +172,10 @@ public class HocusFocusController : WebApiController
                 // Create a snapshot of the regions to avoid collection modification exceptions
                 var regionsSnapshot = regionsEnumerable.Cast<object>().ToList();
                 var curveFittingsSnapshot = (regionCurveFittingsValue is System.Collections.IEnumerable curvesEnum)
-                    ? curvesEnum.OfType<object>().ToList() 
+                    ? curvesEnum.OfType<object>().ToList()
                     : new List<object>();
                 var lineFittingsSnapshot = (regionLineFittingsValue is System.Collections.IEnumerable linesEnum)
-                    ? linesEnum.OfType<object>().ToList() 
+                    ? linesEnum.OfType<object>().ToList()
                     : new List<object>();
 
                 foreach (var region in regionsSnapshot)
@@ -205,16 +206,20 @@ public class HocusFocusController : WebApiController
                                 // Get min and max X values from focus points
                                 var minX = regionList.OfType<Dictionary<string, object>>()
                                     .Where(p => p.ContainsKey("X"))
-                                    .Select(p => {
-                                        if (double.TryParse(p["X"].ToString(), out var x)) return x;
+                                    .Select(p =>
+                                    {
+                                        if (p["X"] is double xd) return xd;
+                                        if (double.TryParse(p["X"]?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var x)) return x;
                                         return 0.0;
                                     })
                                     .DefaultIfEmpty(0.0)
                                     .Min();
                                 var maxX = regionList.OfType<Dictionary<string, object>>()
                                     .Where(p => p.ContainsKey("X"))
-                                    .Select(p => {
-                                        if (double.TryParse(p["X"].ToString(), out var x)) return x;
+                                    .Select(p =>
+                                    {
+                                        if (p["X"] is double xd) return xd;
+                                        if (double.TryParse(p["X"]?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var x)) return x;
                                         return 0.0;
                                     })
                                     .DefaultIfEmpty(0.0)
@@ -439,11 +444,15 @@ public class HocusFocusController : WebApiController
             var runAFAnalysisCommand = inspectorVMType.GetProperty("RunAutoFocusAnalysisCommand")?.GetValue(inspectorVM);
             var runAFAnalysisState = TryGetCanExecuteState(runAFAnalysisCommand);
 
+            var rerunSavedAFCommand = inspectorVMType.GetProperty("RerunSavedAutoFocusAnalysisCommand")?.GetValue(inspectorVM);
+            var rerunSavedAFState = TryGetCanExecuteState(rerunSavedAFCommand);
+
             HttpContext.Response.StatusCode = 200;
             return new Dictionary<string, object>()
             {
                 { "Success", true },
                 { "CanRunAutoFocusAnalysis", runAFAnalysisState },
+                { "CanRerunSavedAutoFocusAnalysis", rerunSavedAFState },
                 { "AutoFocusCompleted", autoFocusCompleted ?? false },
                 { "AutoFocusAnalysisProgressOrResult", autoFocusAnalysisProgressOrResult ?? false },
                 { "AutoFocusAnalysisResult", autoFocusAnalysisResult ?? false },
@@ -626,7 +635,7 @@ public class HocusFocusController : WebApiController
             // If afDirectory is provided, set it on the plugin so AnalyzeSavedAutoFocusRun can use it
             if (!string.IsNullOrEmpty(afDirectory))
             {
-                var selectedAFDirProperty = hocusFocusPluginType.GetProperty("SelectedAFDirectory", 
+                var selectedAFDirProperty = hocusFocusPluginType.GetProperty("SelectedAFDirectory",
                     System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
 
                 if (selectedAFDirProperty != null && selectedAFDirProperty.CanWrite)
@@ -966,11 +975,11 @@ public class HocusFocusController : WebApiController
                                 }
                             }
                         }
-                        
+
                         // Reset the nextHistoryId counter so history IDs start from 1 again
                         try
                         {
-                            var nextHistoryIdField = tiltModelType.GetField("nextHistoryId", 
+                            var nextHistoryIdField = tiltModelType.GetField("nextHistoryId",
                                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                             if (nextHistoryIdField != null)
                             {
@@ -1027,7 +1036,7 @@ public class HocusFocusController : WebApiController
                 };
             }
 
-            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions", 
+            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (autoFocusOptionsProperty == null)
             {
@@ -1124,6 +1133,90 @@ public class HocusFocusController : WebApiController
         }
     }
 
+    [Route(HttpVerbs.Get, "/hocusfocus/autofocus/last-run")]
+    public object GetLastAutoFocusRun()
+    {
+        try
+        {
+            var hocusFocusVMType = Type.GetType("NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM, NINA.Joko.Plugins.HocusFocus");
+            if (hocusFocusVMType == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus plugin not loaded" }
+                };
+            }
+
+            var currentProperty = hocusFocusVMType.GetProperty("Current",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            var currentVM = currentProperty?.GetValue(null);
+            if (currentVM == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "No AutoFocus run has been started yet in this session" }
+                };
+            }
+
+            var lastReport = currentVM.GetType().GetProperty("LastReport")?.GetValue(currentVM);
+            if (lastReport == null)
+            {
+                HttpContext.Response.StatusCode = 404;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "No AutoFocus run has completed yet" }
+                };
+            }
+
+            object Get(object obj, string name) => obj?.GetType().GetProperty(name)?.GetValue(obj);
+            double GetDouble(object obj, string name) => Get(obj, name) is double d ? d : double.NaN;
+            int GetInt(object obj, string name) => Get(obj, name) is int i ? i : -1;
+
+            var durationObj = Get(lastReport, "Duration");
+            var rSquaresObj = Get(lastReport, "RSquares");
+            var calcFocusPoint = Get(lastReport, "CalculatedFocusPoint");
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Timestamp",              Get(lastReport, "Timestamp") },
+                { "Filter",                 Get(lastReport, "Filter") },
+                { "Temperature",            GetDouble(lastReport, "Temperature") },
+                { "DurationSeconds",        durationObj is TimeSpan ts ? ts.TotalSeconds : double.NaN },
+                { "InitialFocuserPosition", GetInt(currentVM, "InitialFocuserPosition") },
+                { "FinalFocuserPosition",   GetInt(currentVM, "FinalFocuserPosition") },
+                { "InitialHFR",             GetDouble(currentVM, "InitialHFR") },
+                { "FinalHFR",               GetDouble(currentVM, "FinalHFR") },
+                { "EstimatedFinalHFR",      GetDouble(calcFocusPoint, "Value") },
+                { "Fitting",                Get(lastReport, "Fitting")?.ToString() },
+                { "RSquares", rSquaresObj == null ? null : new Dictionary<string, object>
+                    {
+                        { "Hyperbolic", GetDouble(rSquaresObj, "Hyperbolic") },
+                        { "Quadratic",  GetDouble(rSquaresObj, "Quadratic") },
+                        { "LeftTrend",  GetDouble(rSquaresObj, "LeftTrend") },
+                        { "RightTrend", GetDouble(rSquaresObj, "RightTrend") }
+                    }
+                },
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to read last AutoFocus run: {ex.Message}" }
+            };
+        }
+    }
+
     [Route(HttpVerbs.Get, "/hocusfocus/autofocus/options")]
     public object GetAutoFocusOptions()
     {
@@ -1141,7 +1234,7 @@ public class HocusFocusController : WebApiController
                 };
             }
 
-            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions", 
+            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (autoFocusOptionsProperty == null)
             {
@@ -1166,12 +1259,22 @@ public class HocusFocusController : WebApiController
 
             // Reflect over all properties and build a dictionary
             var optionsDict = new Dictionary<string, object>();
+            var enumOptionsDict = new Dictionary<string, string[]>();
             var optionsType = autoFocusOptions.GetType();
             foreach (var prop in optionsType.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
             {
                 try
                 {
-                    optionsDict[prop.Name] = prop.GetValue(autoFocusOptions);
+                    var value = prop.GetValue(autoFocusOptions);
+                    if (prop.PropertyType.IsEnum)
+                    {
+                        optionsDict[prop.Name] = value?.ToString();
+                        enumOptionsDict[prop.Name] = Enum.GetNames(prop.PropertyType);
+                    }
+                    else
+                    {
+                        optionsDict[prop.Name] = value;
+                    }
                 }
                 catch
                 {
@@ -1182,7 +1285,8 @@ public class HocusFocusController : WebApiController
             return new Dictionary<string, object>()
             {
                 { "Success", true },
-                { "Options", optionsDict }
+                { "Options", optionsDict },
+                { "EnumOptions", enumOptionsDict }
             };
         }
         catch (Exception ex)
@@ -1235,7 +1339,7 @@ public class HocusFocusController : WebApiController
                 return new { Success = false, Error = "HocusFocus plugin not loaded" };
             }
 
-            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions", 
+            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (autoFocusOptionsProperty == null)
             {
@@ -1300,7 +1404,18 @@ public class HocusFocusController : WebApiController
                         convertedValue = Convert.ToBoolean(newValue);
                     }
                 }
-                else if (targetType == typeof(int) || targetType == typeof(double) || targetType == typeof(float) || 
+                else if (targetType.IsEnum)
+                {
+                    if (newValue is JsonElement jelem)
+                    {
+                        convertedValue = Enum.Parse(targetType, jelem.GetString(), ignoreCase: true);
+                    }
+                    else
+                    {
+                        convertedValue = Enum.Parse(targetType, newValue.ToString(), ignoreCase: true);
+                    }
+                }
+                else if (targetType == typeof(int) || targetType == typeof(double) || targetType == typeof(float) ||
                          targetType == typeof(decimal) || targetType == typeof(long) || targetType == typeof(short) ||
                          targetType == typeof(uint) || targetType == typeof(ulong) || targetType == typeof(ushort))
                 {
@@ -1375,7 +1490,7 @@ public class HocusFocusController : WebApiController
                 return new { Success = false, Error = "HocusFocus plugin not loaded" };
             }
 
-            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions", 
+            var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (autoFocusOptionsProperty == null)
             {
@@ -1391,7 +1506,7 @@ public class HocusFocusController : WebApiController
             }
 
             // Call ResetDefaults method
-            var resetMethod = autoFocusOptions.GetType().GetMethod("ResetDefaults", 
+            var resetMethod = autoFocusOptions.GetType().GetMethod("ResetDefaults",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
 
             if (resetMethod == null)
@@ -2016,7 +2131,7 @@ public class HocusFocusController : WebApiController
                 else if (targetType.IsEnum)
                 {
                     string enumStringValue = null;
-                    
+
                     if (newValue is JsonElement jelem)
                     {
                         enumStringValue = jelem.GetString();
@@ -2029,7 +2144,7 @@ public class HocusFocusController : WebApiController
                     {
                         enumStringValue = newValue.ToString();
                     }
-                    
+
                     Logger.Debug($"[StarDetection] Parsing enum {targetType.Name} from string: {enumStringValue}");
                     convertedValue = Enum.Parse(targetType, enumStringValue, ignoreCase: true);
                 }
@@ -2112,7 +2227,7 @@ public class HocusFocusController : WebApiController
                 };
             }
 
-            var aberrationInspectorOptionsProperty = hocusFocusPluginType.GetProperty("InspectorOptions", 
+            var aberrationInspectorOptionsProperty = hocusFocusPluginType.GetProperty("InspectorOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (aberrationInspectorOptionsProperty == null)
             {
@@ -2137,12 +2252,22 @@ public class HocusFocusController : WebApiController
 
             // Reflect over all properties and build a dictionary
             var optionsDict = new Dictionary<string, object>();
+            var enumOptionsDict = new Dictionary<string, string[]>();
             var optionsType = aberrationInspectorOptions.GetType();
             foreach (var prop in optionsType.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
             {
                 try
                 {
-                    optionsDict[prop.Name] = prop.GetValue(aberrationInspectorOptions);
+                    var value = prop.GetValue(aberrationInspectorOptions);
+                    if (prop.PropertyType.IsEnum)
+                    {
+                        optionsDict[prop.Name] = value?.ToString();
+                        enumOptionsDict[prop.Name] = Enum.GetNames(prop.PropertyType);
+                    }
+                    else
+                    {
+                        optionsDict[prop.Name] = value;
+                    }
                 }
                 catch
                 {
@@ -2153,7 +2278,8 @@ public class HocusFocusController : WebApiController
             return new Dictionary<string, object>()
             {
                 { "Success", true },
-                { "Options", optionsDict }
+                { "Options", optionsDict },
+                { "EnumOptions", enumOptionsDict }
             };
         }
         catch (Exception ex)
@@ -2206,7 +2332,7 @@ public class HocusFocusController : WebApiController
                 return new { Success = false, Error = "HocusFocus plugin not loaded" };
             }
 
-            var aberrationInspectorOptionsProperty = hocusFocusPluginType.GetProperty("InspectorOptions", 
+            var aberrationInspectorOptionsProperty = hocusFocusPluginType.GetProperty("InspectorOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (aberrationInspectorOptionsProperty == null)
             {
@@ -2282,7 +2408,7 @@ public class HocusFocusController : WebApiController
                         convertedValue = Enum.Parse(targetType, newValue.ToString(), ignoreCase: true);
                     }
                 }
-                else if (targetType == typeof(int) || targetType == typeof(double) || targetType == typeof(float) || 
+                else if (targetType == typeof(int) || targetType == typeof(double) || targetType == typeof(float) ||
                          targetType == typeof(decimal) || targetType == typeof(long) || targetType == typeof(short) ||
                          targetType == typeof(uint) || targetType == typeof(ulong) || targetType == typeof(ushort))
                 {
@@ -2357,7 +2483,7 @@ public class HocusFocusController : WebApiController
                 return new { Success = false, Error = "HocusFocus plugin not loaded" };
             }
 
-            var aberrationInspectorOptionsProperty = hocusFocusPluginType.GetProperty("InspectorOptions", 
+            var aberrationInspectorOptionsProperty = hocusFocusPluginType.GetProperty("InspectorOptions",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
             if (aberrationInspectorOptionsProperty == null)
             {
@@ -2373,7 +2499,7 @@ public class HocusFocusController : WebApiController
             }
 
             // Call ResetDefaults method
-            var resetMethod = aberrationInspectorOptions.GetType().GetMethod("ResetDefaults", 
+            var resetMethod = aberrationInspectorOptions.GetType().GetMethod("ResetDefaults",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
 
             if (resetMethod == null)
@@ -2402,5 +2528,797 @@ public class HocusFocusController : WebApiController
             HttpContext.Response.StatusCode = 500;
             return new { Success = false, Error = ex.Message };
         }
+    }
+
+    [Route(HttpVerbs.Get, "/hocusfocus/browse-directories")]
+    public object BrowseDirectories()
+    {
+        try
+        {
+            // Get the path query parameter (defaults to home directory or Documents)
+            string pathParam = null;
+            if (HttpContext.Request.QueryString.AllKeys.Contains("path"))
+            {
+                pathParam = HttpContext.Request.QueryString["path"]?.ToString();
+            }
+            var path = string.IsNullOrWhiteSpace(pathParam) ? GetDefaultBrowsePath() : Uri.UnescapeDataString(pathParam);
+
+            Logger.Debug($"[BrowseDirectories] Requested path: {pathParam}, resolved to: {path}");
+
+            // Security: Prevent path traversal attacks
+            var fullPath = Path.GetFullPath(path);
+            if (!Directory.Exists(fullPath))
+            {
+                Logger.Error($"[BrowseDirectories] Path does not exist: {fullPath}");
+                HttpContext.Response.StatusCode = 404;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Path does not exist" }
+                };
+            }
+
+            // Get subdirectories
+            var subdirectories = new List<Dictionary<string, object>>();
+            try
+            {
+                // Get all directories and filter out hidden ones (starting with .)
+                var dirs = Directory.GetDirectories(fullPath)
+                    .Where(d => !Path.GetFileName(d).StartsWith("."))
+                    .OrderBy(d => Path.GetFileName(d))
+                    .ToList();
+                foreach (var dir in dirs)
+                {
+                    try
+                    {
+                        var dirInfo = new DirectoryInfo(dir);
+                        // Check if directory has non-hidden subdirectories
+                        var hasVisibleSubdirs = Directory.GetDirectories(dir)
+                            .Any(d => !Path.GetFileName(d).StartsWith("."));
+
+                        subdirectories.Add(new Dictionary<string, object>()
+                        {
+                            { "name", dirInfo.Name },
+                            { "path", dirInfo.FullName },
+                            { "hasSubdirs", hasVisibleSubdirs }
+                        });
+                    }
+                    catch { /* Skip directories we can't access */ }
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                HttpContext.Response.StatusCode = 403;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Access denied to this directory" }
+                };
+            }
+
+            // Get parent directory for navigation
+            var parentPath = Directory.GetParent(fullPath)?.FullName;
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "currentPath", fullPath },
+                { "parentPath", parentPath },
+                { "directories", subdirectories }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[BrowseDirectories] Error browsing directories: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to browse directories: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Scans for available ETA Tilter devices
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/tilter/scan-devices")]
+    public object ScanTilterDevices()
+    {
+        try
+        {
+            var tilterService = TilterService.Instance;
+            var devices = tilterService.ScanDevices();
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Response", devices }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[ScanTilterDevices] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to scan devices: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Gets list of available ETA Tilter devices
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/tilter/devices")]
+    public object GetTilterDevices()
+    {
+        try
+        {
+            var tilterService = TilterService.Instance;
+            var devices = tilterService.GetAvailableDevices();
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Response", devices }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[GetTilterDevices] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to get devices: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Connects to an ETA Tilter device
+    /// </summary>
+    [Route(HttpVerbs.Post, "/hocusfocus/tilter/connect")]
+    public async Task<object> ConnectTilterDevice()
+    {
+        try
+        {
+            var json = await HttpContext.GetRequestBodyAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("deviceId", out var deviceIdElement))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Missing deviceId parameter" }
+                };
+            }
+
+            int deviceId;
+            // Handle both int and string formats
+            if (deviceIdElement.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                if (!deviceIdElement.TryGetInt32(out deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Invalid deviceId value" }
+                    };
+                }
+            }
+            else if (deviceIdElement.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                if (!int.TryParse(deviceIdElement.GetString(), out deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Invalid deviceId format" }
+                    };
+                }
+            }
+            else
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Invalid deviceId parameter type" }
+                };
+            }
+
+            var tilterService = TilterService.Instance;
+            bool connected = tilterService.ConnectDevice(deviceId);
+
+            HttpContext.Response.StatusCode = connected ? 200 : 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", connected },
+                { "Message", connected ? "Device connected successfully" : "Failed to connect device" }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[ConnectTilterDevice] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to connect device: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Disconnects from an ETA Tilter device
+    /// </summary>
+    [Route(HttpVerbs.Post, "/hocusfocus/tilter/disconnect")]
+    public async Task<object> DisconnectTilterDevice()
+    {
+        try
+        {
+            var json = await HttpContext.GetRequestBodyAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("deviceId", out var deviceIdElement))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Missing deviceId parameter" }
+                };
+            }
+
+            int deviceId;
+            // Handle both int and string formats
+            if (deviceIdElement.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                if (!deviceIdElement.TryGetInt32(out deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Invalid deviceId value" }
+                    };
+                }
+            }
+            else if (deviceIdElement.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                if (!int.TryParse(deviceIdElement.GetString(), out deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Invalid deviceId format" }
+                    };
+                }
+            }
+            else
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Invalid deviceId parameter type" }
+                };
+            }
+
+            var tilterService = TilterService.Instance;
+            bool disconnected = tilterService.DisconnectDevice(deviceId);
+
+            HttpContext.Response.StatusCode = disconnected ? 200 : 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", disconnected },
+                { "Message", disconnected ? "Device disconnected successfully" : "Failed to disconnect device" }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[DisconnectTilterDevice] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to disconnect device: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Checks if an ETA Tilter device is currently connected
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/tilter/is-connected/{deviceId}")]
+    public object IsTilterDeviceConnected(int deviceId)
+    {
+        try
+        {
+            var tilterService = TilterService.Instance;
+            bool isConnected = tilterService.IsDeviceConnected(deviceId);
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "IsConnected", isConnected }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[IsTilterDeviceConnected] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "IsConnected", false },
+                { "Error", ex.Message }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Gets status of an ETA Tilter device
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/tilter/status/{deviceId}")]
+    public object GetTilterStatus(int deviceId)
+    {
+        try
+        {
+            var tilterService = TilterService.Instance;
+            // GetTilterStatus is only for real ETA devices which use 78.0mm outer radius
+            var status = tilterService.GetDeviceStatus(deviceId, 78.0);
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Response", status }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[GetTilterStatus] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to get status: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Sets positions for an ETA Tilter device
+    /// </summary>
+    [Route(HttpVerbs.Post, "/hocusfocus/tilter/set-positions")]
+    public async Task<object> SetTilterPositions()
+    {
+        try
+        {
+            var json = await HttpContext.GetRequestBodyAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("deviceId", out var deviceIdElement))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Missing deviceId parameter" }
+                };
+            }
+
+            int deviceId;
+            // Handle both int and string formats
+            if (deviceIdElement.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                if (!deviceIdElement.TryGetInt32(out deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Invalid deviceId value" }
+                    };
+                }
+            }
+            else if (deviceIdElement.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                if (!int.TryParse(deviceIdElement.GetString(), out deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Invalid deviceId format" }
+                    };
+                }
+            }
+            else
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Invalid deviceId parameter type" }
+                };
+            }
+
+            if (!root.TryGetProperty("positions", out var positionsElement))
+            {
+                HttpContext.Response.StatusCode = 400;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "Missing positions parameter" }
+                };
+            }
+
+            // Extract the three position values - only set if present in the request
+            float? position1 = null, position2 = null, position3 = null;
+
+            if (positionsElement.TryGetProperty("position1", out var p1) && p1.TryGetSingle(out var p1Val))
+                position1 = p1Val;
+            if (positionsElement.TryGetProperty("position2", out var p2) && p2.TryGetSingle(out var p2Val))
+                position2 = p2Val;
+            if (positionsElement.TryGetProperty("position3", out var p3) && p3.TryGetSingle(out var p3Val))
+                position3 = p3Val;
+
+            var tilterService = TilterService.Instance;
+            bool success = tilterService.SetDevicePositions(deviceId, position1, position2, position3);
+
+            HttpContext.Response.StatusCode = success ? 200 : 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", success },
+                { "Message", success ? "Positions set successfully" : "Failed to set positions" }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[SetTilterPositions] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to set positions: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Gets the current sensor configuration (size and orientation)
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/tilter/sensor-config")]
+    public object GetSensorConfiguration()
+    {
+        try
+        {
+            var tilterService = TilterService.Instance;
+            var config = tilterService.GetSensorConfiguration();
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "SensorWidth", config.SensorWidth },
+                { "SensorHeight", config.SensorHeight },
+                { "SensorRotation", config.SensorRotation },
+                { "TilterOuterRadius", config.TilterOuterRadius },
+                { "TilterThreadPitch", config.TilterThreadPitch }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[GetSensorConfiguration] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to get sensor configuration: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Sets the sensor configuration (size and orientation)
+    /// </summary>
+    [Route(HttpVerbs.Post, "/hocusfocus/tilter/sensor-config")]
+    public async Task<object> SetSensorConfiguration()
+    {
+        try
+        {
+            using var json = JsonDocument.Parse(await HttpContext.GetRequestBodyAsStringAsync());
+            var root = json.RootElement;
+
+            double width = 36.0;
+            double height = 24.0;
+            double rotation = 0.0;
+            double outerRadius = 0.0;
+            double threadPitch = 0.0;
+
+            if (root.TryGetProperty("sensorWidth", out var widthElement) && widthElement.TryGetDouble(out var widthVal))
+                width = widthVal;
+            if (root.TryGetProperty("sensorHeight", out var heightElement) && heightElement.TryGetDouble(out var heightVal))
+                height = heightVal;
+            if (root.TryGetProperty("sensorRotation", out var rotationElement) && rotationElement.TryGetDouble(out var rotationVal))
+                rotation = Math.Clamp(rotationVal, 0, 359.9);
+            if (root.TryGetProperty("tilterOuterRadius", out var outerRadiusElement) && outerRadiusElement.TryGetDouble(out var outerRadiusVal))
+                outerRadius = outerRadiusVal;
+            if (root.TryGetProperty("tilterThreadPitch", out var threadPitchElement) && threadPitchElement.TryGetDouble(out var threadPitchVal))
+                threadPitch = threadPitchVal;
+
+            var config = new TilterService.SensorConfigurationDTO
+            {
+                SensorWidth = width,
+                SensorHeight = height,
+                SensorRotation = rotation,
+                TilterOuterRadius = outerRadius,
+                TilterThreadPitch = threadPitch
+            };
+
+            var tilterService = TilterService.Instance;
+            tilterService.SetSensorConfiguration(config);
+
+            HttpContext.Response.StatusCode = 200;
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Message", "Sensor configuration updated successfully" }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[SetSensorConfiguration] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to set sensor configuration: {ex.Message}" }
+            };
+        }
+    }
+
+    [Route(HttpVerbs.Post, "/hocusfocus/tilter/apply-tilt-plane")]
+    public object ApplyTiltPlane()
+    {
+        try
+        {
+            using (var reader = new System.IO.StreamReader(HttpContext.Request.InputStream))
+            {
+                string json = reader.ReadToEnd();
+
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                // Extract device ID
+                if (!root.TryGetProperty("deviceId", out var deviceIdElement) || !deviceIdElement.TryGetInt32(out var deviceId))
+                {
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Missing or invalid deviceId parameter" }
+                    };
+                }
+
+                // Extract desired Z values at the four corners
+                double tlZ = 0, trZ = 0, blZ = 0, brZ = 0;
+
+                if (root.TryGetProperty("imagePlaneTopLeftZ", out var tlElement) && tlElement.ValueKind != System.Text.Json.JsonValueKind.Null && tlElement.TryGetDouble(out var tlVal))
+                    tlZ = tlVal;
+                if (root.TryGetProperty("imagePlaneTopRightZ", out var trElement) && trElement.ValueKind != System.Text.Json.JsonValueKind.Null && trElement.TryGetDouble(out var trVal))
+                    trZ = trVal;
+                if (root.TryGetProperty("imagePlaneBottomLeftZ", out var blElement) && blElement.ValueKind != System.Text.Json.JsonValueKind.Null && blElement.TryGetDouble(out var blVal))
+                    blZ = blVal;
+                if (root.TryGetProperty("imagePlaneBottomRightZ", out var brElement) && brElement.ValueKind != System.Text.Json.JsonValueKind.Null && brElement.TryGetDouble(out var brVal))
+                    brZ = brVal;
+
+                // Extract outer radius - optional parameter (no default)
+                double? outerRadius = null;
+                if (root.TryGetProperty("outerRadius", out var outerRadiusElement) && outerRadiusElement.ValueKind != System.Text.Json.JsonValueKind.Null && outerRadiusElement.TryGetDouble(out var outerRadiusVal))
+                {
+                    outerRadius = outerRadiusVal;
+                }
+
+                // Extract dontOffsetToZero flag - optional parameter (default false)
+                bool dontOffsetToZero = false;
+                if (root.TryGetProperty("dontOffsetToZero", out var dontOffsetElement) && dontOffsetElement.ValueKind != System.Text.Json.JsonValueKind.Null)
+                {
+                    try
+                    {
+                        dontOffsetToZero = dontOffsetElement.GetBoolean();
+                    }
+                    catch
+                    {
+                        dontOffsetToZero = false;
+                    }
+                }
+
+                var tilterService = TilterService.Instance;
+
+                // Check if device is connected first (skip for manual tilter device -1)
+                if (deviceId != -1 && !tilterService.IsDeviceConnected(deviceId))
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", $"Device {deviceId} is not connected. Please connect the device before calculating positions." }
+                    };
+                }
+
+                // Determine the outer radius to use
+                double? finalOuterRadius = outerRadius;
+
+                // If no outer radius provided (ETA device case), try to fetch from device
+                // Skip this for manual tilter device -1 (it's virtual and requires explicit outerRadius)
+                if (outerRadius == null && deviceId != -1)
+                {
+                    try
+                    {
+                        // For ETA devices, fetch the radius from the device itself
+                        var etaStatus = new WandererSDK.WTEtaStatus();
+                        var statusResult = WandererSDK.WTETAGetStatus(deviceId, ref etaStatus);
+
+                        if (statusResult == WandererSDK.WTErrorType.Success)
+                        {
+                            if (etaStatus.Radius > 0)
+                            {
+                                finalOuterRadius = etaStatus.Radius;
+                                Logger.Info($"[ApplyTiltPlane] Fetched ETA device radius: {etaStatus.Radius:F2}mm");
+                            }
+                            else
+                            {
+                                Logger.Warning($"[ApplyTiltPlane] ETA device returned invalid radius: {etaStatus.Radius:F2}mm");
+                            }
+                        }
+                        else
+                        {
+                            Logger.Warning($"[ApplyTiltPlane] Failed to fetch ETA device radius, status: {statusResult}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"[ApplyTiltPlane] Error fetching ETA device radius: {ex.Message}");
+                    }
+                }
+
+                // If we still don't have an outer radius, it's required
+                if (finalOuterRadius == null || finalOuterRadius <= 0)
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", "Tilter outer radius not available. For manual tilters, please configure the Tilter Screw Outer Radius before calculating positions. For ETA devices, ensure the device is properly connected." }
+                    };
+                }
+
+                // Retrieve current actuator positions to use as the baseline for corrections
+                // Skip this for manual tilter device -1 (it's virtual and has no current positions)
+                double currentP1 = 0, currentP2 = 0, currentP3 = 0;
+                if (deviceId != -1)
+                {
+                    try
+                    {
+                        var status = tilterService.GetDeviceStatus(deviceId, finalOuterRadius);
+                        if (status != null)
+                        {
+                            currentP1 = status.CurrentPosition1;
+                            currentP2 = status.CurrentPosition2;
+                            currentP3 = status.CurrentPosition3;
+                            Logger.Info($"[ApplyTiltPlane] Current device positions (mm) - P1: {currentP1:F6}, P2: {currentP2:F6}, P3: {currentP3:F6}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"[ApplyTiltPlane] Could not retrieve current positions, using 0: {ex.Message}");
+                    }
+                }
+
+                var desiredPlane = new TilterService.ApplyTiltPlaneDTO
+                {
+                    ImagePlaneTopLeftZ = tlZ,
+                    ImagePlaneTopRightZ = trZ,
+                    ImagePlaneBottomLeftZ = blZ,
+                    ImagePlaneBottomRightZ = brZ,
+                    OuterRadius = finalOuterRadius.Value,
+                    DontOffsetToZero = dontOffsetToZero
+                };
+
+                var result = tilterService.CalculateActuatorPositions(desiredPlane, currentP1, currentP2, currentP3, dontOffsetToZero);
+
+                if (!result.Success)
+                {
+                    HttpContext.Response.StatusCode = 400;
+                    return new Dictionary<string, object>()
+                    {
+                        { "Success", false },
+                        { "Error", result.Message }
+                    };
+                }
+
+                HttpContext.Response.StatusCode = 200;
+                var responseDict = new Dictionary<string, object>()
+                {
+                    { "Success", true },
+                    { "Message", result.Message },
+                    { "Position1", result.Position1 },
+                    { "Position2", result.Position2 },
+                    { "Position3", result.Position3 }
+                };
+
+                // Include raw positions for manual tilters (to show what was calculated before offsetting)
+                if (result.RawPosition1.HasValue)
+                    responseDict["RawPosition1"] = result.RawPosition1;
+                if (result.RawPosition2.HasValue)
+                    responseDict["RawPosition2"] = result.RawPosition2;
+                if (result.RawPosition3.HasValue)
+                    responseDict["RawPosition3"] = result.RawPosition3;
+
+                return responseDict;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"[ApplyTiltPlane] Error: {ex.Message}", ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to apply tilt plane: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Helper method to determine the default starting path for directory browsing
+    /// </summary>
+    private string GetDefaultBrowsePath()
+    {
+        try
+        {
+            // Try to get the AutoFocusOptions SavePath first
+            var hocusFocusPluginType = Type.GetType("NINA.Joko.Plugins.HocusFocus.HocusFocusPlugin, NINA.Joko.Plugins.HocusFocus");
+            if (hocusFocusPluginType != null)
+            {
+                var autoFocusOptionsProperty = hocusFocusPluginType.GetProperty("AutoFocusOptions",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (autoFocusOptionsProperty != null)
+                {
+                    var autoFocusOptions = autoFocusOptionsProperty.GetValue(null);
+                    if (autoFocusOptions != null)
+                    {
+                        var savePathProperty = autoFocusOptions.GetType().GetProperty("SavePath");
+                        if (savePathProperty != null)
+                        {
+                            var savePath = savePathProperty.GetValue(autoFocusOptions) as string;
+                            if (!string.IsNullOrWhiteSpace(savePath) && Directory.Exists(savePath))
+                            {
+                                return savePath;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { /* Fall through to default */ }
+
+        // Fallback to common directories
+        return Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
     }
 }

@@ -22,6 +22,11 @@ jobs:
           mkdir packages
           mkdir packages/${{ env.PLUGIN_NAME }}
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Pull and build external repository
         run: |
           git clone https://github.com/Touch-N-Stars/Touch-N-Stars.git external_repo
@@ -30,6 +35,15 @@ jobs:
           npm run build
           cd ..
           mv external_repo/dist app
+
+      - name: Verify Celestia Atlas data
+        run: |
+          if (!(Test-Path "app/celestia-atlas-data")) {
+            throw "Touch-N-Stars build is missing app/celestia-atlas-data"
+          }
+          if (Test-Path "app/stellarium-data") {
+            throw "Legacy app/stellarium-data must not be packaged"
+          }
 
       - name: Get Assembly Version
         id: get_version
@@ -44,9 +58,16 @@ jobs:
 
       - name: Prepare package
         run: |
-          Copy-Item "Touch-N-Stars/bin/Release/net8.0-windows/${{ env.PLUGIN_DLL_NAME }}.dll" "packages/${{ env.PLUGIN_NAME }}/${{ env.PLUGIN_DLL_NAME }}.dll" -Force
-          Copy-Item "Touch-N-Stars/bin/Release/net8.0-windows/${{ env.PLUGIN_DLL_NAME }}.pdb" "packages/${{ env.PLUGIN_NAME }}/${{ env.PLUGIN_DLL_NAME }}.pdb" -Force
-          Copy-Item "Touch-N-Stars/extra-libs/*.dll" "packages/${{ env.PLUGIN_NAME }}/" -Force
+          $buildOutput = "Touch-N-Stars/bin/Release/net8.0-windows"
+          $packageRoot = "packages/${{ env.PLUGIN_NAME }}"
+
+          # Include full plugin runtime payload: main DLL, deps/runtimeconfig, runtimes folder and all transitive dependencies.
+          Copy-Item "$buildOutput/*" "$packageRoot/" -Recurse -Force
+
+          # Keep explicit extra-libs copy for any manually managed binaries.
+          if (Test-Path "Touch-N-Stars/extra-libs") {
+            Copy-Item "Touch-N-Stars/extra-libs/*" "$packageRoot/" -Recurse -Force
+          }
   
       - name: Add app folder to package
         run: |

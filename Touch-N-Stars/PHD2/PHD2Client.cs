@@ -22,6 +22,7 @@ using System.Net.Sockets;
 using System.Threading;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using NINA.Core.Utility.Notification;
 
 namespace TouchNStars.PHD2
 {
@@ -79,6 +80,7 @@ namespace TouchNStars.PHD2
         public SettleProgress SettleProgress { get; set; }
         public StarLostInfo LastStarLost { get; set; }
         public GuideStarInfo CurrentStar { get; set; }
+        public CalibrationStepInfo CalibrationStep { get; set; }
     }
 
     public class GuideStarInfo
@@ -87,6 +89,27 @@ namespace TouchNStars.PHD2
         public double HFD { get; set; }
         public double StarMass { get; set; }
         public DateTime LastUpdate { get; set; }
+    }
+
+    public class CalibrationStepInfo
+    {
+        public string Direction { get; set; }
+        public int Step { get; set; }
+        public string Message { get; set; }
+        public double Dist { get; set; }
+        public double Dx { get; set; }
+        public double Dy { get; set; }
+    }
+
+    public class DarkBuildStatus
+    {
+        public bool Active { get; set; }
+        public bool Complete { get; set; }
+        public bool Success { get; set; }
+        public int Frame { get; set; }
+        public int TotalFrames { get; set; }
+        public int ExposureMs { get; set; }
+        public string Error { get; set; }
     }
 
     public class StarImageData
@@ -221,7 +244,13 @@ namespace TouchNStars.PHD2
         private Thread workerThread;
         private volatile bool terminate;
         private readonly object syncObject = new object();
-        private JObject response;
+        // Responses are matched to their originating Call() by request id. PHD2
+        // interleaves RPC responses with a stream of event notifications (heavy
+        // during active guiding), so a single shared "response" field raced: an
+        // answer arriving before the caller reached Monitor.Wait was lost, then
+        // every call timed out. Keyed pending map + PulseAll fixes that.
+        private readonly Dictionary<int, JObject> pendingResponses = new Dictionary<int, JObject>();
+        private int nextRequestId;
 
         private readonly Accumulator accumRA = new Accumulator();
         private readonly Accumulator accumDec = new Accumulator();
@@ -236,6 +265,8 @@ namespace TouchNStars.PHD2
         public string PHDSubver { get; private set; }
         public StarLostInfo LastStarLost { get; private set; }
         public GuideStarInfo CurrentStar { get; private set; } = new GuideStarInfo();
+        public CalibrationStepInfo LastCalibrationStep { get; private set; }
+        public DarkBuildStatus DarkBuild { get; private set; } = new DarkBuildStatus();
         private SettleProgress settle;
 
         public PHD2Client(string hostname = "localhost", uint instance = 1)
@@ -272,11 +303,22 @@ namespace TouchNStars.PHD2
 
             connection?.Close();
             connection = new PHD2Connection();
+
+            // Drop any responses left over from the previous connection and wake
+            // any callers still waiting so they fail fast instead of timing out.
+            lock (syncObject)
+            {
+                pendingResponses.Clear();
+                Monitor.PulseAll(syncObject);
+            }
         }
 
         public JObject Call(string method, JToken param = null)
         {
-            string jsonRpc = MakeJsonRpc(method, param);
+            // Unique id per call so the worker can match this response even when
+            // it arrives interleaved with (or before) other responses/events.
+            int id = System.Threading.Interlocked.Increment(ref nextRequestId);
+            string jsonRpc = MakeJsonRpc(method, id, param);
             Debug.WriteLine($"PHD2 Call: {jsonRpc}");
 
             // Also log to NINA logger for better visibility
@@ -302,21 +344,25 @@ namespace TouchNStars.PHD2
             {
                 var timeout = DateTime.Now.AddSeconds(10); // 10 second timeout
 
-                while (response == null && DateTime.Now < timeout)
+                // The response may already be in the map if the worker read it
+                // between our WriteLine and taking this lock - checking the map
+                // (not a single shared field) means we never miss it.
+                while (!pendingResponses.ContainsKey(id) && DateTime.Now < timeout)
                 {
                     if (!IsConnected)
+                    {
+                        pendingResponses.Remove(id);
                         throw new PHD2Exception("PHD2 Server disconnected during call");
+                    }
 
                     Monitor.Wait(syncObject, 1000); // Wait max 1 second at a time
                 }
 
-                if (response == null)
+                if (!pendingResponses.TryGetValue(id, out JObject result))
                 {
                     throw new PHD2Exception($"Timeout waiting for response to {method} - PHD2 may be disconnected");
                 }
-
-                JObject result = response;
-                response = null;
+                pendingResponses.Remove(id);
 
                 if (IsFailedResponse(result))
                     throw new PHD2Exception((string)result["error"]["message"]);
@@ -350,11 +396,17 @@ namespace TouchNStars.PHD2
 
                         if (json.ContainsKey("jsonrpc"))
                         {
-                            // Response to a call
+                            // Response to a call - store it under its id and wake
+                            // all waiters (PulseAll, since several calls may be
+                            // pending). The waiting Call() matches by its own id.
+                            int? responseId = json["id"]?.Value<int>();
                             lock (syncObject)
                             {
-                                response = json;
-                                Monitor.Pulse(syncObject);
+                                if (responseId.HasValue)
+                                {
+                                    pendingResponses[responseId.Value] = json;
+                                }
+                                Monitor.PulseAll(syncObject);
                             }
                         }
                         else
@@ -422,12 +474,48 @@ namespace TouchNStars.PHD2
                     }
                     break;
 
+                case "LoopingExposures":
+                    // PHD2 includes SNR/HFD/StarMass in LoopingExposures when a star is found
+                    if (eventObj["StarMass"] != null && CurrentStar != null)
+                    {
+                        if (eventObj["SNR"] != null) CurrentStar.SNR = (double)eventObj["SNR"];
+                        if (eventObj["HFD"] != null) CurrentStar.HFD = (double)eventObj["HFD"];
+                        CurrentStar.StarMass = (double)eventObj["StarMass"];
+                        CurrentStar.LastUpdate = DateTime.Now;
+                    }
+                    break;
+
                 case "GuidingStopped":
                     AppState = "Stopped";
                     break;
 
                 case "Paused":
                     AppState = "Paused";
+                    break;
+
+                case "StarSelected":
+                    AppState = "Selected";
+                    break;
+
+                case "Calibrating":
+                    AppState = "Calibrating";
+                    LastCalibrationStep = new CalibrationStepInfo
+                    {
+                        Direction = (string)eventObj["dir"],
+                        Step = eventObj["step"] != null ? (int)eventObj["step"] : 0,
+                        Message = (string)eventObj["State"],
+                        Dist = eventObj["dist"] != null ? (double)eventObj["dist"] : 0,
+                        Dx = eventObj["dx"] != null ? (double)eventObj["dx"] : 0,
+                        Dy = eventObj["dy"] != null ? (double)eventObj["dy"] : 0
+                    };
+                    break;
+
+                case "CalibrationComplete":
+                    LastCalibrationStep = null;
+                    break;
+
+                case "CalibrationFailed":
+                    LastCalibrationStep = null;
                     break;
 
                 case "StarLost":
@@ -480,6 +568,41 @@ namespace TouchNStars.PHD2
                         settle = doneProgress;
                     }
                     accumActive = true;
+                    break;
+
+                case "DarkLibraryBuildProgress":
+                    DarkBuild = new DarkBuildStatus
+                    {
+                        Active = true,
+                        Complete = false,
+                        Success = false,
+                        Frame = eventObj["Frame"] != null ? (int)eventObj["Frame"] : 0,
+                        TotalFrames = eventObj["TotalFrames"] != null ? (int)eventObj["TotalFrames"] : 0,
+                        ExposureMs = eventObj["ExposureMs"] != null ? (int)eventObj["ExposureMs"] : 0,
+                        Error = null
+                    };
+                    break;
+
+                case "DarkLibraryBuildComplete":
+                    DarkBuild = new DarkBuildStatus
+                    {
+                        Active = false,
+                        Complete = true,
+                        Success = eventObj["Success"] != null && (bool)eventObj["Success"],
+                        Frame = DarkBuild.TotalFrames,
+                        TotalFrames = DarkBuild.TotalFrames,
+                        ExposureMs = DarkBuild.ExposureMs,
+                        Error = (string)eventObj["Error"]
+                    };
+                    break;
+
+                case "Alert":
+                    var alertMsg = (string)eventObj["Msg"];
+                    var alertType = (string)eventObj["Type"];
+                    if (alertType == "error")
+                        Notification.ShowError(alertMsg);
+                    else
+                        Notification.ShowWarning(alertMsg);
                     break;
             }
         }
@@ -827,6 +950,26 @@ namespace TouchNStars.PHD2
             Call("set_calibration_step", step);
         }
 
+        public int GetCalibrationDistance()
+        {
+            CheckConnected();
+            var result = Call("get_calibration_distance");
+            var distance = result["result"];
+
+            if (distance == null || distance.Type == JTokenType.Null)
+            {
+                throw new PHD2Exception("Calibration distance not available");
+            }
+
+            return (int)distance;
+        }
+
+        public void SetCalibrationDistance(int distance)
+        {
+            CheckConnected();
+            Call("set_calibration_distance", distance);
+        }
+
         public void ClearMountCalibration()
         {
             CheckConnected();
@@ -1160,7 +1303,8 @@ namespace TouchNStars.PHD2
                     HFD = CurrentStar.HFD,
                     StarMass = CurrentStar.StarMass,
                     LastUpdate = CurrentStar.LastUpdate
-                } : null
+                } : null,
+                CalibrationStep = LastCalibrationStep
             };
         }
 
@@ -1286,6 +1430,74 @@ namespace TouchNStars.PHD2
             return (string)result["result"];
         }
 
+        public int GetMaxRaDuration()
+        {
+            CheckConnected();
+            var result = Call("get_max_ra_duration");
+            return (int)result["result"];
+        }
+
+        public void SetMaxRaDuration(int ms)
+        {
+            CheckConnected();
+            Call("set_max_ra_duration", new JValue(ms));
+        }
+
+        public int GetMaxDecDuration()
+        {
+            CheckConnected();
+            var result = Call("get_max_dec_duration");
+            return (int)result["result"];
+        }
+
+        public void SetMaxDecDuration(int ms)
+        {
+            CheckConnected();
+            Call("set_max_dec_duration", new JValue(ms));
+        }
+
+        public JObject GetDarkLibraryInfo()
+        {
+            CheckConnected();
+            var result = Call("get_dark_library_info");
+            return (JObject)result["result"];
+        }
+
+        public void LoadDarkLibrary()
+        {
+            CheckConnected();
+            Call("load_dark_library");
+        }
+
+        public void UnloadDarkLibrary()
+        {
+            CheckConnected();
+            Call("unload_dark_library");
+        }
+
+        public void DeleteDarkLibrary()
+        {
+            CheckConnected();
+            Call("delete_dark_library");
+        }
+
+        public void StartBuildDarkLibrary(int[] expTimesMs, int frameCount)
+        {
+            CheckConnected();
+            var p = new JObject
+            {
+                ["expTimes"] = new JArray(expTimesMs.Cast<object>().ToArray()),
+                ["frameCount"] = frameCount
+            };
+            Call("start_build_dark_library", p);
+        }
+
+        public void CancelBuildDarkLibrary()
+        {
+            CheckConnected();
+            Call("cancel_build_dark_library");
+        }
+
         public bool GetGuideOutputEnabled()
         {
             CheckConnected();
@@ -1326,7 +1538,10 @@ namespace TouchNStars.PHD2
 
             var param = new JArray { axis, name };
             var result = Call("get_algo_param", param);
-            return (double)result["result"];
+            var token = result["result"];
+            if (token.Type != JTokenType.Float && token.Type != JTokenType.Integer)
+                throw new PHD2Exception($"could not get param '{name}': result is not numeric ({token})");
+            return (double)token;
         }
 
         public string[] GetAlgoParamNames(string axis)
@@ -1539,6 +1754,32 @@ namespace TouchNStars.PHD2
             };
         }
 
+        public JObject GetCalibrationData(string which = "Mount")
+        {
+            CheckConnected();
+            var result = Call("get_calibration_data", new JValue(which));
+            return result["result"] as JObject;
+        }
+
+        public List<double[]> GetSecondaryStars()
+        {
+            CheckConnected();
+
+            var result = Call("get_secondary_stars");
+            var arr = result["result"] as JArray;
+            var stars = new List<double[]>();
+            if (arr != null)
+            {
+                foreach (var item in arr)
+                {
+                    var x = (double)item["x"];
+                    var y = (double)item["y"];
+                    stars.Add(new[] { x, y });
+                }
+            }
+            return stars;
+        }
+
         private bool IsGuiding()
         {
             return AppState == "Guiding" || AppState == "LostLock";
@@ -1550,12 +1791,12 @@ namespace TouchNStars.PHD2
                 throw new PHD2Exception("PHD2 Server disconnected");
         }
 
-        private static string MakeJsonRpc(string method, JToken param)
+        private static string MakeJsonRpc(string method, int id, JToken param)
         {
             var request = new JObject
             {
                 ["method"] = method,
-                ["id"] = 1
+                ["id"] = id
             };
 
             if (param != null && param.Type != JTokenType.Null)
@@ -1569,7 +1810,7 @@ namespace TouchNStars.PHD2
                 }
             }
 
-            return request.ToString(Formatting.None);
+            return JsonConvert.SerializeObject(request);
         }
 
         private static bool IsFailedResponse(JObject response)
@@ -1708,6 +1949,90 @@ namespace TouchNStars.PHD2
             CheckConnected();
             var param = new JObject { ["binning"] = binning };
             Call("set_camera_binning", param);
+        }
+
+        public int GetCameraBitdepth()
+        {
+            CheckConnected();
+            var result = Call("get_camera_bitdepth");
+            if (result == null || result["result"] == null)
+                return 0;
+            return (int)result["result"];
+        }
+
+        /// <summary>
+        /// Calls the get_camera_info RPC (added to PHD2 locally).
+        /// Returns a Dictionary with keys: name, connected, pixel_size, is_color,
+        /// has_gain_control, gain, has_subframes, has_cooler, max_hw_binning, binning,
+        /// and (when connected) bits_per_pixel, frame_width, frame_height.
+        /// </summary>
+        public Dictionary<string, object> GetCameraInfoRpc()
+        {
+            CheckConnected();
+            var result = Call("get_camera_info");
+            if (result == null || result["result"] == null || result["result"].Type == JTokenType.Null)
+                return null;
+
+            var obj = result["result"] as JObject;
+            if (obj == null)
+                return null;
+
+            var info = new Dictionary<string, object>();
+            foreach (var prop in obj.Properties())
+            {
+                var val = prop.Value;
+                switch (val.Type)
+                {
+                    case JTokenType.Boolean: info[prop.Name] = (bool)val; break;
+                    case JTokenType.Integer: info[prop.Name] = (long)val; break;
+                    case JTokenType.Float: info[prop.Name] = (double)val; break;
+                    case JTokenType.String: info[prop.Name] = (string)val; break;
+                    case JTokenType.Null: info[prop.Name] = null; break;
+                    default: info[prop.Name] = val.ToString(); break;
+                }
+            }
+            return info;
+        }
+
+        /// <summary>
+        /// Returns the guide frame size as (Width, Height), or null if the camera is not connected.
+        /// PHD2 serialises wxSize as a two-element JSON array [x, y].
+        /// </summary>
+        public (int Width, int Height)? GetCameraFrameSize()
+        {
+            CheckConnected();
+            try
+            {
+                var result = Call("get_camera_frame_size");
+                if (result == null || result["result"] == null || result["result"].Type == JTokenType.Null)
+                    return null;
+                var ary = result["result"] as JArray;
+                if (ary == null || ary.Count < 2)
+                    return null;
+                return ((int)ary[0], (int)ary[1]);
+            }
+            catch
+            {
+                return null; // camera not connected in PHD2
+            }
+        }
+
+        public string GetSelectedCamera()
+        {
+            CheckConnected();
+            var result = Call("get_selected_camera");
+            if (result == null || result["result"] == null || result["result"].Type == JTokenType.Null)
+                return null;
+            return (string)result["result"];
+        }
+
+        public string GetSelectedCameraId()
+        {
+            CheckConnected();
+            var result = Call("get_selected_camera_id");
+            if (result == null || result["result"] == null || result["result"].Type == JTokenType.Null)
+                return null;
+            return (string)result["result"];
         }
 
         // Auto exposure methods
@@ -1874,6 +2199,60 @@ namespace TouchNStars.PHD2
             CheckConnected();
             var param = new JObject { ["adu_value"] = aduValue };
             Call("set_saturation_adu_value", param);
+        }
+
+        // Noise reduction: 0=None, 1=2x2Mean, 2=3x3Median
+        public int GetNoiseReductionMethod()
+        {
+            CheckConnected();
+            var result = Call("get_noise_reduction_method");
+            return (int)result["result"];
+        }
+
+        public void SetNoiseReductionMethod(int method)
+        {
+            CheckConnected();
+            var param = new JObject { ["method"] = method };
+            Call("set_noise_reduction_method", param);
+        }
+
+        // Time lapse: fixed delay in ms between guide exposures (mutually exclusive with variable delay)
+        public int GetTimeLapse()
+        {
+            CheckConnected();
+            var result = Call("get_time_lapse");
+            return (int)result["result"];
+        }
+
+        public void SetTimeLapse(int ms)
+        {
+            CheckConnected();
+            var param = new JObject { ["ms"] = ms };
+            Call("set_time_lapse", param);
+        }
+
+        // Backlash compensation
+        public (bool Enabled, int PulseWidth, int Floor, int Ceiling) GetBacklashComp()
+        {
+            CheckConnected();
+            var result = Call("get_backlash_comp");
+            var r = result["result"];
+            bool enabled = r["enabled"] != null && (bool)r["enabled"];
+            int pulseWidth = r["pulseWidth"] != null ? (int)r["pulseWidth"] : 0;
+            int floor = r["floor"] != null ? (int)r["floor"] : 0;
+            int ceiling = r["ceiling"] != null ? (int)r["ceiling"] : 0;
+            return (enabled, pulseWidth, floor, ceiling);
+        }
+
+        public void SetBacklashComp(bool? enabled, int? pulseWidth, int? floor, int? ceiling)
+        {
+            CheckConnected();
+            var param = new JObject();
+            if (enabled.HasValue) param["enabled"] = enabled.Value;
+            if (pulseWidth.HasValue) param["pulseWidth"] = pulseWidth.Value;
+            if (floor.HasValue) param["floor"] = floor.Value;
+            if (ceiling.HasValue) param["ceiling"] = ceiling.Value;
+            Call("set_backlash_comp", param);
         }
 
     }

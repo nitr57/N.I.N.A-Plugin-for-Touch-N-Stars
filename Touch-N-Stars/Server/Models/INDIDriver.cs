@@ -1,4 +1,9 @@
+using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using Newtonsoft.Json;
+using NINA.Core.Utility;
 
 namespace TouchNStars.Server.Models;
 
@@ -9,117 +14,337 @@ public class INDIDriver
     public string Type { get; set; }
 }
 
-public static class INDIFocusDrivers
+public static class INDIDriverRegistry
 {
-    public static readonly List<INDIDriver> Drivers = new()
-    {
-        new INDIDriver { Name = "indi_celestron_sct_focus", Label = "Celestron SCT Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_deepskydad_af1_focus", Label = "DeepSkyDad AF1 Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_deepskydad_af2_focus", Label = "DeepSkyDad AF2 Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_deepskydad_af3_focus", Label = "DeepSkyDad AF3 Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_dmfc_focus", Label = "DMFC Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_esattoarco_focus", Label = "Esatto Arco Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_esatto_focus", Label = "Esatto Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_fcusb_focus", Label = "FocusLynx USB Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_gemini_focus", Label = "Gemini Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_hitecastrodc_focus", Label = "HitecAstro DC Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_lacerta_mfoc_fmc_focus", Label = "Lacerta MFoc FMC Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_lacerta_mfoc_focus", Label = "Lacerta MFoc Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_microtouch_focus", Label = "Microtouch Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_moonlite_focus", Label = "Moonlite Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_moonlitedro_focus", Label = "Moonlite DRO Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_myfocuserpro2_focus", Label = "MyFocuserPro2 Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_pegasus_focuscube", Label = "Pegasus FocusCube", Type = "focuser" },
-        new INDIDriver { Name = "indi_pegasus_focuscube3", Label = "Pegasus FocusCube 3", Type = "focuser" },
-        new INDIDriver { Name = "indi_qhy_focuser", Label = "QHY Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_robo_focus", Label = "RoboFocus Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_sestosenso_focus", Label = "Sesto Senso Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_sestosenso2_focus", Label = "Sesto Senso 2 Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_simulator_focus", Label = "Simulator Focuser", Type = "focuser" },
-        new INDIDriver { Name = "indi_teenastro_focus", Label = "TeenAstro Focuser", Type = "focuser" },
-    };
-}
+    private static readonly string[] BuiltInDriverTypes =
+    [
+        "camera",
+        "dome",
+        "filterwheel",
+        "flatpanel",
+        "focuser",
+        "rotator",
+        "safetymonitor",
+        "switches",
+        "telescope",
+        "weather"
+    ];
 
-public static class INDIRotatorDrivers
-{
-    public static readonly List<INDIDriver> Drivers = new()
-    {
-        new INDIDriver { Name = "indi_asi_rotator", Label = "ZWO ASI Rotator", Type = "rotator" },
-        new INDIDriver { Name = "indi_falcon_rotator", Label = "Falcon Rotator", Type = "rotator" },
-        new INDIDriver { Name = "indi_falconv2_rotator", Label = "Falcon v2 Rotator", Type = "rotator" },
-        new INDIDriver { Name = "indi_simulator_rotator", Label = "Simulator Rotator", Type = "rotator" },
-    };
-}
+    // Base directory: ~/Documents/INDI/ (or My Documents\INDI\ on Windows)
+    private static readonly string DriverDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "INDI");
+    private static readonly string ThirdPartyFilePath = Path.Combine(DriverDirectory, "3rdparty.json");
+    private static readonly object PrepareLock = new();
+    private static bool prepared;
 
-public static class INDIFilterWheelDrivers
-{
-    public static readonly List<INDIDriver> Drivers = new()
-    {
-        new INDIDriver { Name = "indi_pegasusindigo_wheel", Label = "Pegasus Indigo Filter Wheel", Type = "filterwheel" },
-        new INDIDriver { Name = "indi_simulator_wheel", Label = "Simulator Filter Wheel", Type = "filterwheel" },
-    };
-}
+    private static readonly Assembly _assembly = Assembly.GetExecutingAssembly();
+    // Embedded resource name format: TouchNStars.Server.Models.indi_drivers.<type>.json
+    private static string ResourceName(string driverType) =>
+        $"TouchNStars.Server.Models.indi_drivers.{driverType}.json";
 
-public static class INDIMountDrivers
-{
-    public static readonly List<INDIDriver> Drivers = new()
+    public static void PrepareDriverFiles(bool force = false)
     {
-        new INDIDriver { Name = "indi_azgti_telescope", Label = "AZ-GTi Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_eq500x_telescope", Label = "EQ500x Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_eqmod_telescope", Label = "EQMod Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_ioptronv3_telescope", Label = "iOptron v3 Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_paramount_telescope", Label = "Paramount Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_simulator_telescope", Label = "Simulator Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_staradventurer2i_telescope", Label = "Star Adventurer 2i Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_staradventurergti_telescope", Label = "Star Adventurer GTi Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_synscanlegacy_telescope", Label = "SynScan Legacy Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_synscan_telescope", Label = "SynScan Telescope", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200_10micron", Label = "LX200 10Micron", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200am5", Label = "LX200 AM5", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200basic", Label = "LX200 Basic", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200classic", Label = "LX200 Classic", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200fs2", Label = "LX200 FS2", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200gemini", Label = "LX200 Gemini", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200generic", Label = "LX200 Generic", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200_OnStep", Label = "LX200 OnStep", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200_OpenAstroTech", Label = "LX200 OpenAstroTech", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200_pegasus_nyx101", Label = "LX200 Pegasus NYX101", Type = "telescope" },
-        new INDIDriver { Name = "indi_lx200_TeenAstro", Label = "LX200 TeenAstro", Type = "telescope" },
-        new INDIDriver { Name = "indi_skywatcherAltAzMount", Label = "Skywatcher AltAz", Type = "telescope" },
-    };
-}
+        lock (PrepareLock)
+        {
+            if (prepared && !force)
+            {
+                return;
+            }
 
-public static class INDIWeatherDrivers
-{
-    public static readonly List<INDIDriver> Drivers = new()
-    {
-        new INDIDriver { Name = "indi_mbox_weather", Label = "MBox Weather", Type = "weather" },
-        new INDIDriver { Name = "indi_simulator_weather", Label = "Simulator Weather", Type = "weather" },
-        new INDIDriver { Name = "indi_sqm_weather", Label = "SQM Weather", Type = "weather" },
-        new INDIDriver { Name = "indi_uranus_weather", Label = "Uranus Weather", Type = "weather" },
-    };
-}
+            EnsureDriverDirectory();
+            Logger.Info($"Preparing INDI driver files in '{DriverDirectory}' (force={force})");
 
-public static class INDISwitchDrivers
-{
-    public static readonly List<INDIDriver> Drivers = new()
-    {
-        new INDIDriver { Name = "indi_celestron_dewpower", Label = "Celestron Dew Power", Type = "switches" },
-        new INDIDriver { Name = "indi_pegasus_ppb", Label = "Pegasus PPB", Type = "switches" },
-        new INDIDriver { Name = "indi_pegasus_ppba", Label = "Pegasus PPB Advanced", Type = "switches" },
-        new INDIDriver { Name = "indi_pegasus_spb", Label = "Pegasus SPB", Type = "switches" },
-        new INDIDriver { Name = "indi_pegasus_upb", Label = "Pegasus UPB", Type = "switches" },
-        new INDIDriver { Name = "indi_wanderer_dew_terminator", Label = "Wanderer Dew Terminator", Type = "switches" },
-    };
-}
+            foreach (string builtInType in BuiltInDriverTypes)
+            {
+                try
+                {
+                    SyncBuiltInDriverFile(builtInType);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Failed to prepare INDI file for type '{builtInType}': {ex.Message}");
+                }
+            }
 
-public static class INDIFlatPanelDrivers
-{
-    public static readonly List<INDIDriver> Drivers = new()
+            EnsureThirdPartyFile();
+            prepared = true;
+        }
+    }
+
+    public static List<INDIDriver> GetDrivers(string driverType)
     {
-        new INDIDriver { Name = "indi_deepskydata_fp", Label = "DeepSkyDad Flat Panel", Type = "flatpanel" },
-        new INDIDriver { Name = "indi_gemini_flatpanel", Label = "Gemini Flat Panel", Type = "flatpanel" },
-        new INDIDriver { Name = "indi_simulator_lightpanel", Label = "Simulator Light Panel", Type = "flatpanel" },
-        new INDIDriver { Name = "indi_wanderer_cover", Label = "Wanderer Cover", Type = "flatpanel" },
-    };
+        if (string.IsNullOrWhiteSpace(driverType))
+        {
+            Logger.Warning("INDI driver type was empty, returning empty list");
+            return new List<INDIDriver>();
+        }
+
+        PrepareDriverFiles();
+
+        var filePath = Path.Combine(DriverDirectory, $"{driverType}.json");
+        var drivers = ReadDriverListFromFile(filePath);
+        var thirdPartyDrivers = ReadThirdPartyDrivers(driverType);
+
+        if (thirdPartyDrivers.Count == 0)
+        {
+            return drivers;
+        }
+
+        var merged = new Dictionary<string, INDIDriver>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var driver in drivers)
+        {
+            if (driver == null)
+            {
+                continue;
+            }
+
+            string key = string.IsNullOrWhiteSpace(driver.Name)
+                ? $"__label__:{driver.Label ?? string.Empty}"
+                : driver.Name;
+            merged[key] = NormalizeDriver(driver, driverType);
+        }
+
+        foreach (var driver in thirdPartyDrivers)
+        {
+            if (driver == null)
+            {
+                continue;
+            }
+
+            string key = string.IsNullOrWhiteSpace(driver.Name)
+                ? $"__label__:{driver.Label ?? string.Empty}"
+                : driver.Name;
+            // 3rdparty entries intentionally override defaults when names collide.
+            merged[key] = NormalizeDriver(driver, driverType);
+        }
+
+        return new List<INDIDriver>(merged.Values);
+    }
+
+    private static void EnsureDriverDirectory()
+    {
+        try
+        {
+            Directory.CreateDirectory(DriverDirectory);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to create INDI driver directory '{DriverDirectory}': {ex.Message}");
+        }
+    }
+
+    // Overwrite the local default file with the embedded one so plugin updates always win.
+    private static void SyncBuiltInDriverFile(string driverType)
+    {
+        if (Array.IndexOf(BuiltInDriverTypes, driverType) < 0)
+        {
+            Logger.Warning($"Unknown INDI driver type '{driverType}', no embedded sync performed");
+            return;
+        }
+
+        var dest = Path.Combine(DriverDirectory, $"{driverType}.json");
+        var resourceName = ResourceName(driverType);
+        using var stream = _assembly.GetManifestResourceStream(resourceName);
+        if (stream == null)
+        {
+            Logger.Warning($"No embedded default found for INDI driver type '{driverType}' (resource '{resourceName}')");
+            return;
+        }
+
+        try
+        {
+            using var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            byte[] embeddedBytes = ms.ToArray();
+
+            bool shouldWrite = true;
+            if (File.Exists(dest))
+            {
+                byte[] existingBytes = File.ReadAllBytes(dest);
+                shouldWrite = !AreEqual(existingBytes, embeddedBytes);
+            }
+
+            if (!shouldWrite)
+            {
+                return;
+            }
+
+            using var fs = File.Create(dest);
+            fs.Write(embeddedBytes, 0, embeddedBytes.Length);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to sync INDI driver file '{dest}': {ex.Message}");
+        }
+    }
+
+    // Seed 3rdparty.json exactly once; do not overwrite user edits.
+    private static void EnsureThirdPartyFile()
+    {
+        if (File.Exists(ThirdPartyFilePath))
+        {
+            return;
+        }
+
+        var resourceName = ResourceName("3rdparty");
+        using var stream = _assembly.GetManifestResourceStream(resourceName);
+        try
+        {
+            using var fs = File.Create(ThirdPartyFilePath);
+
+            if (stream == null)
+            {
+                Logger.Warning($"No embedded default found for INDI third-party file (resource '{resourceName}'). Writing inline default template.");
+                WriteDefaultThirdPartyTemplate(fs);
+                return;
+            }
+
+            stream.CopyTo(fs);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Failed to seed INDI third-party file '{ThirdPartyFilePath}': {ex.Message}");
+        }
+    }
+
+    private static void WriteDefaultThirdPartyTemplate(Stream targetStream)
+    {
+        var template = new Dictionary<string, List<INDIDriver>>(StringComparer.OrdinalIgnoreCase);
+        foreach (string type in BuiltInDriverTypes)
+        {
+            template[type] = new List<INDIDriver>();
+        }
+
+        using var writer = new StreamWriter(targetStream);
+        string json = JsonConvert.SerializeObject(template, Formatting.Indented);
+        writer.Write(json);
+    }
+
+    private static List<INDIDriver> ReadDriverListFromFile(string filePath)
+    {
+        if (!File.Exists(filePath))
+        {
+            Logger.Warning($"INDI driver file not found at '{filePath}', returning empty list");
+            return new List<INDIDriver>();
+        }
+
+        try
+        {
+            string json = File.ReadAllText(filePath);
+            var drivers = JsonConvert.DeserializeObject<List<INDIDriver>>(json);
+            if (drivers == null)
+            {
+                Logger.Warning($"INDI driver file '{filePath}' deserialised to null (expected a JSON array)");
+                return new List<INDIDriver>();
+            }
+            return drivers;
+        }
+        catch (IOException ex)
+        {
+            Logger.Error($"Failed to read INDI driver file '{filePath}': {ex.Message}");
+            return new List<INDIDriver>();
+        }
+        catch (JsonException ex)
+        {
+            Logger.Error($"Failed to parse INDI driver file '{filePath}': {ex.Message}");
+            return new List<INDIDriver>();
+        }
+    }
+
+    private static List<INDIDriver> ReadThirdPartyDrivers(string driverType)
+    {
+        if (!File.Exists(ThirdPartyFilePath))
+        {
+            return new List<INDIDriver>();
+        }
+
+        string json;
+        try
+        {
+            json = File.ReadAllText(ThirdPartyFilePath);
+        }
+        catch (IOException ex)
+        {
+            Logger.Error($"Failed to read INDI third-party file '{ThirdPartyFilePath}': {ex.Message}");
+            return new List<INDIDriver>();
+        }
+
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return new List<INDIDriver>();
+        }
+
+        try
+        {
+            // Preferred format: { "focuser": [{...}], "telescope": [{...}] }
+            var map = JsonConvert.DeserializeObject<Dictionary<string, List<INDIDriver>>>(json);
+            if (map != null)
+            {
+                if (!map.TryGetValue(driverType, out var typedDrivers) || typedDrivers == null)
+                {
+                    return new List<INDIDriver>();
+                }
+
+                return typedDrivers;
+            }
+        }
+        catch (JsonException)
+        {
+            // Fall back to flat-array format below.
+        }
+
+        try
+        {
+            // Backward-compatible format: [ { "Name": "...", "Label": "...", "Type": "focuser" } ]
+            var allDrivers = JsonConvert.DeserializeObject<List<INDIDriver>>(json);
+            if (allDrivers == null)
+            {
+                return new List<INDIDriver>();
+            }
+
+            return allDrivers.FindAll(d =>
+                d != null &&
+                !string.IsNullOrWhiteSpace(d.Type) &&
+                d.Type.Equals(driverType, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (JsonException ex)
+        {
+            Logger.Error($"Failed to parse INDI third-party file '{ThirdPartyFilePath}': {ex.Message}");
+            return new List<INDIDriver>();
+        }
+    }
+
+    private static INDIDriver NormalizeDriver(INDIDriver driver, string fallbackType)
+    {
+        return new INDIDriver
+        {
+            Name = driver.Name,
+            Label = driver.Label,
+            Type = string.IsNullOrWhiteSpace(driver.Type) ? fallbackType : driver.Type
+        };
+    }
+
+    private static bool AreEqual(byte[] left, byte[] right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
+        if (left == null || right == null || left.Length != right.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < left.Length; i++)
+        {
+            if (left[i] != right[i])
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
