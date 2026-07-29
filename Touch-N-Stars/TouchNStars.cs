@@ -251,16 +251,6 @@ namespace TouchNStars {
         }
 
         private void RefreshMdnsAdvertisement() {
-            // PINS/Linux uses Avahi as the single mDNS owner for both the rig
-            // hostname and pinsdaemon discovery. Running Makaretu.Dns beside
-            // Avahi makes both responders probe the same machine name and
-            // forces Avahi to publish unstable "-2"/"-3" host aliases.
-            // Windows has no pinsdaemon/Avahi and keeps the plugin broadcaster.
-            if (OperatingSystem.IsLinux()) {
-                StopMdnsAdvertisement();
-                return;
-            }
-
             if (!AppEnabled || server == null || CachedPort <= 0) {
                 StopMdnsAdvertisement();
                 return;

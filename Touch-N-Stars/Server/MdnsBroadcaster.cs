@@ -39,7 +39,16 @@ internal sealed class MdnsBroadcaster : IDisposable
         {
             EnsureStarted();
             var addresses = address != null ? new[] { address } : null;
-            UpdateAdvertisement(new ServiceProfile(instanceName, serviceType, (ushort)port, addresses));
+            // Avahi owns the Linux host identity. Marking the profile as shared
+            // lets the plugin keep publishing its dynamic service and port
+            // without competing with Avahi for the same host records.
+            bool sharedProfile = OperatingSystem.IsLinux();
+            UpdateAdvertisement(new ServiceProfile(
+                instanceName,
+                serviceType,
+                (ushort)port,
+                addresses,
+                sharedProfile));
         }
     }
 
