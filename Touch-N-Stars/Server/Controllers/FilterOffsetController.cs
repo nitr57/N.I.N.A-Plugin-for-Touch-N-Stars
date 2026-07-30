@@ -350,54 +350,29 @@ public class FilterOffsetController : WebApiController
                     return new ApiResponse { Success = false, Error = "Profile not available", StatusCode = 503, Type = "Error" };
                 }
 
-                // NewOffsets are already relative to the base filter (see ComputeOffsets). Shifting the
-                // whole set by a constant never changes the spacing between the measured filters, which
-                // is all the focuser move between two calibrated filters depends on — but it does change
-                // how the measured block lines up with any filter that was left out of the calibration,
-                // since those still carry offsets on the old zero point. So when the run was partial,
-                // anchor the set on one measured filter's PREVIOUS offset: that filter's moves to and
-                // from the uncalibrated ones stay exactly as they were, and the recalibration only
-                // redistributes the rest. See ChooseAnchorIndex for which filter gets picked.
+                // FocusOffset is a differential quantity — FilterWheelVM moves the focuser by
+                // newFilter.FocusOffset - prevFilter.FocusOffset — so only the spacing between filters
+                // has any effect, and the set is free to be zeroed wherever it reads best. Zero it on
+                // the filter the user picks as the AutoFocus filter: that is the filter AutoFocus
+                // actually runs through, so "0" there and everything else stated relative to it is the
+                // reading that matches what the equipment does. It is also how NINA's own offset
+                // calculator presents its results.
                 //
-                // When the run covered every filter in the profile there is nothing left to stay
-                // compatible with, and anchoring is pure downside — it inherits whatever the profile
-                // happened to hold, including values written by older builds that stored absolute
-                // focuser positions in FocusOffset, and then re-inherits them on every recalibration.
-                // A full-wheel run therefore writes the clean base-relative set, which also repairs a
-                // profile that was poisoned that way.
-                var newOffsets = _result.NewOffsets
-                    .Select(o => (o.Position, o.Name, o.FocusOffset))
-                    .ToList();
+                // Every filter in the profile is written, not just the calibrated ones. A filter left
+                // out of the run keeps its previous distance to the base filter, so its focuser moves
+                // are unchanged, but it moves onto the same zero point as the rest instead of being
+                // stranded on the old one. That is what lets the reference be chosen freely, and it
+                // also repairs a profile poisoned by older builds that stored absolute focuser
+                // positions in FocusOffset: only differences of the old values are ever used, never an
+                // old value itself.
+                var newOffsets = BuildOffsetTable(
+                    profile.FilterWheelSettings.FilterWheelFilters,
+                    _result.NewOffsets,
+                    _result.OldOffsets,
+                    payload?.NewDefaultFilterPosition);
 
-                if (newOffsets.Count > 0)
-                {
-                    var calibratedPositions = newOffsets.Select(o => o.Position).ToList();
-                    var profilePositions = profile.FilterWheelSettings.FilterWheelFilters
-                        .Select(f => (int)f.Position)
-                        .ToList();
-
-                    if (CoversEveryProfileFilter(calibratedPositions, profilePositions))
-                    {
-                        Logger.Info($"FilterOffset: calibration covered all {profilePositions.Count} filters in the " +
-                                    "profile — writing offsets relative to the base filter, without anchoring.");
-                    }
-                    else
-                    {
-                        int anchorIndex = ChooseAnchorIndex(calibratedPositions, payload?.NewDefaultFilterPosition);
-                        var (anchorPosition, _, measured) = newOffsets[anchorIndex];
-                        int anchor = _result.OldOffsets?.FirstOrDefault(o => o.Position == anchorPosition)?.FocusOffset ?? 0;
-                        if (measured != anchor)
-                        {
-                            newOffsets = newOffsets
-                                .Select(o => (o.Position, o.Name, o.FocusOffset - measured + anchor))
-                                .ToList();
-                        }
-
-                        Logger.Info($"FilterOffset: only {calibratedPositions.Count} of {profilePositions.Count} " +
-                                    "profile filters were calibrated — anchoring offsets on filter position " +
-                                    $"{anchorPosition} at its previous offset {anchor} (measured {measured})");
-                    }
-                }
+                foreach (var (Position, Name, FocusOffset) in newOffsets)
+                    Logger.Info($"FilterOffset: filter '{Name}' (position {Position}) offset {FocusOffset}");
 
                 // Write offsets to profile
                 profile.FocuserSettings.UseFilterWheelOffsets = true;
@@ -481,13 +456,22 @@ public class FilterOffsetController : WebApiController
             .Select(f => ((int)f.Position, f.Name, f.FocusOffset))
             .ToList();
 
-        // 2. Setup: disable offsets & autofocus-filter flag, reset offsets to 0
+        // 2. Setup: stop offsets from perturbing the measurements.
+        //
+        // Turning UseFilterWheelOffsets off is enough on its own, and it is the only thing done here.
+        // Every path that turns a FocusOffset into a focuser move sits behind that flag —
+        // FilterWheelVM.ChangeFilter (the only one that moves the focuser at all), HocusFocus's
+        // SetAutofocusFilter, and its star-detection optimiser — and the readers that are not behind it
+        // (the Alpaca FocusOffsets property, the Oasis store/sync buttons, the filter-list import) never
+        // move a focuser.
+        //
+        // This deliberately no longer zeroes FocusOffset or clears AutoFocusFilter. Both were redundant
+        // given the flag, and both were destructive: ProfileService auto-saves about a second after any
+        // profile change, so the wiped values were on disk immediately while the only copy that could
+        // restore them lived in this class's static fields. A run that never reached Accept or Discard —
+        // NINA restarted, the plugin reloaded, an apply that failed — left the user with every offset at
+        // 0 and their AutoFocus filter cleared, with nothing left to recover from.
         profile.FocuserSettings.UseFilterWheelOffsets = false;
-        foreach (var f in selectedFilters)
-        {
-            f.AutoFocusFilter = false;
-            f.FocusOffset = 0;
-        }
 
         // position → AF results for that filter, tagged with the zero-based loop they came from. A loop
         // can be missing when its AutoFocus failed, so the loop number has to travel with the sample
@@ -515,13 +499,19 @@ public class FilterOffsetController : WebApiController
 
                 Logger.Info($"FilterOffset: loop {_currentLoop}/{loops} — switching to filter '{filter.Name}' (position {filter.Position})");
 
-                // Re-apply suppression immediately before each filter's AF attempts.
-                // Something resets UseFilterWheelOffsets or AutoFocusFilter between iterations;
-                // keeping both false prevents HocusFocus's SetAutofocusFilter from switching
-                // the filter wheel away from the intended target during the AF run.
+                // Re-assert the flag before each filter's AF attempts. Nothing else in NINA or its
+                // plugins writes UseFilterWheelOffsets, so this should never be doing any work — but a
+                // filter-list re-import can replace the profile's FilterInfo objects mid-run, and
+                // re-asserting costs nothing next to an AutoFocus run.
+                //
+                // It used to clear AutoFocusFilter on every filter here as well, to stop HocusFocus's
+                // SetAutofocusFilter from switching the wheel away from the target. That was aimed at
+                // the wrong mechanism: SetAutofocusFilter returns immediately while this flag is false,
+                // and the wheel actually moved because of the previous run's teardown restoring its
+                // imaging filter — which is what WaitForHocusFocusCleanupAsync and the wrong-filter
+                // check in MeasureFilterFocusPositionAsync handle. Clearing it only served to destroy
+                // the user's AutoFocus filter selection on any run that never reached Accept.
                 profile.FocuserSettings.UseFilterWheelOffsets = false;
-                foreach (var f in profile.FilterWheelSettings.FilterWheelFilters)
-                    f.AutoFocusFilter = false;
 
                 int? position = await MeasureFilterFocusPositionAsync(filter, apiUrl, client, token);
                 if (position == null)
@@ -1112,54 +1102,80 @@ public class FilterOffsetController : WebApiController
     }
 
     /// <summary>
-    /// True when the calibration measured every filter the profile knows about.
+    /// Builds the offsets to write for every filter in the profile, stated relative to the filter
+    /// selected as the AutoFocus filter — that filter comes out at 0.
     ///
-    /// This is the condition under which the offsets must NOT be anchored on a previous value: with no
-    /// filter left on the old zero point, nothing in the profile depends on where the measured block
-    /// sits, so the base-relative set can be written as-is. Anchoring in that situation only carries
-    /// the old zero point forward forever — including a bogus one.
+    /// Only spacing matters (FilterWheelVM moves by the difference between two filters' offsets), so
+    /// zeroing the set is free: it changes every number on screen and no focuser move at all. Zeroing
+    /// on the AutoFocus filter is the reading that matches the equipment, since that is the filter
+    /// AutoFocus runs through and therefore the one the focuser is actually parked on when the offsets
+    /// are applied.
     ///
-    /// A profile with no filters, or a run that measured none, is not "full coverage": there is
-    /// nothing to conclude from an empty set, so anchoring stays in charge.
+    /// Filters that were not calibrated this run are carried across by their previous distance to the
+    /// base filter, which is still valid and is the only thing the run learned nothing about. Note this
+    /// only ever reads *differences* of previous offsets, never a previous offset on its own, so a
+    /// profile left holding absolute focuser positions by an older build comes out clean.
+    ///
+    /// <paramref name="measuredOffsets"/> is ComputeOffsets' output, stated relative to its first
+    /// entry — the base filter of the run.
     /// </summary>
-    internal static bool CoversEveryProfileFilter(
-        IReadOnlyCollection<int> calibratedPositions,
-        IReadOnlyCollection<int> profilePositions)
+    internal static List<(int Position, string Name, int FocusOffset)> BuildOffsetTable(
+        IEnumerable<FilterInfo> profileFilters,
+        IReadOnlyList<FilterOffsetEntry> measuredOffsets,
+        IReadOnlyList<FilterOffsetEntry> previousOffsets,
+        int? autoFocusFilterPosition)
     {
-        if (calibratedPositions == null || calibratedPositions.Count == 0) return false;
-        if (profilePositions == null || profilePositions.Count == 0) return false;
+        var table = new List<(int Position, string Name, int FocusOffset)>();
+        if (profileFilters == null || measuredOffsets == null || measuredOffsets.Count == 0) return table;
 
-        var calibrated = new HashSet<int>(calibratedPositions);
-        return profilePositions.All(calibrated.Contains);
-    }
+        var measured = new Dictionary<int, int>();
+        foreach (var o in measuredOffsets) measured[o.Position] = o.FocusOffset;
 
-    /// <summary>
-    /// Index of the calibrated filter the offsets get anchored on, for a partial calibration.
-    ///
-    /// Any measured filter is an equally valid anchor — the choice only decides which filter keeps the
-    /// number it already had. Prefer the one the user is selecting as the new AutoFocus filter, since
-    /// leaving that one untouched is the least surprising outcome, and fall back to the base filter
-    /// (index 0, the lowest-position filter of the run) whenever that selection was not part of this
-    /// calibration — including "None". Picking an uncalibrated filter as the AutoFocus filter stays
-    /// allowed; it just does not get to be the anchor.
-    ///
-    /// Returns -1 for an empty set, which callers must not reach: there is no set to anchor.
-    /// </summary>
-    internal static int ChooseAnchorIndex(IReadOnlyList<int> calibratedPositions, int? newDefaultFilterPosition)
-    {
-        if (calibratedPositions == null || calibratedPositions.Count == 0) return -1;
+        int basePosition = measuredOffsets[0].Position;
+        int baseMeasured = measuredOffsets[0].FocusOffset;
+        int basePrevious = previousOffsets?.FirstOrDefault(o => o.Position == basePosition)?.FocusOffset ?? 0;
 
-        if (newDefaultFilterPosition is int afPosition)
+        foreach (var f in profileFilters)
         {
-            for (int i = 0; i < calibratedPositions.Count; i++)
+            int position = (int)f.Position;
+            if (measured.TryGetValue(position, out int m))
             {
-                if (calibratedPositions[i] == afPosition) return i;
+                table.Add((position, f.Name, m));
+            }
+            else
+            {
+                // A run only zeroes the FocusOffset of the filters it calibrates, so an uncalibrated
+                // filter still holds the pre-run value that basePrevious was snapshotted alongside —
+                // the two are comparable, and their difference is this filter's distance to the base.
+                table.Add((position, f.Name, baseMeasured + (f.FocusOffset - basePrevious)));
             }
         }
 
-        return 0;
+        if (table.Count == 0) return table;
+
+        // "None" (and a selection the profile no longer has) falls back to the base filter, which keeps
+        // the result identical to what ComputeOffsets measured.
+        int referenceIndex = autoFocusFilterPosition is int afPosition
+            ? table.FindIndex(t => t.Position == afPosition)
+            : -1;
+        if (referenceIndex < 0) referenceIndex = table.FindIndex(t => t.Position == basePosition);
+        if (referenceIndex < 0) referenceIndex = 0;
+
+        int zero = table[referenceIndex].FocusOffset;
+        if (zero != 0)
+            table = table.Select(t => (t.Position, t.Name, t.FocusOffset - zero)).ToList();
+
+        return table;
     }
 
+    /// <summary>
+    /// Puts the profile back the way the run found it, for a cancel, a discard or a failure.
+    ///
+    /// A run only changes UseFilterWheelOffsets now, so that is the only line here that normally has
+    /// work to do. The offset and AutoFocus-filter restores are kept because they cost nothing and
+    /// still cover the case where something outside this controller changed them mid-run — a
+    /// filter-list re-import from the wheel being the realistic one.
+    /// </summary>
     private static void RestoreOldValues()
     {
         try
