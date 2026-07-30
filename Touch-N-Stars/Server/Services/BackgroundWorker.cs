@@ -47,7 +47,14 @@ internal static class BackgroundWorker {
             lastLine = logLines.Length;
 
             foreach (string line in newLines) {
-                if ((line.Contains("|ERROR|") || line.Contains("|WARNING|")) && line.Contains("|StartAutoFocus|")) {
+                // "|StartAutoFocus|" catches NINA's built-in AutoFocus, which logs its failures from
+                // that method. HocusFocus does not go through it — it fails in RunAutoFocus and then
+                // announces it from PerformPostAutoFocusActions — so match its message text as well,
+                // or a failed HocusFocus run looks exactly like a successful one to every consumer of
+                // DataContainer.afError. Matching the text rather than the method name keeps this
+                // working when line numbers move.
+                if ((line.Contains("|ERROR|") || line.Contains("|WARNING|")) &&
+                    (line.Contains("|StartAutoFocus|") || line.Contains("AutoFocus did not complete successfully"))) {
                     DataContainer.afRun = false;
                     DataContainer.afError = true;
 

@@ -4,6 +4,7 @@ using EmbedIO.WebApi;
 using NINA.Core.Model;
 using NINA.Core.Model.Equipment;
 using NINA.Core.Utility;
+using NINA.WPF.Base.Utility.AutoFocus;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -353,37 +354,49 @@ public class FilterOffsetController : WebApiController
                 // whole set by a constant never changes the spacing between the measured filters, which
                 // is all the focuser move between two calibrated filters depends on — but it does change
                 // how the measured block lines up with any filter that was left out of the calibration,
-                // since those still carry offsets on the old zero point. So always anchor the set on one
-                // measured filter's PREVIOUS offset: that filter's moves to and from the uncalibrated
-                // ones stay exactly as they were, and the recalibration only redistributes the rest.
+                // since those still carry offsets on the old zero point. So when the run was partial,
+                // anchor the set on one measured filter's PREVIOUS offset: that filter's moves to and
+                // from the uncalibrated ones stay exactly as they were, and the recalibration only
+                // redistributes the rest. See ChooseAnchorIndex for which filter gets picked.
                 //
-                // Any measured filter works as the anchor. Prefer the one the user is selecting as the
-                // new AutoFocus filter, since keeping that one where it was is the least surprising
-                // outcome, but fall back to the base filter whenever that selection is not part of
-                // this calibration — including "None". Picking an uncalibrated filter as the AutoFocus
-                // filter stays allowed; it just does not get to be the anchor.
+                // When the run covered every filter in the profile there is nothing left to stay
+                // compatible with, and anchoring is pure downside — it inherits whatever the profile
+                // happened to hold, including values written by older builds that stored absolute
+                // focuser positions in FocusOffset, and then re-inherits them on every recalibration.
+                // A full-wheel run therefore writes the clean base-relative set, which also repairs a
+                // profile that was poisoned that way.
                 var newOffsets = _result.NewOffsets
                     .Select(o => (o.Position, o.Name, o.FocusOffset))
                     .ToList();
 
                 if (newOffsets.Count > 0)
                 {
-                    int anchorIndex = payload?.NewDefaultFilterPosition is int afPosition
-                        ? newOffsets.FindIndex(o => o.Position == afPosition)
-                        : -1;
-                    if (anchorIndex < 0) anchorIndex = 0;
+                    var calibratedPositions = newOffsets.Select(o => o.Position).ToList();
+                    var profilePositions = profile.FilterWheelSettings.FilterWheelFilters
+                        .Select(f => (int)f.Position)
+                        .ToList();
 
-                    var (anchorPosition, _, measured) = newOffsets[anchorIndex];
-                    int anchor = _result.OldOffsets?.FirstOrDefault(o => o.Position == anchorPosition)?.FocusOffset ?? 0;
-                    if (measured != anchor)
+                    if (CoversEveryProfileFilter(calibratedPositions, profilePositions))
                     {
-                        newOffsets = newOffsets
-                            .Select(o => (o.Position, o.Name, o.FocusOffset - measured + anchor))
-                            .ToList();
+                        Logger.Info($"FilterOffset: calibration covered all {profilePositions.Count} filters in the " +
+                                    "profile — writing offsets relative to the base filter, without anchoring.");
                     }
+                    else
+                    {
+                        int anchorIndex = ChooseAnchorIndex(calibratedPositions, payload?.NewDefaultFilterPosition);
+                        var (anchorPosition, _, measured) = newOffsets[anchorIndex];
+                        int anchor = _result.OldOffsets?.FirstOrDefault(o => o.Position == anchorPosition)?.FocusOffset ?? 0;
+                        if (measured != anchor)
+                        {
+                            newOffsets = newOffsets
+                                .Select(o => (o.Position, o.Name, o.FocusOffset - measured + anchor))
+                                .ToList();
+                        }
 
-                    Logger.Info($"FilterOffset: anchoring offsets on filter position {anchorPosition} at its " +
-                                $"previous offset {anchor} (measured {measured})");
+                        Logger.Info($"FilterOffset: only {calibratedPositions.Count} of {profilePositions.Count} " +
+                                    "profile filters were calibrated — anchoring offsets on filter position " +
+                                    $"{anchorPosition} at its previous offset {anchor} (measured {measured})");
+                    }
                 }
 
                 // Write offsets to profile
@@ -476,10 +489,12 @@ public class FilterOffsetController : WebApiController
             f.FocusOffset = 0;
         }
 
-        // position → list of AF settled positions, one per loop
-        var calculatedPositions = new Dictionary<int, List<int>>();
+        // position → AF results for that filter, tagged with the zero-based loop they came from. A loop
+        // can be missing when its AutoFocus failed, so the loop number has to travel with the sample
+        // rather than being inferred from its index later.
+        var calculatedPositions = new Dictionary<int, List<(int Loop, int Position)>>();
         foreach (var f in selectedFilters)
-            calculatedPositions[(int)f.Position] = new List<int>();
+            calculatedPositions[(int)f.Position] = new List<(int Loop, int Position)>();
 
         var apiUrl = await CoreUtility.GetApiUrl();
         using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
@@ -508,10 +523,19 @@ public class FilterOffsetController : WebApiController
                 foreach (var f in profile.FilterWheelSettings.FilterWheelFilters)
                     f.AutoFocusFilter = false;
 
-                int position = await MeasureFilterFocusPositionAsync(filter, apiUrl, client, token);
-                Logger.Info($"FilterOffset: filter '{filter.Name}' settled at position {position}");
+                int? position = await MeasureFilterFocusPositionAsync(filter, apiUrl, client, token);
+                if (position == null)
+                {
+                    // Already logged with the reason by the measurement itself. Leaving the sample out
+                    // entirely is the point: recording a failed run's leftover focuser position is what
+                    // put a 200-step error into a filter's offset before this was detected at all.
+                    Logger.Info($"FilterOffset: no measurement for filter '{filter.Name}' in loop {_currentLoop}/{loops}");
+                    continue;
+                }
 
-                calculatedPositions[(int)filter.Position].Add(position);
+                Logger.Info($"FilterOffset: filter '{filter.Name}' settled at position {position.Value}");
+
+                calculatedPositions[(int)filter.Position].Add((loop - 1, position.Value));
             }
         }
 
@@ -561,44 +585,131 @@ public class FilterOffsetController : WebApiController
     // has actually finished. Re-asserting ChangeFilter before every trigger attempt (including retries),
     // and verifying the actually-mounted filter right after completion, are kept as defense in depth for
     // anything else (a manual AF from another client, etc.) that might still move the wheel mid-run.
-    private static async Task<int> MeasureFilterFocusPositionAsync(FilterInfo filter, string apiUrl, HttpClient client, CancellationToken token)
+    /// <summary>
+    /// Runs AF for one filter and returns the focus position it found, or null when no trustworthy
+    /// measurement could be taken after <c>maxAttempts</c> tries.
+    ///
+    /// A null is a dropped sample, not a failed calibration: one flaky filter must not throw away a
+    /// run that can take the better part of an hour. ComputeOffsets copes with a filter that has fewer
+    /// samples than the others, and with one that has none at all.
+    /// </summary>
+    private static async Task<int?> MeasureFilterFocusPositionAsync(FilterInfo filter, string apiUrl, HttpClient client, CancellationToken token)
     {
-        const int maxVerificationAttempts = 3;
+        // One retry, not more: every attempt is a full AutoFocus run — minutes of exposures — and a
+        // filter that fails twice in a row is not usually going to succeed on a third try. Dropping the
+        // sample and moving on costs less than keeping the user waiting.
+        const int maxAttempts = 2;
 
-        for (var verificationAttempt = 1; ; verificationAttempt++)
+        for (var attempt = 1; ; attempt++)
         {
             token.ThrowIfCancellationRequested();
+
+            // Snapshot before the run starts: HocusFocus only advances LastReport from its Completed
+            // handler, which does not fire for a failed run, so comparing the two is what tells a real
+            // measurement apart from a failure. Taken before StartAutofocusWithRetryAsync so a run that
+            // finishes unusually fast cannot slip in between.
+            bool reportReadable = TryGetHocusFocusLastReport(out var reportBeforeRun);
 
             await StartAutofocusWithRetryAsync(apiUrl, client, filter, token);
 
             // Wait until the AF file watcher (BackgroundWorker) signals completion
             await WaitForAutofocusAsync(token);
 
+            string failure = null;
+            int? position = null;
+
             if (DataContainer.afError)
-                throw new Exception($"AutoFocus failed for filter '{filter.Name}'");
+            {
+                failure = string.IsNullOrWhiteSpace(DataContainer.afErrorText)
+                    ? "AutoFocus reported an error"
+                    : DataContainer.afErrorText;
+            }
 
             // The just-completed run's own filter-restore cleanup hasn't fired yet at this point (it only
             // runs after the completion signal we just waited on), so the wheel still reflects whatever
             // filter the run actually measured through.
             var actualFilter = TouchNStars.Mediators.FilterWheel.GetInfo()?.SelectedFilter;
-            if (actualFilter != null && actualFilter.Position != filter.Position)
+            if (failure == null && actualFilter != null && actualFilter.Position != filter.Position)
+                failure = $"AutoFocus measured through filter '{actualFilter.Name}' instead (race with the previous run's cleanup)";
+
+            if (failure == null)
             {
-                if (verificationAttempt >= maxVerificationAttempts)
-                    throw new Exception($"FilterOffset: AutoFocus for filter '{filter.Name}' kept measuring through filter '{actualFilter.Name}' instead after {verificationAttempt} attempts");
+                if (reportReadable)
+                {
+                    // The report is the authoritative answer, and reading it removes a race that silently
+                    // corrupted results: the AF report file appears — which is what WaitForAutofocusAsync
+                    // waits on — a fraction of a second BEFORE PerformPostAutoFocusActions restores the
+                    // focuser, so asking the focuser where it is at this moment can return wherever a
+                    // failed blind search happened to stop. CalculatedFocusPoint is also the fitted
+                    // minimum rather than the position the focuser was quantised to, so it carries the
+                    // precision AF actually achieved.
+                    TryGetHocusFocusLastReport(out var reportAfterRun);
+                    double focus = reportAfterRun?.CalculatedFocusPoint?.Position ?? double.NaN;
 
-                Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' actually ran through filter '{actualFilter.Name}' (race with previous run's cleanup) — discarding result and re-measuring (attempt {verificationAttempt})");
-                await TouchNStars.Mediators.FilterWheel.ChangeFilter(filter, token);
-                continue;
+                    if (reportAfterRun == null || ReferenceEquals(reportAfterRun, reportBeforeRun))
+                        failure = "AutoFocus produced no new report — the run did not complete successfully";
+                    else if (double.IsNaN(focus) || double.IsInfinity(focus))
+                        // A fit that produced no finite minimum. Casting that to int yields 0 or
+                        // int.MinValue with no complaint, and a bogus 0 here would drag every other
+                        // filter's offset with it — the whole point of this method is to not do that.
+                        failure = $"AutoFocus reported a non-finite focus position ({focus})";
+                    else
+                        position = (int)Math.Round(focus, MidpointRounding.AwayFromZero);
+                }
+                else
+                {
+                    // No HocusFocus (or its shape changed): fall back to asking the focuser directly, as
+                    // before. NINA's built-in AutoFocus does not restore the position on failure, and its
+                    // failures are caught by the DataContainer.afError check above.
+                    position = await GetFocuserPositionAsync(apiUrl, client, token);
+                }
             }
-
-            int position = await GetFocuserPositionAsync(apiUrl, client, token);
 
             // Don't return — and so don't let the caller switch to the next filter — until HocusFocus has
             // actually finished tearing this run down (filter restored, guard released). This is what
-            // prevents the race from happening in the first place, rather than just detecting it above.
+            // prevents the filter race from happening in the first place, rather than just detecting it.
             await WaitForHocusFocusCleanupAsync(token);
 
-            return position;
+            if (failure == null) return position;
+
+            if (attempt >= maxAttempts)
+            {
+                Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' failed on all {attempt} attempt(s) " +
+                               $"({failure}) — recording no measurement for this loop and continuing with the " +
+                               "remaining filters.");
+                return null;
+            }
+
+            Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' did not produce a usable measurement " +
+                           $"({failure}) — re-measuring (attempt {attempt}/{maxAttempts})");
+            await TouchNStars.Mediators.FilterWheel.ChangeFilter(filter, token);
+        }
+    }
+
+    // Reads HocusFocus's last AutoFocus report (HocusFocusVM.Current.LastReport). It is assigned only in
+    // AutoFocusEngine_Completed, which fires on success only — a run that ends in "Too many failed points"
+    // leaves the previous report in place, which is what makes this usable as a success signal.
+    //
+    // Returns false when HocusFocus isn't loaded or the property can't be read, so callers can fall back
+    // rather than treat an unavailable report as a failed AutoFocus. A true with a null report is normal:
+    // no AF has completed since NINA started.
+    private static bool TryGetHocusFocusLastReport(out AutoFocusReport report)
+    {
+        report = null;
+        try
+        {
+            var hocusFocusVMType = Type.GetType("NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVM, NINA.Joko.Plugins.HocusFocus");
+            var currentVM = hocusFocusVMType?.GetProperty("Current", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var property = currentVM?.GetType().GetProperty("LastReport");
+            if (property == null) return false;
+
+            report = property.GetValue(currentVM) as AutoFocusReport;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"FilterOffset: could not read HocusFocus LastReport via reflection: {ex.Message}");
+            return false;
         }
     }
 
@@ -792,38 +903,65 @@ public class FilterOffsetController : WebApiController
     ///
     /// Note this can only reject numerically outlying samples. A loop that measured through the
     /// wrong filter still passes if that filter happens to be near-parfocal with the intended one.
+    /// It also needs at least 3 loops to reject anything at all; with 2 it keeps both samples and
+    /// reports the disagreement instead, since neither can be blamed for it.
     ///
-    /// Survivors keep their zero-based loop index, because dropping a loop from the middle of the
-    /// series leaves a gap that the temperature-drift estimate has to account for.
+    /// Samples arrive already tagged with the zero-based loop they came from, and survivors keep that
+    /// tag. The drift estimate needs the true loop number, not a position in the list: a loop can be
+    /// missing before this is ever called (an AutoFocus that failed twice records no sample) as well as
+    /// dropped here, and either way the survivors' spacing has to reflect the loops that sat between
+    /// them.
     ///
-    /// Rejections are reported through <paramref name="reportRejections"/> rather than straight to
-    /// Logger: touching NINA's Logger initialises it, which creates a log file and prunes the real
-    /// user log directory — not something a unit test of this arithmetic should do.
+    /// Rejections and low-confidence warnings are reported through <paramref name="reportRejections"/>
+    /// rather than straight to Logger: touching NINA's Logger initialises it, which creates a log file
+    /// and prunes the real user log directory — not something a unit test of this arithmetic should do.
     /// </summary>
     internal static List<(int Loop, int Position)> RejectOutliers(
         string filterName,
-        List<int> positions,
+        IReadOnlyList<(int Loop, int Position)> samples,
         double tolerance,
         Action<string> reportRejections = null)
     {
-        var all = positions.Select((p, i) => (Loop: i, Position: p)).ToList();
-        if (positions.Count < 3) return all;
+        var all = samples.ToList();
+        if (samples.Count < 3)
+        {
+            // Under three samples there is no median to defend: with two, the "median" is their mean,
+            // so one bad AutoFocus run pulls the result halfway towards itself at full weight, and
+            // nothing here can tell which of the two to blame. Rejection is inert rather than wrong,
+            // but the offset it produces is only as good as the worse sample — say so when the samples
+            // visibly disagree, because the result looks just as confident either way.
+            if (samples.Count == 2)
+            {
+                int spread = Math.Abs(samples[0].Position - samples[1].Position);
+                if (spread > tolerance)
+                {
+                    reportRejections?.Invoke(
+                        $"FilterOffset: the 2 measurements for filter '{filterName}' disagree by {spread} steps " +
+                        $"({samples[0].Position} vs {samples[1].Position}), more than the {tolerance:0.#} step " +
+                        "tolerance, and outlier rejection needs at least 3 loops to discard either one. The offset " +
+                        "for this filter is the midpoint of both and may be off by roughly half that spread — " +
+                        "re-run with 3 or more loops for a result that can reject a bad AutoFocus.");
+                }
+            }
 
-        var sorted = positions.Select(p => (double)p).OrderBy(p => p).ToList();
+            return all;
+        }
+
+        var sorted = samples.Select(s => (double)s.Position).OrderBy(p => p).ToList();
         double median = Median(sorted);
 
-        var deviations = positions.Select(p => Math.Abs(p - median)).OrderBy(d => d).ToList();
+        var deviations = samples.Select(s => Math.Abs(s.Position - median)).OrderBy(d => d).ToList();
         // 1.4826 rescales the MAD to be comparable to a standard deviation for normal data.
         double cutoff = Math.Max(tolerance, 3.0 * 1.4826 * Median(deviations));
 
         var accepted = new List<(int Loop, int Position)>();
         var rejected = new List<string>();
-        for (int i = 0; i < positions.Count; i++)
+        foreach (var (loop, position) in samples)
         {
-            if (Math.Abs(positions[i] - median) > cutoff)
-                rejected.Add($"loop {i + 1}: {positions[i]} ({positions[i] - median:+0.#;-0.#;0} from median)");
+            if (Math.Abs(position - median) > cutoff)
+                rejected.Add($"loop {loop + 1}: {position} ({position - median:+0.#;-0.#;0} from median)");
             else
-                accepted.Add((i, positions[i]));
+                accepted.Add((loop, position));
         }
 
         if (rejected.Count > 0)
@@ -894,7 +1032,7 @@ public class FilterOffsetController : WebApiController
     /// </summary>
     private static List<(int Position, string Name, int FocusOffset)> ComputeOffsets(
         List<FilterInfo> selectedFilters,
-        Dictionary<int, List<int>> calculatedPositions,
+        Dictionary<int, List<(int Loop, int Position)>> calculatedPositions,
         NINA.Profile.Interfaces.IProfile profile)
     {
         double tolerance = OutlierToleranceSteps(profile);
@@ -971,6 +1109,55 @@ public class FilterOffsetController : WebApiController
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// True when the calibration measured every filter the profile knows about.
+    ///
+    /// This is the condition under which the offsets must NOT be anchored on a previous value: with no
+    /// filter left on the old zero point, nothing in the profile depends on where the measured block
+    /// sits, so the base-relative set can be written as-is. Anchoring in that situation only carries
+    /// the old zero point forward forever — including a bogus one.
+    ///
+    /// A profile with no filters, or a run that measured none, is not "full coverage": there is
+    /// nothing to conclude from an empty set, so anchoring stays in charge.
+    /// </summary>
+    internal static bool CoversEveryProfileFilter(
+        IReadOnlyCollection<int> calibratedPositions,
+        IReadOnlyCollection<int> profilePositions)
+    {
+        if (calibratedPositions == null || calibratedPositions.Count == 0) return false;
+        if (profilePositions == null || profilePositions.Count == 0) return false;
+
+        var calibrated = new HashSet<int>(calibratedPositions);
+        return profilePositions.All(calibrated.Contains);
+    }
+
+    /// <summary>
+    /// Index of the calibrated filter the offsets get anchored on, for a partial calibration.
+    ///
+    /// Any measured filter is an equally valid anchor — the choice only decides which filter keeps the
+    /// number it already had. Prefer the one the user is selecting as the new AutoFocus filter, since
+    /// leaving that one untouched is the least surprising outcome, and fall back to the base filter
+    /// (index 0, the lowest-position filter of the run) whenever that selection was not part of this
+    /// calibration — including "None". Picking an uncalibrated filter as the AutoFocus filter stays
+    /// allowed; it just does not get to be the anchor.
+    ///
+    /// Returns -1 for an empty set, which callers must not reach: there is no set to anchor.
+    /// </summary>
+    internal static int ChooseAnchorIndex(IReadOnlyList<int> calibratedPositions, int? newDefaultFilterPosition)
+    {
+        if (calibratedPositions == null || calibratedPositions.Count == 0) return -1;
+
+        if (newDefaultFilterPosition is int afPosition)
+        {
+            for (int i = 0; i < calibratedPositions.Count; i++)
+            {
+                if (calibratedPositions[i] == afPosition) return i;
+            }
+        }
+
+        return 0;
     }
 
     private static void RestoreOldValues()
