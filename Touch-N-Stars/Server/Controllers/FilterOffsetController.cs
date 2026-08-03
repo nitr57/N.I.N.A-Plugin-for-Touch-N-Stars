@@ -26,7 +26,8 @@ namespace TouchNStars.Server.Controllers;
 /// 
 /// Workflow:
 ///   POST /api/filter-offset/start   → starts background calculation
-///   GET  /api/filter-offset/status  → poll for progress
+///   GET  /api/filter-offset/status  → poll for progress, incl. the outcome of every filter × loop of
+///                                     the current run (the measurement board)
 ///   GET  /api/filter-offset/stop    → cancel
 ///   GET  /api/filter-offset/filters → list profile filters
 ///   GET  /api/filter-offset/result  → fetch pending old/new offsets (state == PendingResult)
@@ -52,6 +53,15 @@ public class FilterOffsetController : WebApiController
     private static int _totalFilters;
     private static string _currentFilterName = "";
     private static string _errorMessage = "";
+
+    // Every AutoFocus attempt of the current run, one entry per filter per loop, in the order they
+    // were measured. Written by the background calculation and read by /status while it is still
+    // running, so it gets its own lock rather than _stateLock: the state-machine lock is held across
+    // profile writes in /apply, and a status poll — the thing driving the live board — must not wait
+    // on those. The state-machine paths take _measurementsLock while holding _stateLock, never the
+    // other way round, so the nesting stays one-directional.
+    private static readonly object _measurementsLock = new object();
+    private static List<FilterOffsetMeasurement> _measurements = new();
 
     // Saved values for discard
     private static bool _oldUseOffsets;
@@ -194,6 +204,11 @@ public class FilterOffsetController : WebApiController
             _cts = new CancellationTokenSource();
             token = _cts.Token;
 
+            // Before the state flip, not after: a status poll reads the state first and the board
+            // second (see GetStatus), so dropping the previous run's board afterwards is exactly the
+            // order that lets a poll pair the new run's "Running" with the old run's measurements.
+            ClearMeasurements();
+
             _state = "Running";
             _currentLoop = 0;
             _totalLoops = payload.Loops;
@@ -218,6 +233,11 @@ public class FilterOffsetController : WebApiController
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
                 Logger.Info("FilterOffset: calculation cancelled");
+                // Dropped before the state flip, like every other transition: a poll reads state then
+                // board, so this order can only ever pair a state with a board at least as new. No
+                // result to read the board against here anyway — the per-loop positions taken so far
+                // are in the NINA log.
+                ClearMeasurements();
                 lock (_stateLock)
                 {
                     RestoreOldValues();
@@ -235,6 +255,9 @@ public class FilterOffsetController : WebApiController
                     _state = "Error";
                     _errorMessage = ex.Message;
                 }
+                // The board is deliberately kept here, unlike on cancel: a run that died on loop 5 of
+                // 6 is exactly when the measurements taken so far are worth looking at, and the error
+                // screen shows them alongside the reason. The next start clears them.
             }
         });
 
@@ -245,6 +268,22 @@ public class FilterOffsetController : WebApiController
     [Route(HttpVerbs.Get, "/filter-offset/status")]
     public ApiResponse GetStatus()
     {
+        // State first, board second, and never the other way round. Every writer does the mirror
+        // image — the board is published or dropped before the state that describes it, in all of
+        // start, apply, discard, cancel and the flip to PendingResult — so reading in this order can
+        // only pair a state with a board at least as new as itself. Reverse either side and a
+        // "PendingResult" can arrive next to an unmarked board, or a "Running" next to the previous
+        // run's measurements.
+        var state = _state;
+
+        // Copy the list so serialisation can't run over it while the background run appends. The
+        // entries themselves are shared, so a poll that lands exactly while outlier rejection is
+        // marking them can show a half-marked board — self-correcting on the next poll, two seconds
+        // later, and the alternative is holding this lock across serialisation.
+        List<FilterOffsetMeasurement> measurements;
+        lock (_measurementsLock)
+            measurements = new List<FilterOffsetMeasurement>(_measurements);
+
         return new ApiResponse
         {
             Success = true,
@@ -252,13 +291,14 @@ public class FilterOffsetController : WebApiController
             Type = "Success",
             Response = new
             {
-                State = _state,
+                State = state,
                 CurrentLoop = _currentLoop,
                 TotalLoops = _totalLoops,
                 CurrentFilterIndex = _currentFilterIndex,
                 TotalFilters = _totalFilters,
                 CurrentFilterName = _currentFilterName,
                 Error = _errorMessage,
+                Measurements = measurements,
             }
         };
     }
@@ -393,6 +433,10 @@ public class FilterOffsetController : WebApiController
                 // profile is authoritative either way, and ProfileService's save timer retries.
                 profile.Save();
 
+                // The board belongs to the run, and the run is over — drop it rather than keep
+                // shipping it with every Idle status poll. Before the state flip, as everywhere else.
+                ClearMeasurements();
+
                 _result = null;
                 _state = "Idle";
 
@@ -430,6 +474,7 @@ public class FilterOffsetController : WebApiController
                 }
 
                 RestoreOldValues();
+                ClearMeasurements();
                 _result = null;
                 _state = "Idle";
                 return new ApiResponse { Success = true, Response = "Discarded; old values restored", StatusCode = 200, Type = "Success" };
@@ -441,6 +486,39 @@ public class FilterOffsetController : WebApiController
             HttpContext.Response.StatusCode = 500;
             return new ApiResponse { Success = false, Error = ex.Message, StatusCode = 500, Type = "Error" };
         }
+    }
+
+    // ── Measurement board ─────────────────────────────────────────────────────
+
+    private static void AddMeasurement(FilterOffsetMeasurement measurement)
+    {
+        lock (_measurementsLock)
+            _measurements.Add(measurement);
+    }
+
+    /// <summary>
+    /// Flags the samples outlier rejection threw away, so the board can show them struck through
+    /// instead of silently dropping them from a column that still has a number in every other row.
+    /// <paramref name="acceptedLoops"/> holds the zero-based loop tags that survived; the board's own
+    /// loop numbers are one-based.
+    /// </summary>
+    private static void MarkRejectedMeasurements(int position, IEnumerable<int> acceptedLoops)
+    {
+        var kept = new HashSet<int>(acceptedLoops);
+        lock (_measurementsLock)
+        {
+            foreach (var m in _measurements)
+            {
+                if (m.Position != position || m.FocusPosition == null) continue;
+                m.Rejected = !kept.Contains(m.Loop - 1);
+            }
+        }
+    }
+
+    private static void ClearMeasurements()
+    {
+        lock (_measurementsLock)
+            _measurements = new List<FilterOffsetMeasurement>();
     }
 
     // ── Calculation ───────────────────────────────────────────────────────────
@@ -513,7 +591,47 @@ public class FilterOffsetController : WebApiController
                 // the user's AutoFocus filter selection on any run that never reached Accept.
                 profile.FocuserSettings.UseFilterWheelOffsets = false;
 
-                int? position = await MeasureFilterFocusPositionAsync(filter, apiUrl, client, token);
+                int? position;
+                string failure;
+                int attempts;
+                string firstFailure;
+                try
+                {
+                    (position, failure, attempts, firstFailure) =
+                        await MeasureFilterFocusPositionAsync(filter, apiUrl, client, token);
+                }
+                catch (Exception ex) when (!(ex is OperationCanceledException && token.IsCancellationRequested))
+                {
+                    // A measurement can also end by throwing — AutoFocus never started, it never
+                    // finished, the focuser position could not be read. That aborts the whole run, and
+                    // the cell that killed it has to say so: without this it stays blank and reads as
+                    // "not measured yet" on the error screen, next to loops that genuinely were not
+                    // reached. Recorded, then rethrown so the run still fails.
+                    AddMeasurement(new FilterOffsetMeasurement
+                    {
+                        Position = (int)filter.Position,
+                        Name = filter.Name,
+                        Loop = loop,
+                        FocusPosition = null,
+                        Failure = ex.Message,
+                    });
+                    throw;
+                }
+
+                // Recorded either way, and before the continue below: the board's whole point is that a
+                // loop which produced nothing is visible as such, with the reason, instead of leaving a
+                // gap the user has to go to the NINA log to explain.
+                AddMeasurement(new FilterOffsetMeasurement
+                {
+                    Position = (int)filter.Position,
+                    Name = filter.Name,
+                    Loop = loop,
+                    FocusPosition = position,
+                    Failure = failure,
+                    Attempts = attempts,
+                    FirstFailure = firstFailure,
+                });
+
                 if (position == null)
                 {
                     // Already logged with the reason by the measurement itself. Leaving the sample out
@@ -530,7 +648,8 @@ public class FilterOffsetController : WebApiController
         }
 
         // 4. Compute new offsets using the same algorithm as FilterOffsetCalculator.Execute()
-        var newOffsets = ComputeOffsets(selectedFilters, calculatedPositions, profile);
+        var newOffsets = ComputeOffsets(selectedFilters, calculatedPositions, profile,
+            out var details, out var temperatureDrift, out var baseFilterUnmeasured);
 
         // 5. Store result and move to PendingResult state. This is the only transition INTO the state
         // the HTTP handlers wait on, so it publishes under the same lock they read under — otherwise
@@ -552,6 +671,9 @@ public class FilterOffsetController : WebApiController
                     .ToList(),
                 OldDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
                 SuggestedDefaultFilterPosition = _oldDefaultFilterPosition.HasValue ? (int?)_oldDefaultFilterPosition.Value : null,
+                Details = details,
+                TemperatureDrift = temperatureDrift,
+                BaseFilterUnmeasured = baseFilterUnmeasured,
             };
 
             _state = "PendingResult";
@@ -576,19 +698,28 @@ public class FilterOffsetController : WebApiController
     // and verifying the actually-mounted filter right after completion, are kept as defense in depth for
     // anything else (a manual AF from another client, etc.) that might still move the wheel mid-run.
     /// <summary>
-    /// Runs AF for one filter and returns the focus position it found, or null when no trustworthy
-    /// measurement could be taken after <c>maxAttempts</c> tries.
+    /// Runs AF for one filter and returns the focus position it found, or a null position with the
+    /// reason when no trustworthy measurement could be taken after <c>maxAttempts</c> tries.
     ///
-    /// A null is a dropped sample, not a failed calibration: one flaky filter must not throw away a
-    /// run that can take the better part of an hour. ComputeOffsets copes with a filter that has fewer
-    /// samples than the others, and with one that has none at all.
+    /// A null position is a dropped sample, not a failed calibration: one flaky filter must not throw
+    /// away a run that can take the better part of an hour. ComputeOffsets copes with a filter that has
+    /// fewer samples than the others, and with one that has none at all. The reason travels back with
+    /// it so the board can say why a cell is empty; it is the last attempt's failure.
+    ///
+    /// The attempt count and the first attempt's failure travel back too, so a measurement the retry
+    /// rescued can be shown as what it was rather than as a clean first-try result.
     /// </summary>
-    private static async Task<int?> MeasureFilterFocusPositionAsync(FilterInfo filter, string apiUrl, HttpClient client, CancellationToken token)
+    private static async Task<(int? Position, string Failure, int Attempts, string FirstFailure)> MeasureFilterFocusPositionAsync(FilterInfo filter, string apiUrl, HttpClient client, CancellationToken token)
     {
         // One retry, not more: every attempt is a full AutoFocus run — minutes of exposures — and a
         // filter that fails twice in a row is not usually going to succeed on a third try. Dropping the
         // sample and moving on costs less than keeping the user waiting.
         const int maxAttempts = 2;
+
+        // Kept so a cell the retry rescued does not look like a first-try success. Without it, the run
+        // that took twice as long is indistinguishable on the board from the one that went smoothly,
+        // which is exactly the question the board is there to answer.
+        string firstFailure = null;
 
         for (var attempt = 1; ; attempt++)
         {
@@ -660,15 +791,17 @@ public class FilterOffsetController : WebApiController
             // prevents the filter race from happening in the first place, rather than just detecting it.
             await WaitForHocusFocusCleanupAsync(token);
 
-            if (failure == null) return position;
+            if (failure == null) return (position, null, attempt, firstFailure);
 
             if (attempt >= maxAttempts)
             {
                 Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' failed on all {attempt} attempt(s) " +
                                $"({failure}) — recording no measurement for this loop and continuing with the " +
                                "remaining filters.");
-                return null;
+                return (null, failure, attempt, firstFailure);
             }
+
+            firstFailure ??= failure;
 
             Logger.Warning($"FilterOffset: AutoFocus for filter '{filter.Name}' did not produce a usable measurement " +
                            $"({failure}) — re-measuring (attempt {attempt}/{maxAttempts})");
@@ -902,6 +1035,10 @@ public class FilterOffsetController : WebApiController
     /// dropped here, and either way the survivors' spacing has to reflect the loops that sat between
     /// them.
     ///
+    /// <paramref name="cutoffUsed"/> returns the distance from the median a sample had to exceed to be
+    /// discarded — the MAD-derived value, which is usually well above <paramref name="tolerance"/>.
+    /// Null when there were too few samples for rejection to be possible at all.
+    ///
     /// Rejections and low-confidence warnings are reported through <paramref name="reportRejections"/>
     /// rather than straight to Logger: touching NINA's Logger initialises it, which creates a log file
     /// and prunes the real user log directory — not something a unit test of this arithmetic should do.
@@ -910,9 +1047,12 @@ public class FilterOffsetController : WebApiController
         string filterName,
         IReadOnlyList<(int Loop, int Position)> samples,
         double tolerance,
+        out double? cutoffUsed,
         Action<string> reportRejections = null)
     {
         var all = samples.ToList();
+        cutoffUsed = null;
+
         if (samples.Count < 3)
         {
             // Under three samples there is no median to defend: with two, the "median" is their mean,
@@ -941,8 +1081,11 @@ public class FilterOffsetController : WebApiController
         double median = Median(sorted);
 
         var deviations = samples.Select(s => Math.Abs(s.Position - median)).OrderBy(d => d).ToList();
-        // 1.4826 rescales the MAD to be comparable to a standard deviation for normal data.
+        // 1.4826 rescales the MAD to be comparable to a standard deviation for normal data. The MAD
+        // term routinely dominates the tolerance floor, so this — not the floor — is the distance a
+        // sample actually had to exceed to be discarded, and it is what the caller reports.
         double cutoff = Math.Max(tolerance, 3.0 * 1.4826 * Median(deviations));
+        cutoffUsed = cutoff;
 
         var accepted = new List<(int Loop, int Position)>();
         var rejected = new List<string>();
@@ -1019,25 +1162,40 @@ public class FilterOffsetController : WebApiController
     ///    one, compared against the existing offsets in OldOffsets, and pushed to hardware verbatim
     ///    by some wheels (e.g. OasisFilterWheel.StoreFocusOffsets). The apply step can still
     ///    re-reference these onto whichever filter the user picks as the new AutoFocus filter.
+    ///
+    /// <paramref name="details"/> receives the per-filter working: how many loops produced a usable
+    /// measurement (failed AutoFocus runs are not counted — they never reach
+    /// <paramref name="calculatedPositions"/>), how many of those survived rejection, the median they
+    /// were rejected against, the spread of the survivors, and the drift-corrected position the offset
+    /// was derived from. It is what turns the board from a grid of numbers into something that
+    /// explains the offset above it.
     /// </summary>
     private static List<(int Position, string Name, int FocusOffset)> ComputeOffsets(
         List<FilterInfo> selectedFilters,
         Dictionary<int, List<(int Loop, int Position)>> calculatedPositions,
-        NINA.Profile.Interfaces.IProfile profile)
+        NINA.Profile.Interfaces.IProfile profile,
+        out List<FilterOffsetDetail> details,
+        out double temperatureDrift,
+        out bool baseFilterUnmeasured)
     {
+        baseFilterUnmeasured = false;
+
         double tolerance = OutlierToleranceSteps(profile);
 
         // Outlier-filtered samples per filter position, each tagged with the loop it came from.
         var accepted = new Dictionary<int, List<(int Loop, int Position)>>();
+        var cutoffs = new Dictionary<int, double?>();
         foreach (var f in selectedFilters)
         {
             int pos = (int)f.Position;
-            accepted[pos] = RejectOutliers(f.Name, calculatedPositions[pos], tolerance, msg => Logger.Warning(msg));
+            accepted[pos] = RejectOutliers(f.Name, calculatedPositions[pos], tolerance, out var cutoff, msg => Logger.Warning(msg));
+            cutoffs[pos] = cutoff;
+            MarkRejectedMeasurements(pos, accepted[pos].Select(s => s.Loop));
         }
 
         // Temperature drift is estimated from the first (base) filter, across surviving samples only
         // so a rejected loop can't masquerade as thermal movement.
-        double temperatureDrift = selectedFilters.Count > 0
+        temperatureDrift = selectedFilters.Count > 0
             ? EstimatePerLoopDrift(accepted[(int)selectedFilters[0].Position])
             : 0.0;
 
@@ -1058,6 +1216,9 @@ public class FilterOffsetController : WebApiController
         var absolutePositions = new List<(int Position, string Name, double? Focus)>();
         double totalRatio = 0.0;
 
+        details = new List<FilterOffsetDetail>();
+        var detailByPosition = new Dictionary<int, FilterOffsetDetail>();
+
         foreach (var filter in selectedFilters)
         {
             var pf = profile.FilterWheelSettings.FilterWheelFilters.FirstOrDefault(x => x.Position == filter.Position);
@@ -1070,6 +1231,32 @@ public class FilterOffsetController : WebApiController
                 ? EstimateFocusAtRunStart(positions, temperatureDrift, totalRatio)
                 : null;
 
+            var taken = calculatedPositions[(int)filter.Position];
+            var detail = new FilterOffsetDetail
+            {
+                Position = (int)filter.Position,
+                Name = filter.Name,
+                SamplesTaken = taken.Count,
+                SamplesUsed = positions.Count,
+                // Over all samples, including the rejected ones — it is the value they were rejected
+                // against, so the board can state a discarded cell's deviation from it.
+                Median = taken.Count > 0
+                    ? (double?)Median(taken.Select(s => (double)s.Position).OrderBy(p => p).ToList())
+                    : null,
+                // Of the surviving samples only, unlike the median: this is the disagreement the
+                // offset actually carries, and a rejected sample is by definition not in it.
+                Spread = positions.Count > 1
+                    ? (int?)(positions.Max(s => s.Position) - positions.Min(s => s.Position))
+                    : null,
+                // The distance a sample had to exceed to be discarded. Usually set by this filter's own
+                // scatter, falling back to the profile-wide floor when that scatter is tiny. Null when
+                // there were too few samples to reject any.
+                Cutoff = cutoffs[(int)filter.Position],
+                EstimatedFocus = focus,
+            };
+            details.Add(detail);
+            detailByPosition[(int)filter.Position] = detail;
+
             absolutePositions.Add(((int)filter.Position, filter.Name, focus));
             totalRatio += filterTime / totalTime;
         }
@@ -1078,6 +1265,10 @@ public class FilterOffsetController : WebApiController
         double? baseFocus = absolutePositions.Count > 0 ? absolutePositions[0].Focus : null;
         if (baseFocus == null)
         {
+            // Every detail's FocusOffset is still 0, which is exactly what is being reported here.
+            // Flagged so the result says so on screen: a table of zeros next to filters that plainly
+            // did measure something otherwise reads as a real, if surprising, calibration.
+            baseFilterUnmeasured = true;
             Logger.Warning("FilterOffset: base filter has no usable measurement — reporting all offsets as 0.");
             return absolutePositions.Select(p => (p.Position, p.Name, 0)).ToList();
         }
@@ -1094,6 +1285,9 @@ public class FilterOffsetController : WebApiController
 
             if (!Focus.HasValue)
                 Logger.Warning($"FilterOffset: no usable measurement for filter '{Name}' — offset set to 0.");
+
+            if (detailByPosition.TryGetValue(Position, out var detail))
+                detail.FocusOffset = focusOffset;
 
             result.Add((Position, Name, focusOffset));
         }
@@ -1225,10 +1419,87 @@ public class FilterOffsetEntry
     public int FocusOffset { get; set; }
 }
 
+/// <summary>
+/// What one filter × loop produced. <see cref="FocusPosition"/> is null when the loop produced no
+/// usable measurement, in which case <see cref="Failure"/> says why.
+///
+/// One entry covers the loop's AutoFocus attempts, not a single run: a loop that failed once and
+/// succeeded on the retry is one entry, with the position it settled on, <see cref="Attempts"/> at 2
+/// and the discarded attempt's reason in <see cref="FirstFailure"/>.
+/// </summary>
+public class FilterOffsetMeasurement
+{
+    public int Position { get; set; }
+    public string Name { get; set; }
+
+    /// <summary>One-based, matching the loop counter the run reports.</summary>
+    public int Loop { get; set; }
+
+    public int? FocusPosition { get; set; }
+
+    /// <summary>Why this loop produced nothing. Null when it produced a position.</summary>
+    public string Failure { get; set; }
+
+    /// <summary>
+    /// AutoFocus runs this loop cost. 0 when the attempt threw and took the whole calibration with it.
+    /// </summary>
+    public int Attempts { get; set; }
+
+    /// <summary>
+    /// The first attempt's failure when a later one succeeded — the cost the retry hid. Null when the
+    /// loop needed only one attempt, or when it failed outright (<see cref="Failure"/> covers that).
+    /// </summary>
+    public string FirstFailure { get; set; }
+
+    /// <summary>
+    /// A measurement that was taken but left out of the offset. Set when outlier rejection runs, which
+    /// is just before the result is published — so it is false for the whole run and, briefly, in the
+    /// window between rejection and the flip to PendingResult. A client that has no aggregation to go
+    /// with the board should not explain a rejection it cannot yet quantify.
+    /// </summary>
+    public bool Rejected { get; set; }
+}
+
+/// <summary>Per-filter working behind one offset, for the measurement board.</summary>
+public class FilterOffsetDetail
+{
+    public int Position { get; set; }
+    public string Name { get; set; }
+    /// <summary>Loops that produced a usable measurement; a failed AutoFocus is not one.</summary>
+    public int SamplesTaken { get; set; }
+
+    /// <summary>Of those, the ones outlier rejection kept.</summary>
+    public int SamplesUsed { get; set; }
+    public double? Median { get; set; }
+    public int? Spread { get; set; }
+
+    /// <summary>
+    /// Steps from the median a sample had to exceed to be rejected: the greater of the profile-wide
+    /// tolerance floor and a term scaled from this filter's own scatter. The scatter term usually
+    /// wins, which is what makes this per filter rather than one number for the run. Null when there
+    /// were fewer than the three samples rejection needs.
+    /// </summary>
+    public double? Cutoff { get; set; }
+
+    public double? EstimatedFocus { get; set; }
+    public int FocusOffset { get; set; }
+}
+
 public class FilterOffsetResult
 {
     public List<FilterOffsetEntry> OldOffsets { get; set; }
     public List<FilterOffsetEntry> NewOffsets { get; set; }
     public int? OldDefaultFilterPosition { get; set; }
     public int? SuggestedDefaultFilterPosition { get; set; }
+
+    public List<FilterOffsetDetail> Details { get; set; }
+
+    /// <summary>Focuser steps per loop, positive when the focus position moved down over the run.</summary>
+    public double TemperatureDrift { get; set; }
+
+    /// <summary>
+    /// The run's base filter produced no usable measurement, so there was nothing to state the other
+    /// filters against and every offset is reported as 0. The result is not usable.
+    /// </summary>
+    public bool BaseFilterUnmeasured { get; set; }
 }
