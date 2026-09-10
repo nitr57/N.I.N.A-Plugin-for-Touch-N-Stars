@@ -92,6 +92,7 @@ public class TilterService
         public double SensorRotation { get; set; } // in degrees
         public double TilterOuterRadius { get; set; } // in mm
         public double TilterThreadPitch { get; set; } // in mm
+        public int TilterScrewCount { get; set; }     // 3 or 4 (manual tilters; ETA hardware is always 3)
     }
 
     public class ApplyTiltPlaneDTO
@@ -102,6 +103,7 @@ public class TilterService
         public double ImagePlaneBottomRightZ { get; set; }  // Desired Z at bottom-right corner
         public double OuterRadius { get; set; }             // Outer radius of tilter screws (default 78mm for Wanderer ETA)
         public bool DontOffsetToZero { get; set; }          // For manual tilters: don't shift positions to avoid negatives
+        public int ScrewCount { get; set; }                 // 3 (equilateral, ETA) or 4 (one screw per sensor corner)
     }
 
     public class ApplyTiltPlaneResultDTO
@@ -110,9 +112,12 @@ public class TilterService
         public float Position1 { get; set; }
         public float Position2 { get; set; }
         public float Position3 { get; set; }
+        public float? Position4 { get; set; }     // Only populated for 4-screw tilters
         public float? RawPosition1 { get; set; }  // Raw calculated value before offsetting (for manual tilters)
         public float? RawPosition2 { get; set; }  // Raw calculated value before offsetting (for manual tilters)
         public float? RawPosition3 { get; set; }  // Raw calculated value before offsetting (for manual tilters)
+        public float? RawPosition4 { get; set; }  // Raw calculated value before offsetting (4-screw manual tilters)
+        public int ScrewCount { get; set; }       // Number of screws the positions above describe
         public string Message { get; set; }
     }
 
@@ -659,7 +664,8 @@ public class TilterService
             SensorHeight = Settings.Default.SensorHeight,
             SensorRotation = Settings.Default.SensorRotation,
             TilterOuterRadius = Settings.Default.TilterOuterRadius,
-            TilterThreadPitch = Settings.Default.TilterThreadPitch
+            TilterThreadPitch = Settings.Default.TilterThreadPitch,
+            TilterScrewCount = NormalizeScrewCount(Settings.Default.TilterScrewCount)
         };
     }
 
@@ -676,8 +682,9 @@ public class TilterService
             Settings.Default.SensorRotation = Math.Clamp(config.SensorRotation, 0, 359.9);
             Settings.Default.TilterOuterRadius = config.TilterOuterRadius;
             Settings.Default.TilterThreadPitch = config.TilterThreadPitch;
+            Settings.Default.TilterScrewCount = NormalizeScrewCount(config.TilterScrewCount);
             CoreUtil.SaveSettings(Settings.Default);
-            Logger.Info($"TilterService: Sensor configuration updated - Width: {config.SensorWidth}mm, Height: {config.SensorHeight}mm, Rotation: {Settings.Default.SensorRotation}°, OuterRadius: {config.TilterOuterRadius}mm, ThreadPitch: {config.TilterThreadPitch}mm");
+            Logger.Info($"TilterService: Sensor configuration updated - Width: {config.SensorWidth}mm, Height: {config.SensorHeight}mm, Rotation: {Settings.Default.SensorRotation}°, OuterRadius: {config.TilterOuterRadius}mm, ThreadPitch: {config.TilterThreadPitch}mm, ScrewCount: {Settings.Default.TilterScrewCount}");
         }
         catch (Exception ex)
         {
@@ -708,10 +715,11 @@ public class TilterService
     }
 
     /// <summary>
-    /// Computes required actuator positions (P1, P2, P3) to achieve a specific tilt plane
-    /// defined by Z values at the four image sensor corners (inverse calculation)
+    /// Computes required actuator positions (P1..P3 for a 3-screw tilter, P1..P4 for a 4-screw one)
+    /// to achieve a specific tilt plane defined by Z values at the four image sensor corners
+    /// (inverse calculation)
     /// </summary>
-    public ApplyTiltPlaneResultDTO CalculateActuatorPositions(ApplyTiltPlaneDTO desiredPlane, double currentP1 = 0, double currentP2 = 0, double currentP3 = 0, bool dontOffsetToZero = false)
+    public ApplyTiltPlaneResultDTO CalculateActuatorPositions(ApplyTiltPlaneDTO desiredPlane, double currentP1 = 0, double currentP2 = 0, double currentP3 = 0, bool dontOffsetToZero = false, bool shiftToNonNegative = true)
     {
         try
         {
@@ -801,69 +809,93 @@ public class TilterService
 
             Logger.Info($"[CalculateActuatorPositions] Fitted plane: Z = {A:F6}*X + {B:F6}*Y + {C:F6}");
 
-            // WandererETA geometry constants
-            double outerRadius = desiredPlane.OuterRadius;  // Use outer radius from DTO
-            double innerRadius = outerRadius / 2.0;  // For equilateral triangle, inner_radius ≈ outer_radius/2
-            double a = Math.Sqrt(outerRadius * outerRadius - innerRadius * innerRadius);
+            // Tilter screw geometry. 3-screw plates (Wanderer ETA) use an equilateral layout;
+            // 4-screw plates carry one screw diagonally under each sensor corner.
+            int screwCount = NormalizeScrewCount(desiredPlane.ScrewCount);
+            double[][] screws = GetScrewPositions(screwCount, desiredPlane.OuterRadius);
 
-            // Calculate the correction deltas needed at the three actuator locations.
-            // The plane equation evaluated at each actuator's XY position gives the Z-correction
-            // (in mm) that needs to be applied to achieve the desired image plane tilt.
-            // P1 = (-a, innerRadius), P2 = (0, -outerRadius), P3 = (a, innerRadius)
-            double delta1 = A * (-a) + B * innerRadius + C;
-            double delta2 = A * 0 + B * (-outerRadius) + C;
-            double delta3 = A * a + B * innerRadius + C;
+            // Calculate the correction deltas needed at the screw locations.
+            // The plane equation evaluated at each screw's XY position gives the Z-correction
+            // (in mm) that needs to be applied there to achieve the desired image plane tilt.
+            // Evaluating one and the same fitted plane keeps the deltas exactly coplanar, so a
+            // 4-screw plate stays self-consistent despite being geometrically over-determined.
+            double[] deltas = new double[screwCount];
+            for (int i = 0; i < screwCount; i++)
+            {
+                deltas[i] = A * screws[i][0] + B * screws[i][1] + C;
+            }
 
-            Logger.Info($"[CalculateActuatorPositions] Correction deltas (mm) - P1: {delta1:F6}, P2: {delta2:F6}, P3: {delta3:F6}");
+            Logger.Info($"[CalculateActuatorPositions] Correction deltas (mm) - {string.Join(", ", deltas.Select((d, i) => $"P{i + 1}: {d:F6}"))}");
 
-            // New target = current position + correction delta
-            double p1Final = currentP1 + delta1;
-            double p2Final = currentP2 + delta2;
-            double p3Final = currentP3 + delta3;
+            // New target = current position + correction delta.
+            // Only 3-screw ETA hardware reports current positions; 4-screw plates are manual-only
+            // and always start from a zero baseline.
+            double[] current = screwCount == 3
+                ? new[] { currentP1, currentP2, currentP3 }
+                : new double[screwCount];
+
+            double[] finals = new double[screwCount];
+            for (int i = 0; i < screwCount; i++)
+            {
+                finals[i] = current[i] + deltas[i];
+            }
 
             // Save raw values before offsetting (for manual tilters, to show what was calculated)
-            double p1Raw = p1Final;
-            double p2Raw = p2Final;
-            double p3Raw = p3Final;
+            double[] raws = (double[])finals.Clone();
 
-            // If any position would go below 0, shift all up by the same amount
-            // (preserves the relative tilt while satisfying the hardware minimum)
-            double minValue = Math.Min(Math.Min(p1Final, p2Final), p3Final);
-            if (minValue < 0)
+            // If any position would go below 0, shift all up by the same amount (preserves the
+            // relative tilt). A manual plate is adjusted from fully seated screws, so travel can
+            // only go one way and the shift makes every value achievable; callers that want the
+            // signed adjustment relative to the current position ask for shiftToNonNegative=false.
+            if (shiftToNonNegative)
             {
-                double shift = Math.Abs(minValue);
-                p1Final += shift;
-                p2Final += shift;
-                p3Final += shift;
-                Logger.Debug($"[CalculateActuatorPositions] Shifted up by {shift:F6} mm to satisfy hardware minimum");
+                double minValue = finals.Min();
+                if (minValue < 0)
+                {
+                    double shift = Math.Abs(minValue);
+                    for (int i = 0; i < screwCount; i++)
+                    {
+                        finals[i] += shift;
+                    }
+                    Logger.Debug($"[CalculateActuatorPositions] Shifted up by {shift:F6} mm to satisfy the non-negative travel minimum");
+                }
             }
 
-            // Clamp to valid hardware range [0, 1.2] mm only if offsetting to zero is enabled
-            // For manual tilters with dontOffsetToZero=true, allow negative values to indicate direction
-            if (dontOffsetToZero)
+            for (int i = 0; i < screwCount; i++)
             {
-                p1Final = Math.Round(Math.Max(0, p1Final), 6);
-                p2Final = Math.Round(Math.Max(0, p2Final), 6);
-                p3Final = Math.Round(Math.Max(0, p3Final), 6);
-            }
-            else
-            {
-                p1Final = Math.Round(Math.Max(0, Math.Min(1.2, p1Final)), 6);
-                p2Final = Math.Round(Math.Max(0, Math.Min(1.2, p2Final)), 6);
-                p3Final = Math.Round(Math.Max(0, Math.Min(1.2, p3Final)), 6);
+                double value = finals[i];
+                if (dontOffsetToZero)
+                {
+                    // Manual tilters have no fixed travel limit. Only guard the floor when the
+                    // caller asked for non-negative output; clamping otherwise would clip the
+                    // signed values and break coplanarity.
+                    if (shiftToNonNegative)
+                    {
+                        value = Math.Max(0, value);
+                    }
+                }
+                else
+                {
+                    // ETA hardware range
+                    value = Math.Max(0, Math.Min(1.2, value));
+                }
+                finals[i] = Math.Round(value, 6);
             }
 
-            Logger.Info($"[CalculateActuatorPositions] Final target positions (mm) - P1: {p1Final:F6}, P2: {p2Final:F6}, P3: {p3Final:F6}");
+            Logger.Info($"[CalculateActuatorPositions] Final target positions (mm) - {string.Join(", ", finals.Select((v, i) => $"P{i + 1}: {v:F6}"))}");
 
             return new ApplyTiltPlaneResultDTO
             {
                 Success = true,
-                Position1 = (float)p1Final,
-                Position2 = (float)p2Final,
-                Position3 = (float)p3Final,
-                RawPosition1 = dontOffsetToZero ? (float?)Math.Round(p1Raw, 6) : null,
-                RawPosition2 = dontOffsetToZero ? (float?)Math.Round(p2Raw, 6) : null,
-                RawPosition3 = dontOffsetToZero ? (float?)Math.Round(p3Raw, 6) : null,
+                Position1 = (float)finals[0],
+                Position2 = (float)finals[1],
+                Position3 = (float)finals[2],
+                Position4 = screwCount == 4 ? (float?)finals[3] : null,
+                RawPosition1 = dontOffsetToZero ? (float?)Math.Round(raws[0], 6) : null,
+                RawPosition2 = dontOffsetToZero ? (float?)Math.Round(raws[1], 6) : null,
+                RawPosition3 = dontOffsetToZero ? (float?)Math.Round(raws[2], 6) : null,
+                RawPosition4 = dontOffsetToZero && screwCount == 4 ? (float?)Math.Round(raws[3], 6) : null,
+                ScrewCount = screwCount,
                 Message = "Actuator positions calculated successfully"
             };
         }
@@ -876,5 +908,45 @@ public class TilterService
                 Message = $"Error: {ex.Message}"
             };
         }
+    }
+
+    /// <summary>
+    /// Clamps a configured screw count to a supported layout. Only 3- and 4-screw plates exist
+    /// here; anything else falls back to the 3-screw default.
+    /// </summary>
+    private static int NormalizeScrewCount(int screwCount)
+    {
+        return screwCount == 4 ? 4 : 3;
+    }
+
+    /// <summary>
+    /// XY positions (mm) of the tilter screws on a ring of the given outer radius, expressed in
+    /// the same mirrored "looking at the back of the camera" frame the sensor corners use.
+    /// 3 screws: equilateral Wanderer ETA layout (P1 upper left, P2 bottom, P3 upper right).
+    /// 4 screws: one screw on each diagonal, under a sensor corner (P1 TL, P2 TR, P3 BL, P4 BR).
+    /// </summary>
+    private static double[][] GetScrewPositions(int screwCount, double outerRadius)
+    {
+        if (screwCount == 4)
+        {
+            double diagonal = outerRadius / Math.Sqrt(2.0);
+            return new[]
+            {
+                new[] { diagonal, diagonal },    // P1 - top-left
+                new[] { -diagonal, diagonal },   // P2 - top-right
+                new[] { diagonal, -diagonal },   // P3 - bottom-left
+                new[] { -diagonal, -diagonal }   // P4 - bottom-right
+            };
+        }
+
+        // For an equilateral triangle, inner_radius = outer_radius / 2 and the half-base is a
+        double innerRadius = outerRadius / 2.0;
+        double a = Math.Sqrt(outerRadius * outerRadius - innerRadius * innerRadius);
+        return new[]
+        {
+            new[] { -a, innerRadius },      // P1
+            new[] { 0.0, -outerRadius },    // P2
+            new[] { a, innerRadius }        // P3
+        };
     }
 }

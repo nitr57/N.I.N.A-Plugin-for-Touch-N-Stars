@@ -3019,7 +3019,8 @@ public class HocusFocusController : WebApiController
                 { "SensorHeight", config.SensorHeight },
                 { "SensorRotation", config.SensorRotation },
                 { "TilterOuterRadius", config.TilterOuterRadius },
-                { "TilterThreadPitch", config.TilterThreadPitch }
+                { "TilterThreadPitch", config.TilterThreadPitch },
+                { "TilterScrewCount", config.TilterScrewCount }
             };
         }
         catch (Exception ex)
@@ -3050,6 +3051,7 @@ public class HocusFocusController : WebApiController
             double rotation = 0.0;
             double outerRadius = 0.0;
             double threadPitch = 0.0;
+            int screwCount = 3;
 
             if (root.TryGetProperty("sensorWidth", out var widthElement) && widthElement.TryGetDouble(out var widthVal))
                 width = widthVal;
@@ -3061,6 +3063,8 @@ public class HocusFocusController : WebApiController
                 outerRadius = outerRadiusVal;
             if (root.TryGetProperty("tilterThreadPitch", out var threadPitchElement) && threadPitchElement.TryGetDouble(out var threadPitchVal))
                 threadPitch = threadPitchVal;
+            if (root.TryGetProperty("tilterScrewCount", out var screwCountElement) && screwCountElement.TryGetInt32(out var screwCountVal))
+                screwCount = screwCountVal == 4 ? 4 : 3;
 
             var config = new TilterService.SensorConfigurationDTO
             {
@@ -3068,7 +3072,8 @@ public class HocusFocusController : WebApiController
                 SensorHeight = height,
                 SensorRotation = rotation,
                 TilterOuterRadius = outerRadius,
-                TilterThreadPitch = threadPitch
+                TilterThreadPitch = threadPitch,
+                TilterScrewCount = screwCount
             };
 
             var tilterService = TilterService.Instance;
@@ -3134,6 +3139,18 @@ public class HocusFocusController : WebApiController
                     outerRadius = outerRadiusVal;
                 }
 
+                // Extract screw count - optional parameter, falls back to the saved configuration.
+                // ETA hardware is always a 3-screw plate, so only the virtual manual device may use 4.
+                int planeScrewCount = TilterService.Instance.GetSensorConfiguration().TilterScrewCount;
+                if (root.TryGetProperty("screwCount", out var screwCountElement) && screwCountElement.ValueKind != System.Text.Json.JsonValueKind.Null && screwCountElement.TryGetInt32(out var screwCountVal))
+                {
+                    planeScrewCount = screwCountVal;
+                }
+                if (deviceId != -1)
+                {
+                    planeScrewCount = 3;
+                }
+
                 // Extract dontOffsetToZero flag - optional parameter (default false)
                 bool dontOffsetToZero = false;
                 if (root.TryGetProperty("dontOffsetToZero", out var dontOffsetElement) && dontOffsetElement.ValueKind != System.Text.Json.JsonValueKind.Null)
@@ -3146,6 +3163,25 @@ public class HocusFocusController : WebApiController
                     {
                         dontOffsetToZero = false;
                     }
+                }
+
+                // Extract shiftToNonNegative flag - optional parameter (default true).
+                // Real hardware cannot take negative positions, so it always keeps the shift.
+                bool shiftToNonNegative = true;
+                if (root.TryGetProperty("shiftToNonNegative", out var shiftElement) && shiftElement.ValueKind != System.Text.Json.JsonValueKind.Null)
+                {
+                    try
+                    {
+                        shiftToNonNegative = shiftElement.GetBoolean();
+                    }
+                    catch
+                    {
+                        shiftToNonNegative = true;
+                    }
+                }
+                if (deviceId != -1)
+                {
+                    shiftToNonNegative = true;
                 }
 
                 var tilterService = TilterService.Instance;
@@ -3237,10 +3273,11 @@ public class HocusFocusController : WebApiController
                     ImagePlaneBottomLeftZ = blZ,
                     ImagePlaneBottomRightZ = brZ,
                     OuterRadius = finalOuterRadius.Value,
-                    DontOffsetToZero = dontOffsetToZero
+                    DontOffsetToZero = dontOffsetToZero,
+                    ScrewCount = planeScrewCount
                 };
 
-                var result = tilterService.CalculateActuatorPositions(desiredPlane, currentP1, currentP2, currentP3, dontOffsetToZero);
+                var result = tilterService.CalculateActuatorPositions(desiredPlane, currentP1, currentP2, currentP3, dontOffsetToZero, shiftToNonNegative);
 
                 if (!result.Success)
                 {
@@ -3259,8 +3296,12 @@ public class HocusFocusController : WebApiController
                     { "Message", result.Message },
                     { "Position1", result.Position1 },
                     { "Position2", result.Position2 },
-                    { "Position3", result.Position3 }
+                    { "Position3", result.Position3 },
+                    { "ScrewCount", result.ScrewCount }
                 };
+
+                if (result.Position4.HasValue)
+                    responseDict["Position4"] = result.Position4;
 
                 // Include raw positions for manual tilters (to show what was calculated before offsetting)
                 if (result.RawPosition1.HasValue)
@@ -3269,6 +3310,8 @@ public class HocusFocusController : WebApiController
                     responseDict["RawPosition2"] = result.RawPosition2;
                 if (result.RawPosition3.HasValue)
                     responseDict["RawPosition3"] = result.RawPosition3;
+                if (result.RawPosition4.HasValue)
+                    responseDict["RawPosition4"] = result.RawPosition4;
 
                 return responseDict;
             }

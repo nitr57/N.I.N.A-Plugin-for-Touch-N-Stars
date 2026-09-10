@@ -177,5 +177,17 @@ namespace TouchNStars.Properties {
                 this["TilterThreadPitch"] = value;
             }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("3")]
+        public int TilterScrewCount {
+            get {
+                return ((int)(this["TilterScrewCount"]));
+            }
+            set {
+                this["TilterScrewCount"] = value;
+            }
+        }
     }
 }
