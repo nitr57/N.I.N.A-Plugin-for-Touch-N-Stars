@@ -3020,7 +3020,8 @@ public class HocusFocusController : WebApiController
                 { "SensorRotation", config.SensorRotation },
                 { "TilterOuterRadius", config.TilterOuterRadius },
                 { "TilterThreadPitch", config.TilterThreadPitch },
-                { "TilterScrewCount", config.TilterScrewCount }
+                { "TilterScrewCount", config.TilterScrewCount },
+                { "TilterPositiveTurnIsOutward", config.TilterPositiveTurnIsOutward }
             };
         }
         catch (Exception ex)
@@ -3052,6 +3053,7 @@ public class HocusFocusController : WebApiController
             double outerRadius = 0.0;
             double threadPitch = 0.0;
             int screwCount = 3;
+            bool positiveTurnIsOutward = false;
 
             if (root.TryGetProperty("sensorWidth", out var widthElement) && widthElement.TryGetDouble(out var widthVal))
                 width = widthVal;
@@ -3065,6 +3067,9 @@ public class HocusFocusController : WebApiController
                 threadPitch = threadPitchVal;
             if (root.TryGetProperty("tilterScrewCount", out var screwCountElement) && screwCountElement.TryGetInt32(out var screwCountVal))
                 screwCount = screwCountVal == 4 ? 4 : 3;
+            if (root.TryGetProperty("tilterPositiveTurnIsOutward", out var positiveOutwardElement) &&
+                (positiveOutwardElement.ValueKind == JsonValueKind.True || positiveOutwardElement.ValueKind == JsonValueKind.False))
+                positiveTurnIsOutward = positiveOutwardElement.GetBoolean();
 
             var config = new TilterService.SensorConfigurationDTO
             {
@@ -3073,7 +3078,8 @@ public class HocusFocusController : WebApiController
                 SensorRotation = rotation,
                 TilterOuterRadius = outerRadius,
                 TilterThreadPitch = threadPitch,
-                TilterScrewCount = screwCount
+                TilterScrewCount = screwCount,
+                TilterPositiveTurnIsOutward = positiveTurnIsOutward
             };
 
             var tilterService = TilterService.Instance;
@@ -3165,23 +3171,37 @@ public class HocusFocusController : WebApiController
                     }
                 }
 
-                // Extract shiftToNonNegative flag - optional parameter (default true).
+                // Extract shiftToNonNegative flag - optional parameter (default true). The wire name
+                // predates positiveTurnIsOutward; it means "report travel from fully seated screws".
                 // Real hardware cannot take negative positions, so it always keeps the shift.
-                bool shiftToNonNegative = true;
+                bool shiftToSeated = true;
                 if (root.TryGetProperty("shiftToNonNegative", out var shiftElement) && shiftElement.ValueKind != System.Text.Json.JsonValueKind.Null)
                 {
                     try
                     {
-                        shiftToNonNegative = shiftElement.GetBoolean();
+                        shiftToSeated = shiftElement.GetBoolean();
                     }
                     catch
                     {
-                        shiftToNonNegative = true;
+                        shiftToSeated = true;
                     }
                 }
                 if (deviceId != -1)
                 {
-                    shiftToNonNegative = true;
+                    shiftToSeated = true;
+                }
+
+                // Extract positiveTurnIsOutward - optional parameter, falls back to the saved configuration.
+                // Only manual tilters have a screw direction; ETA positions are always non-negative.
+                bool positiveTurnIsOutward = TilterService.Instance.GetSensorConfiguration().TilterPositiveTurnIsOutward;
+                if (root.TryGetProperty("positiveTurnIsOutward", out var positiveOutwardElement) &&
+                    (positiveOutwardElement.ValueKind == System.Text.Json.JsonValueKind.True || positiveOutwardElement.ValueKind == System.Text.Json.JsonValueKind.False))
+                {
+                    positiveTurnIsOutward = positiveOutwardElement.GetBoolean();
+                }
+                if (deviceId != -1)
+                {
+                    positiveTurnIsOutward = false;
                 }
 
                 var tilterService = TilterService.Instance;
@@ -3277,7 +3297,7 @@ public class HocusFocusController : WebApiController
                     ScrewCount = planeScrewCount
                 };
 
-                var result = tilterService.CalculateActuatorPositions(desiredPlane, currentP1, currentP2, currentP3, dontOffsetToZero, shiftToNonNegative);
+                var result = tilterService.CalculateActuatorPositions(desiredPlane, currentP1, currentP2, currentP3, dontOffsetToZero, shiftToSeated, positiveTurnIsOutward);
 
                 if (!result.Success)
                 {
@@ -3297,7 +3317,8 @@ public class HocusFocusController : WebApiController
                     { "Position1", result.Position1 },
                     { "Position2", result.Position2 },
                     { "Position3", result.Position3 },
-                    { "ScrewCount", result.ScrewCount }
+                    { "ScrewCount", result.ScrewCount },
+                    { "PositiveTurnIsOutward", positiveTurnIsOutward }
                 };
 
                 if (result.Position4.HasValue)

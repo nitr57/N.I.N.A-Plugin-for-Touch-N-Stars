@@ -189,5 +189,17 @@ namespace TouchNStars.Properties {
                 this["TilterScrewCount"] = value;
             }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool TilterPositiveTurnIsOutward {
+            get {
+                return ((bool)(this["TilterPositiveTurnIsOutward"]));
+            }
+            set {
+                this["TilterPositiveTurnIsOutward"] = value;
+            }
+        }
     }
 }

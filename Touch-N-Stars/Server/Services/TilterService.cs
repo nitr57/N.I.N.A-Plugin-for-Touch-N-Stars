@@ -93,6 +93,7 @@ public class TilterService
         public double TilterOuterRadius { get; set; } // in mm
         public double TilterThreadPitch { get; set; } // in mm
         public int TilterScrewCount { get; set; }     // 3 or 4 (manual tilters; ETA hardware is always 3)
+        public bool TilterPositiveTurnIsOutward { get; set; } // Manual tilters: a positive value means turning the screw outward
     }
 
     public class ApplyTiltPlaneDTO
@@ -665,7 +666,8 @@ public class TilterService
             SensorRotation = Settings.Default.SensorRotation,
             TilterOuterRadius = Settings.Default.TilterOuterRadius,
             TilterThreadPitch = Settings.Default.TilterThreadPitch,
-            TilterScrewCount = NormalizeScrewCount(Settings.Default.TilterScrewCount)
+            TilterScrewCount = NormalizeScrewCount(Settings.Default.TilterScrewCount),
+            TilterPositiveTurnIsOutward = Settings.Default.TilterPositiveTurnIsOutward
         };
     }
 
@@ -683,8 +685,9 @@ public class TilterService
             Settings.Default.TilterOuterRadius = config.TilterOuterRadius;
             Settings.Default.TilterThreadPitch = config.TilterThreadPitch;
             Settings.Default.TilterScrewCount = NormalizeScrewCount(config.TilterScrewCount);
+            Settings.Default.TilterPositiveTurnIsOutward = config.TilterPositiveTurnIsOutward;
             CoreUtil.SaveSettings(Settings.Default);
-            Logger.Info($"TilterService: Sensor configuration updated - Width: {config.SensorWidth}mm, Height: {config.SensorHeight}mm, Rotation: {Settings.Default.SensorRotation}°, OuterRadius: {config.TilterOuterRadius}mm, ThreadPitch: {config.TilterThreadPitch}mm, ScrewCount: {Settings.Default.TilterScrewCount}");
+            Logger.Info($"TilterService: Sensor configuration updated - Width: {config.SensorWidth}mm, Height: {config.SensorHeight}mm, Rotation: {Settings.Default.SensorRotation}°, OuterRadius: {config.TilterOuterRadius}mm, ThreadPitch: {config.TilterThreadPitch}mm, ScrewCount: {Settings.Default.TilterScrewCount}, PositiveTurnIsOutward: {Settings.Default.TilterPositiveTurnIsOutward}");
         }
         catch (Exception ex)
         {
@@ -719,7 +722,7 @@ public class TilterService
     /// to achieve a specific tilt plane defined by Z values at the four image sensor corners
     /// (inverse calculation)
     /// </summary>
-    public ApplyTiltPlaneResultDTO CalculateActuatorPositions(ApplyTiltPlaneDTO desiredPlane, double currentP1 = 0, double currentP2 = 0, double currentP3 = 0, bool dontOffsetToZero = false, bool shiftToNonNegative = true)
+    public ApplyTiltPlaneResultDTO CalculateActuatorPositions(ApplyTiltPlaneDTO desiredPlane, double currentP1 = 0, double currentP2 = 0, double currentP3 = 0, bool dontOffsetToZero = false, bool shiftToSeated = true, bool positiveTurnIsOutward = false)
     {
         try
         {
@@ -843,21 +846,24 @@ public class TilterService
             // Save raw values before offsetting (for manual tilters, to show what was calculated)
             double[] raws = (double[])finals.Clone();
 
-            // If any position would go below 0, shift all up by the same amount (preserves the
-            // relative tilt). A manual plate is adjusted from fully seated screws, so travel can
-            // only go one way and the shift makes every value achievable; callers that want the
-            // signed adjustment relative to the current position ask for shiftToNonNegative=false.
-            if (shiftToNonNegative)
+            // A fully seated plate can only be driven inward, so shift every value by the same amount
+            // until none points outward (preserves the relative tilt; only backfocus changes).
+            // Positive values are inward unless positiveTurnIsOutward, in which case the values are
+            // shifted down to non-positive instead. ETA hardware always takes the non-negative form.
+            // Callers that want the signed adjustment relative to the current position ask for
+            // shiftToSeated=false.
+            if (shiftToSeated)
             {
-                double minValue = finals.Min();
-                if (minValue < 0)
+                double shift = positiveTurnIsOutward
+                    ? -Math.Max(0, finals.Max())
+                    : -Math.Min(0, finals.Min());
+                if (shift != 0)
                 {
-                    double shift = Math.Abs(minValue);
                     for (int i = 0; i < screwCount; i++)
                     {
                         finals[i] += shift;
                     }
-                    Logger.Debug($"[CalculateActuatorPositions] Shifted up by {shift:F6} mm to satisfy the non-negative travel minimum");
+                    Logger.Debug($"[CalculateActuatorPositions] Shifted by {shift:F6} mm so every screw turns inward from fully seated");
                 }
             }
 
@@ -866,12 +872,12 @@ public class TilterService
                 double value = finals[i];
                 if (dontOffsetToZero)
                 {
-                    // Manual tilters have no fixed travel limit. Only guard the floor when the
-                    // caller asked for non-negative output; clamping otherwise would clip the
+                    // Manual tilters have no fixed travel limit. Only guard the seated bound when
+                    // the caller asked for seated output; clamping otherwise would clip the
                     // signed values and break coplanarity.
-                    if (shiftToNonNegative)
+                    if (shiftToSeated)
                     {
-                        value = Math.Max(0, value);
+                        value = positiveTurnIsOutward ? Math.Min(0, value) : Math.Max(0, value);
                     }
                 }
                 else
