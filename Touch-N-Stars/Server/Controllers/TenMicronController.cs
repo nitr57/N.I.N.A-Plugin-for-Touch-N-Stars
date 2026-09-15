@@ -196,6 +196,16 @@ public class TenMicronController : WebApiController
     private static bool IsPluginLoaded() => TenMicronPluginType != null &&
                                             GetMountModelMediator() != null;
 
+    /// <summary>
+    /// True when the 10micron mount-model VM reports a live mount connection.
+    /// Every endpoint that reflects into the VM's private Load* methods has to check this first:
+    /// those methods are handed the VM's disconnectCts token, which DoDisconnect() cancels. A load
+    /// started with an already cancelled token is returned already-Canceled without running, and
+    /// MountModelVM parks it in its in-flight field - poisoning every later load for the session.
+    /// </summary>
+    private static bool IsMountVMConnected(object vmHandler) =>
+        vmHandler != null && GetProp<bool>(vmHandler, "Connected");
+
     private Dictionary<string, object> PluginNotLoaded()
     {
         HttpContext.Response.StatusCode = 503;
@@ -235,6 +245,17 @@ public class TenMicronController : WebApiController
                 };
             }
 
+            // Everything below that needs a raw LX200 round trip is static or only changes when
+            // the user sets it, so it is gated behind ?full=true. The 3s status poll asks for the
+            // light version and reads the frequently changing values off the VM's MountInfo, which
+            // costs no mount traffic at all.
+            bool full = false;
+            if (HttpContext.Request.QueryString.AllKeys.Contains("full"))
+            {
+                var rawFull = HttpContext.Request.QueryString["full"];
+                full = string.IsNullOrEmpty(rawFull) || !bool.TryParse(rawFull, out bool parsedFull) || parsedFull;
+            }
+
             var modelMediator = GetMountModelMediator();
             var info = CallMethod(modelMediator, "GetInfo");
             bool connected = info != null && GetProp<bool>(info, "Connected");
@@ -252,7 +273,7 @@ public class TenMicronController : WebApiController
             // GPS time sync state via raw LX200 command :gtgpps#
             // Response: 0=Off, 1=GPS synced, 2=GPS+PPS synced
             string gpsSyncState = "Unknown";
-            if (connected)
+            if (connected && full)
             {
                 var gpsRaw = SendRawMountCommand(mountVM, ":gtgpps#");
                 if (int.TryParse(gpsRaw?.TrimEnd('#'), out int gpsVal))
@@ -261,7 +282,7 @@ public class TenMicronController : WebApiController
 
             // Slew rate (current / min / max) via raw LX200 commands
             double? slewRate = null, slewRateMin = null, slewRateMax = null;
-            if (connected)
+            if (connected && full)
             {
                 if (double.TryParse(SendRawMountCommand(mountVM, ":GMs#")?.TrimEnd('#'),
                     System.Globalization.NumberStyles.Any,
@@ -279,7 +300,7 @@ public class TenMicronController : WebApiController
 
             // Horizon limit high/low via :Gh# / :Go#
             int? horizonLimitHigh = null, horizonLimitLow = null;
-            if (connected)
+            if (connected && full)
             {
                 if (int.TryParse(SendRawMountCommand(mountVM, ":Gh#")?.TrimEnd('#'), out int hh))
                     horizonLimitHigh = hh;
@@ -289,7 +310,7 @@ public class TenMicronController : WebApiController
 
             // Connection type via :GINQ# (0=RS-232, 1=GPS/RS-232, 2=LAN, 3=WiFi)
             string connectionType = "Unknown";
-            if (connected)
+            if (connected && full)
             {
                 string[] connLabels = { "RS-232", "GPS/RS-232", "LAN", "WiFi" };
                 var connRaw = SendRawMountCommand(mountVM, ":GINQ#")?.TrimEnd('#');
@@ -301,7 +322,7 @@ public class TenMicronController : WebApiController
             // Response: "V,YYYY-MM-DD" (V=valid) or "X,YYYY-MM-DD" (expired)
             bool deltaTValid = false;
             string deltaTExpiration = null;
-            if (connected)
+            if (connected && full)
             {
                 var dutvRaw = SendRawMountCommand(mountVM, ":GDUTV#")?.TrimEnd('#');
                 if (!string.IsNullOrEmpty(dutvRaw))
@@ -315,7 +336,7 @@ public class TenMicronController : WebApiController
                 }
             }
 
-            return new Dictionary<string, object>
+            var status = new Dictionary<string, object>
             {
                 { "Success", true },
                 { "PluginLoaded", true },
@@ -333,19 +354,6 @@ public class TenMicronController : WebApiController
                 { "RefractionPressure", mountInfo != null ? (double)GetProp<decimal>(mountInfo, "RefractionPressure") : 0.0 },
                 // enum as string
                 { "MountStatus", mountInfo != null ? GetProp<object>(mountInfo, "Status")?.ToString() ?? "" : "" },
-                { "GpsSyncState", gpsSyncState },
-                // slew rate
-                { "SlewRate", (object)slewRate },
-                { "SlewRateMin", (object)slewRateMin },
-                { "SlewRateMax", (object)slewRateMax },
-                // horizon limits
-                { "HorizonLimitHigh", (object)horizonLimitHigh },
-                { "HorizonLimitLow", (object)horizonLimitLow },
-                // connection type
-                { "ConnectionType", connectionType },
-                // deltaT expiration
-                { "DeltaTValid", deltaTValid },
-                { "DeltaTExpiration", deltaTExpiration },
                 // product / firmware info (static, refreshes on reconnect)
                 { "ProductName", firmware != null ? GetProp<string>(firmware, "ProductName") ?? "" : "" },
                 { "FirmwareVersion", firmware != null ? GetProp<object>(firmware, "Version")?.ToString() ?? "" : "" },
@@ -353,6 +361,23 @@ public class TenMicronController : WebApiController
                 { "IPAddress", GetConnectionIP(mountVM) ?? (options != null ? GetProp<string>(options, "IPAddress") ?? "" : "") },
                 { "MACAddress", options != null ? GetProp<string>(options, "MACAddress") ?? "" : "" },
             };
+
+            // Only sent on a full refresh. setStatus() in the store keeps its previous value for
+            // any key that is absent, so the light poll never blanks these out.
+            if (full)
+            {
+                status["GpsSyncState"] = gpsSyncState;
+                status["SlewRate"] = (object)slewRate;
+                status["SlewRateMin"] = (object)slewRateMin;
+                status["SlewRateMax"] = (object)slewRateMax;
+                status["HorizonLimitHigh"] = (object)horizonLimitHigh;
+                status["HorizonLimitLow"] = (object)horizonLimitLow;
+                status["ConnectionType"] = connectionType;
+                status["DeltaTValid"] = deltaTValid;
+                status["DeltaTExpiration"] = deltaTExpiration;
+            }
+
+            return status;
         }
         catch (Exception ex)
         {
@@ -372,6 +397,9 @@ public class TenMicronController : WebApiController
         {
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
+
+            if (!IsMountVMConnected(vmHandler))
+                return new Dictionary<string, object> { { "Success", true }, { "ModelLoaded", false } };
 
             // Wait for any in-progress alignment model load using the public GetLoadedAlignmentModel API.
             // This avoids triggering an extra mount query (which races with NINA's own polling and
@@ -462,6 +490,9 @@ public class TenMicronController : WebApiController
         {
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
+
+            if (!IsMountVMConnected(vmHandler))
+                return new Dictionary<string, object> { { "Success", true }, { "ModelNames", Array.Empty<string>() } };
 
             // Trigger a fresh load from the mount via the private LoadModelNames method
             if (vmHandler != null)
@@ -1550,6 +1581,9 @@ public class TenMicronController : WebApiController
         {
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
+
+            if (!IsMountVMConnected(vmHandler))
+                return new Dictionary<string, object> { { "Success", true }, { "ModelLoaded", false } };
 
             if (vmHandler != null)
             {
