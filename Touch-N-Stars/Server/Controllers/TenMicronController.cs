@@ -69,6 +69,33 @@ public class TenMicronController : WebApiController
         catch { return fallback; }
     }
 
+    /// <summary>
+    /// Returns the alignment stars of the model the plugin has loaded, waiting for a load that is
+    /// already running. Null when no model is loaded, so the caller falls back to the mount.
+    /// </summary>
+    private static async Task<IList<object>> GetCachedAlignmentStars(object vmHandler, CancellationToken ct)
+    {
+        if (vmHandler == null) return null;
+        var getLoadedMethod = vmHandler.GetType().GetMethod("GetLoadedAlignmentModel",
+            BindingFlags.Public | BindingFlags.Instance);
+        if (getLoadedMethod?.Invoke(vmHandler, new object[] { ct }) is not Task getLoadedTask) return null;
+        await getLoadedTask.ConfigureAwait(false);
+
+        if (!GetProp<bool>(vmHandler, "ModelLoaded")) return null;
+        var model = GetProp<object>(getLoadedTask, "Result");
+        if (GetProp<object>(model, "OriginalAlignmentStars") is not System.Collections.IEnumerable stars) return null;
+        var list = stars.Cast<object>().ToList();
+        return list.Count > 0 ? list : null;
+    }
+
+    private static bool SameAlignmentStar(object cached, object fromMount)
+    {
+        if (cached == null || fromMount == null) return false;
+        // AlignmentStarInfo.ToString covers RA, DEC and error; the exact error guards the rounding.
+        return cached.ToString() == fromMount.ToString()
+            && GetProp<decimal>(cached, "ErrorArcseconds") == GetProp<decimal>(fromMount, "ErrorArcseconds");
+    }
+
     private static object CallMethod(object obj, string name, object[] args = null)
     {
         if (obj == null) return null;
@@ -1509,22 +1536,71 @@ public class TenMicronController : WebApiController
         try
         {
             var modelMediator = GetMountModelMediator();
-            int starCount = (int)(CallMethod(modelMediator, "GetAlignmentStarCount") ?? 0);
-            if (starCount == 0)
-                return Error("No alignment stars to delete", 400);
+            var vmHandler = GetMediatorHandler(modelMediator);
+            var ct = CancellationToken.None;
+            if (vmHandler != null)
+            {
+                var ctsField = vmHandler.GetType().GetField("disconnectCts",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ctsField?.GetValue(vmHandler) is CancellationTokenSource cts) ct = cts.Token;
+            }
 
-            // Find the star with the highest error
+            // Pick the worst star from the model the plugin already holds, like the WPF
+            // DeleteWorstStar does. Reading all stars from the mount again costs one round
+            // trip per star, and the reload after the delete reads them all once more.
             double maxError = double.MinValue;
             int worstIndex = -1;
-            for (int i = 1; i <= starCount; i++)
+            var cachedStars = await GetCachedAlignmentStars(vmHandler, ct).ConfigureAwait(false);
+            if (cachedStars != null)
             {
-                var starInfo = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { i });
-                if (starInfo == null) continue;
-                double err = (double)GetProp<decimal>(starInfo, "ErrorArcseconds");
-                if (err > maxError)
+                for (int i = 0; i < cachedStars.Count; i++)
                 {
-                    maxError = err;
-                    worstIndex = i;
+                    double err = (double)GetProp<decimal>(cachedStars[i], "ErrorArcseconds");
+                    if (err > maxError)
+                    {
+                        maxError = err;
+                        worstIndex = i + 1;
+                    }
+                }
+
+                // The cache is indexed by list position, which only equals the mount index if no
+                // star was skipped while loading. Confirm with a single read before deleting.
+                if (worstIndex > 0)
+                {
+                    object mountStar = null;
+                    try
+                    {
+                        mountStar = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { worstIndex });
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"TenMicron DeleteWorstStar: failed to read star {worstIndex} from the mount: {ex.Message}");
+                    }
+                    if (!SameAlignmentStar(cachedStars[worstIndex - 1], mountStar))
+                    {
+                        Logger.Info($"TenMicron DeleteWorstStar: cached star {worstIndex} does not match the mount, scanning all stars");
+                        maxError = double.MinValue;
+                        worstIndex = -1;
+                    }
+                }
+            }
+
+            if (worstIndex < 0)
+            {
+                int starCount = (int)(CallMethod(modelMediator, "GetAlignmentStarCount") ?? 0);
+                if (starCount == 0)
+                    return Error("No alignment stars to delete", 400);
+
+                for (int i = 1; i <= starCount; i++)
+                {
+                    var starInfo = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { i });
+                    if (starInfo == null) continue;
+                    double err = (double)GetProp<decimal>(starInfo, "ErrorArcseconds");
+                    if (err > maxError)
+                    {
+                        maxError = err;
+                        worstIndex = i;
+                    }
                 }
             }
 
@@ -1538,15 +1614,8 @@ public class TenMicronController : WebApiController
 
             // Mirror the WPF flow: trigger a fresh model reload from the mount so the
             // cache reflects the updated star count and RMS before the next GET.
-            var vmHandler = GetMediatorHandler(modelMediator);
             if (vmHandler != null)
             {
-                var ct = CancellationToken.None;
-                var ctsField = vmHandler.GetType().GetField("disconnectCts",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var cts = ctsField?.GetValue(vmHandler) as CancellationTokenSource;
-                if (cts != null) ct = cts.Token;
-
                 var loadMethod = vmHandler.GetType().GetMethod("LoadAlignmentModel",
                     BindingFlags.NonPublic | BindingFlags.Instance);
                 if (loadMethod != null)
