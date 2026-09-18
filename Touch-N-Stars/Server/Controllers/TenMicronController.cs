@@ -69,6 +69,33 @@ public class TenMicronController : WebApiController
         catch { return fallback; }
     }
 
+    /// <summary>
+    /// Returns the alignment stars of the model the plugin has loaded, waiting for a load that is
+    /// already running. Null when no model is loaded, so the caller falls back to the mount.
+    /// </summary>
+    private static async Task<IList<object>> GetCachedAlignmentStars(object vmHandler, CancellationToken ct)
+    {
+        if (vmHandler == null) return null;
+        var getLoadedMethod = vmHandler.GetType().GetMethod("GetLoadedAlignmentModel",
+            BindingFlags.Public | BindingFlags.Instance);
+        if (getLoadedMethod?.Invoke(vmHandler, new object[] { ct }) is not Task getLoadedTask) return null;
+        await getLoadedTask.ConfigureAwait(false);
+
+        if (!GetProp<bool>(vmHandler, "ModelLoaded")) return null;
+        var model = GetProp<object>(getLoadedTask, "Result");
+        if (GetProp<object>(model, "OriginalAlignmentStars") is not System.Collections.IEnumerable stars) return null;
+        var list = stars.Cast<object>().ToList();
+        return list.Count > 0 ? list : null;
+    }
+
+    private static bool SameAlignmentStar(object cached, object fromMount)
+    {
+        if (cached == null || fromMount == null) return false;
+        // AlignmentStarInfo.ToString covers RA, DEC and error; the exact error guards the rounding.
+        return cached.ToString() == fromMount.ToString()
+            && GetProp<decimal>(cached, "ErrorArcseconds") == GetProp<decimal>(fromMount, "ErrorArcseconds");
+    }
+
     private static object CallMethod(object obj, string name, object[] args = null)
     {
         if (obj == null) return null;
@@ -196,6 +223,16 @@ public class TenMicronController : WebApiController
     private static bool IsPluginLoaded() => TenMicronPluginType != null &&
                                             GetMountModelMediator() != null;
 
+    /// <summary>
+    /// True when the 10micron mount-model VM reports a live mount connection.
+    /// Every endpoint that reflects into the VM's private Load* methods has to check this first:
+    /// those methods are handed the VM's disconnectCts token, which DoDisconnect() cancels. A load
+    /// started with an already cancelled token is returned already-Canceled without running, and
+    /// MountModelVM parks it in its in-flight field - poisoning every later load for the session.
+    /// </summary>
+    private static bool IsMountVMConnected(object vmHandler) =>
+        vmHandler != null && GetProp<bool>(vmHandler, "Connected");
+
     private Dictionary<string, object> PluginNotLoaded()
     {
         HttpContext.Response.StatusCode = 503;
@@ -235,6 +272,17 @@ public class TenMicronController : WebApiController
                 };
             }
 
+            // Everything below that needs a raw LX200 round trip is static or only changes when
+            // the user sets it, so it is gated behind ?full=true. The 3s status poll asks for the
+            // light version and reads the frequently changing values off the VM's MountInfo, which
+            // costs no mount traffic at all.
+            bool full = false;
+            if (HttpContext.Request.QueryString.AllKeys.Contains("full"))
+            {
+                var rawFull = HttpContext.Request.QueryString["full"];
+                full = string.IsNullOrEmpty(rawFull) || !bool.TryParse(rawFull, out bool parsedFull) || parsedFull;
+            }
+
             var modelMediator = GetMountModelMediator();
             var info = CallMethod(modelMediator, "GetInfo");
             bool connected = info != null && GetProp<bool>(info, "Connected");
@@ -252,7 +300,7 @@ public class TenMicronController : WebApiController
             // GPS time sync state via raw LX200 command :gtgpps#
             // Response: 0=Off, 1=GPS synced, 2=GPS+PPS synced
             string gpsSyncState = "Unknown";
-            if (connected)
+            if (connected && full)
             {
                 var gpsRaw = SendRawMountCommand(mountVM, ":gtgpps#");
                 if (int.TryParse(gpsRaw?.TrimEnd('#'), out int gpsVal))
@@ -261,7 +309,7 @@ public class TenMicronController : WebApiController
 
             // Slew rate (current / min / max) via raw LX200 commands
             double? slewRate = null, slewRateMin = null, slewRateMax = null;
-            if (connected)
+            if (connected && full)
             {
                 if (double.TryParse(SendRawMountCommand(mountVM, ":GMs#")?.TrimEnd('#'),
                     System.Globalization.NumberStyles.Any,
@@ -279,7 +327,7 @@ public class TenMicronController : WebApiController
 
             // Horizon limit high/low via :Gh# / :Go#
             int? horizonLimitHigh = null, horizonLimitLow = null;
-            if (connected)
+            if (connected && full)
             {
                 if (int.TryParse(SendRawMountCommand(mountVM, ":Gh#")?.TrimEnd('#'), out int hh))
                     horizonLimitHigh = hh;
@@ -289,7 +337,7 @@ public class TenMicronController : WebApiController
 
             // Connection type via :GINQ# (0=RS-232, 1=GPS/RS-232, 2=LAN, 3=WiFi)
             string connectionType = "Unknown";
-            if (connected)
+            if (connected && full)
             {
                 string[] connLabels = { "RS-232", "GPS/RS-232", "LAN", "WiFi" };
                 var connRaw = SendRawMountCommand(mountVM, ":GINQ#")?.TrimEnd('#');
@@ -301,7 +349,7 @@ public class TenMicronController : WebApiController
             // Response: "V,YYYY-MM-DD" (V=valid) or "X,YYYY-MM-DD" (expired)
             bool deltaTValid = false;
             string deltaTExpiration = null;
-            if (connected)
+            if (connected && full)
             {
                 var dutvRaw = SendRawMountCommand(mountVM, ":GDUTV#")?.TrimEnd('#');
                 if (!string.IsNullOrEmpty(dutvRaw))
@@ -315,7 +363,7 @@ public class TenMicronController : WebApiController
                 }
             }
 
-            return new Dictionary<string, object>
+            var status = new Dictionary<string, object>
             {
                 { "Success", true },
                 { "PluginLoaded", true },
@@ -333,19 +381,6 @@ public class TenMicronController : WebApiController
                 { "RefractionPressure", mountInfo != null ? (double)GetProp<decimal>(mountInfo, "RefractionPressure") : 0.0 },
                 // enum as string
                 { "MountStatus", mountInfo != null ? GetProp<object>(mountInfo, "Status")?.ToString() ?? "" : "" },
-                { "GpsSyncState", gpsSyncState },
-                // slew rate
-                { "SlewRate", (object)slewRate },
-                { "SlewRateMin", (object)slewRateMin },
-                { "SlewRateMax", (object)slewRateMax },
-                // horizon limits
-                { "HorizonLimitHigh", (object)horizonLimitHigh },
-                { "HorizonLimitLow", (object)horizonLimitLow },
-                // connection type
-                { "ConnectionType", connectionType },
-                // deltaT expiration
-                { "DeltaTValid", deltaTValid },
-                { "DeltaTExpiration", deltaTExpiration },
                 // product / firmware info (static, refreshes on reconnect)
                 { "ProductName", firmware != null ? GetProp<string>(firmware, "ProductName") ?? "" : "" },
                 { "FirmwareVersion", firmware != null ? GetProp<object>(firmware, "Version")?.ToString() ?? "" : "" },
@@ -353,6 +388,23 @@ public class TenMicronController : WebApiController
                 { "IPAddress", GetConnectionIP(mountVM) ?? (options != null ? GetProp<string>(options, "IPAddress") ?? "" : "") },
                 { "MACAddress", options != null ? GetProp<string>(options, "MACAddress") ?? "" : "" },
             };
+
+            // Only sent on a full refresh. setStatus() in the store keeps its previous value for
+            // any key that is absent, so the light poll never blanks these out.
+            if (full)
+            {
+                status["GpsSyncState"] = gpsSyncState;
+                status["SlewRate"] = (object)slewRate;
+                status["SlewRateMin"] = (object)slewRateMin;
+                status["SlewRateMax"] = (object)slewRateMax;
+                status["HorizonLimitHigh"] = (object)horizonLimitHigh;
+                status["HorizonLimitLow"] = (object)horizonLimitLow;
+                status["ConnectionType"] = connectionType;
+                status["DeltaTValid"] = deltaTValid;
+                status["DeltaTExpiration"] = deltaTExpiration;
+            }
+
+            return status;
         }
         catch (Exception ex)
         {
@@ -372,6 +424,9 @@ public class TenMicronController : WebApiController
         {
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
+
+            if (!IsMountVMConnected(vmHandler))
+                return new Dictionary<string, object> { { "Success", true }, { "ModelLoaded", false } };
 
             // Wait for any in-progress alignment model load using the public GetLoadedAlignmentModel API.
             // This avoids triggering an extra mount query (which races with NINA's own polling and
@@ -462,6 +517,9 @@ public class TenMicronController : WebApiController
         {
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
+
+            if (!IsMountVMConnected(vmHandler))
+                return new Dictionary<string, object> { { "Success", true }, { "ModelNames", Array.Empty<string>() } };
 
             // Trigger a fresh load from the mount via the private LoadModelNames method
             if (vmHandler != null)
@@ -1478,22 +1536,71 @@ public class TenMicronController : WebApiController
         try
         {
             var modelMediator = GetMountModelMediator();
-            int starCount = (int)(CallMethod(modelMediator, "GetAlignmentStarCount") ?? 0);
-            if (starCount == 0)
-                return Error("No alignment stars to delete", 400);
+            var vmHandler = GetMediatorHandler(modelMediator);
+            var ct = CancellationToken.None;
+            if (vmHandler != null)
+            {
+                var ctsField = vmHandler.GetType().GetField("disconnectCts",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ctsField?.GetValue(vmHandler) is CancellationTokenSource cts) ct = cts.Token;
+            }
 
-            // Find the star with the highest error
+            // Pick the worst star from the model the plugin already holds, like the WPF
+            // DeleteWorstStar does. Reading all stars from the mount again costs one round
+            // trip per star, and the reload after the delete reads them all once more.
             double maxError = double.MinValue;
             int worstIndex = -1;
-            for (int i = 1; i <= starCount; i++)
+            var cachedStars = await GetCachedAlignmentStars(vmHandler, ct).ConfigureAwait(false);
+            if (cachedStars != null)
             {
-                var starInfo = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { i });
-                if (starInfo == null) continue;
-                double err = (double)GetProp<decimal>(starInfo, "ErrorArcseconds");
-                if (err > maxError)
+                for (int i = 0; i < cachedStars.Count; i++)
                 {
-                    maxError = err;
-                    worstIndex = i;
+                    double err = (double)GetProp<decimal>(cachedStars[i], "ErrorArcseconds");
+                    if (err > maxError)
+                    {
+                        maxError = err;
+                        worstIndex = i + 1;
+                    }
+                }
+
+                // The cache is indexed by list position, which only equals the mount index if no
+                // star was skipped while loading. Confirm with a single read before deleting.
+                if (worstIndex > 0)
+                {
+                    object mountStar = null;
+                    try
+                    {
+                        mountStar = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { worstIndex });
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"TenMicron DeleteWorstStar: failed to read star {worstIndex} from the mount: {ex.Message}");
+                    }
+                    if (!SameAlignmentStar(cachedStars[worstIndex - 1], mountStar))
+                    {
+                        Logger.Info($"TenMicron DeleteWorstStar: cached star {worstIndex} does not match the mount, scanning all stars");
+                        maxError = double.MinValue;
+                        worstIndex = -1;
+                    }
+                }
+            }
+
+            if (worstIndex < 0)
+            {
+                int starCount = (int)(CallMethod(modelMediator, "GetAlignmentStarCount") ?? 0);
+                if (starCount == 0)
+                    return Error("No alignment stars to delete", 400);
+
+                for (int i = 1; i <= starCount; i++)
+                {
+                    var starInfo = CallMethod(modelMediator, "GetAlignmentStarInfo", new object[] { i });
+                    if (starInfo == null) continue;
+                    double err = (double)GetProp<decimal>(starInfo, "ErrorArcseconds");
+                    if (err > maxError)
+                    {
+                        maxError = err;
+                        worstIndex = i;
+                    }
                 }
             }
 
@@ -1507,15 +1614,8 @@ public class TenMicronController : WebApiController
 
             // Mirror the WPF flow: trigger a fresh model reload from the mount so the
             // cache reflects the updated star count and RMS before the next GET.
-            var vmHandler = GetMediatorHandler(modelMediator);
             if (vmHandler != null)
             {
-                var ct = CancellationToken.None;
-                var ctsField = vmHandler.GetType().GetField("disconnectCts",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var cts = ctsField?.GetValue(vmHandler) as CancellationTokenSource;
-                if (cts != null) ct = cts.Token;
-
                 var loadMethod = vmHandler.GetType().GetMethod("LoadAlignmentModel",
                     BindingFlags.NonPublic | BindingFlags.Instance);
                 if (loadMethod != null)
@@ -1550,6 +1650,9 @@ public class TenMicronController : WebApiController
         {
             var modelMediator = GetMountModelMediator();
             var vmHandler = GetMediatorHandler(modelMediator);
+
+            if (!IsMountVMConnected(vmHandler))
+                return new Dictionary<string, object> { { "Success", true }, { "ModelLoaded", false } };
 
             if (vmHandler != null)
             {
