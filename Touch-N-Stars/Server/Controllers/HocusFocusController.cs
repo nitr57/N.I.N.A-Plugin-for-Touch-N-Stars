@@ -1164,6 +1164,25 @@ public class HocusFocusController : WebApiController
         }
     }
 
+    private const string HocusFocusAutoFocuserContentId = "NINA.Joko.Plugins.HocusFocus.AutoFocus.HocusFocusVMFactory";
+
+    /// <summary>
+    /// Whether HocusFocus is the auto-focuser NINA runs AutoFocus with, as NINA's pluggable-behavior selector
+    /// resolves it (on pins it is forced whenever HocusFocus is loaded). False when the selector cannot be reached.
+    /// </summary>
+    private static bool IsHocusFocusActiveAutoFocuser()
+    {
+        var options = TouchNStars.Mediators?.Options;
+        var selector = options?.GetType().GetProperty("PluggableAutoFocusVMFactory")?.GetValue(options)
+            as NINA.Core.Interfaces.IPluggableBehaviorSelector<NINA.WPF.Base.Interfaces.IAutoFocusVMFactory>;
+        return selector?.GetBehavior()?.ContentId == HocusFocusAutoFocuserContentId;
+    }
+
+    /// <summary>
+    /// HocusFocus' AutoFocus panel: the chart (points with their HFR error bars, rejected outliers, focus-window
+    /// exclusions, the fitted curves, the final point with its σ(focus) error bar) and the metrics beside it.
+    /// Read from the current HocusFocusVM, so while a run is in progress (InProgress) it describes that run so far.
+    /// </summary>
     [Route(HttpVerbs.Get, "/hocusfocus/autofocus/last-run")]
     public object GetLastAutoFocusRun()
     {
@@ -1193,8 +1212,61 @@ public class HocusFocusController : WebApiController
                 };
             }
 
-            var lastReport = currentVM.GetType().GetProperty("LastReport")?.GetValue(currentVM);
-            if (lastReport == null)
+            // Everything below is read from the VM rather than from its LastReport: the VM is what HocusFocus' own AF
+            // panel draws, it is filled point by point while a run is in progress, and LastReport lacks the rejected
+            // and window-excluded points.
+            object Get(object obj, string name)
+            {
+                if (obj == null)
+                {
+                    return null;
+                }
+                var type = obj.GetType();
+                var property = type.GetProperty(name);
+                if (property != null)
+                {
+                    return property.GetValue(obj);
+                }
+                return type.GetField(name)?.GetValue(obj);
+            }
+            double GetDouble(object obj, string name) => Get(obj, name) is double d ? d : double.NaN;
+            // NaN is not a valid JSON number; HocusFocus uses it (and 0 / -1 for the HFRs and positions) for "unknown".
+            double? Num(double value) => double.IsFinite(value) ? value : null;
+            double? Positive(double value) => double.IsFinite(value) && value > 0 ? value : null;
+            // The plot series are filled on the AF engine's thread while a run is in progress.
+            List<object> Snapshot(object series)
+            {
+                if (series is not System.Collections.IEnumerable items)
+                {
+                    return new List<object>();
+                }
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    try
+                    {
+                        return items.Cast<object>().ToList();
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Modified while being copied; try again.
+                    }
+                }
+                return new List<object>();
+            }
+            string Describe(object enumValue)
+            {
+                if (enumValue == null)
+                {
+                    return null;
+                }
+                var field = enumValue.GetType().GetField(enumValue.ToString());
+                return field?.GetCustomAttribute<System.ComponentModel.DescriptionAttribute>()?.Description ?? enumValue.ToString();
+            }
+
+            var inProgress = Get(currentVM, "AutoFocusInProgress") as bool? ?? false;
+            var lastAutoFocusPoint = Get(currentVM, "LastAutoFocusPoint");
+            var timestamp = Get(lastAutoFocusPoint, "Timestamp") as DateTime? ?? default;
+            if (!inProgress && timestamp == default)
             {
                 HttpContext.Response.StatusCode = 404;
                 return new Dictionary<string, object>()
@@ -1204,35 +1276,206 @@ public class HocusFocusController : WebApiController
                 };
             }
 
-            object Get(object obj, string name) => obj?.GetType().GetProperty(name)?.GetValue(obj);
-            double GetDouble(object obj, string name) => Get(obj, name) is double d ? d : double.NaN;
-            int GetInt(object obj, string name) => Get(obj, name) is int i ? i : -1;
+            var method = Get(currentVM, "AutoFocusChartMethod")?.ToString() ?? "";
+            var curveFitting = Get(currentVM, "AutoFocusChartCurveFitting")?.ToString() ?? "";
+            var hyperbolicFitting = Get(currentVM, "HyperbolicFitting");
+            var quadraticFitting = Get(currentVM, "QuadraticFitting");
+            var trendlineFitting = Get(currentVM, "TrendlineFitting");
+            var gaussianFitting = Get(currentVM, "GaussianFitting");
 
-            var durationObj = Get(lastReport, "Duration");
-            var rSquaresObj = Get(lastReport, "RSquares");
-            var calcFocusPoint = Get(lastReport, "CalculatedFocusPoint");
+            // Which fits HocusFocus shows, as its AutoFocusFittingToVisibilityConverter decides: contrast detection
+            // draws only the Gaussian; star HFR draws the fits the curve-fitting setting names (TRENDHYPERBOLIC is
+            // the trend lines plus the hyperbola, and so on).
+            var contrastDetection = method == "CONTRASTDETECTION";
+            bool Shows(string fitting) => !contrastDetection && curveFitting.Contains(fitting);
+
+            // Points, flagged the way the chart marks them: red crosses for outliers the fit rejected, hollow
+            // rings for points outside the symmetric focus window.
+            HashSet<long> PositionsOf(object series) => Snapshot(series)
+                .Select(p => GetDouble(p, "X"))
+                .Where(double.IsFinite)
+                .Select(x => (long)Math.Round(x))
+                .ToHashSet();
+            var rejectedPositions = PositionsOf(Get(currentVM, "PlotRejectedFocusPoints"));
+            var excludedPositions = PositionsOf(Get(currentVM, "PlotWindowExcludedFocusPoints"));
+            var points = new List<Dictionary<string, object>>();
+            var xs = new List<double>();
+            foreach (var point in Snapshot(Get(currentVM, "FocusPoints")))
+            {
+                var x = GetDouble(point, "X");
+                var y = GetDouble(point, "Y");
+                if (!double.IsFinite(x) || !double.IsFinite(y))
+                {
+                    continue;
+                }
+                var position = (long)Math.Round(x);
+                xs.Add(x);
+                points.Add(new Dictionary<string, object>()
+                {
+                    { "Position", x },
+                    { "HFR", y },
+                    { "Error", Positive(GetDouble(point, "ErrorY")) },
+                    { "Rejected", rejectedPositions.Contains(position) },
+                    { "Excluded", excludedPositions.Contains(position) }
+                });
+            }
+
+            // The final point, with the horizontal σ(focus) error bar HocusFocus draws on it (the leave-one-out
+            // stability when σ(focus) is unavailable; no entry at all when neither exists).
+            var finalFocusPoint = Get(currentVM, "FinalFocusPoint");
+            var finalX = GetDouble(finalFocusPoint, "X");
+            var finalY = GetDouble(finalFocusPoint, "Y");
+            var finalWithError = Snapshot(Get(currentVM, "PlotFinalFocusPointWithError")).FirstOrDefault();
+            var focusError = Positive(GetDouble(finalWithError, "ErrorX"));
+            var minimumStdError = GetDouble(hyperbolicFitting, "MinimumStdError");
+            var hasFinalPoint = double.IsFinite(finalX) && finalX >= 0 && double.IsFinite(finalY);
+            if (hasFinalPoint)
+            {
+                xs.Add(finalX);
+            }
+
+            // Fitted curves are evaluated here with HocusFocus' own fit functions, over the points' span plus the
+            // 10% padding its chart axes use. Parsing the Expression text instead cannot work: each hyperbolic
+            // model (Symmetric, Uneven Blend, Tilted, Smooth Blend) formats a different formula.
+            var minX = xs.Count > 0 ? xs.Min() : double.NaN;
+            var maxX = xs.Count > 0 ? xs.Max() : double.NaN;
+            var padding = (maxX - minX) * 0.1;
+            var fromX = minX - padding;
+            var toX = maxX + padding;
+            List<double[]> Sample(Func<double, double> function, int count)
+            {
+                var samples = new List<double[]>();
+                if (function == null || !(toX > fromX))
+                {
+                    return samples;
+                }
+                for (var i = 0; i < count; i++)
+                {
+                    var x = fromX + (toX - fromX) * i / (count - 1);
+                    double y;
+                    try
+                    {
+                        y = function(x);
+                    }
+                    catch (Exception)
+                    {
+                        continue;
+                    }
+                    if (double.IsFinite(y))
+                    {
+                        samples.Add(new[] { x, y });
+                    }
+                }
+                return samples;
+            }
+            Dictionary<string, object> PointOf(object dataPoint)
+            {
+                var x = GetDouble(dataPoint, "X");
+                var y = GetDouble(dataPoint, "Y");
+                return double.IsFinite(x) && double.IsFinite(y)
+                    ? new Dictionary<string, object>() { { "Position", x }, { "Value", y } }
+                    : null;
+            }
+
+            var curves = new Dictionary<string, object>();
+            if (Shows("HYPERBOLIC") && hyperbolicFitting != null)
+            {
+                curves["Hyperbolic"] = new Dictionary<string, object>()
+                {
+                    { "Points", Sample(Get(hyperbolicFitting, "Fitting") as Func<double, double>, 100) },
+                    { "Minimum", PointOf(Get(hyperbolicFitting, "Minimum")) },
+                    { "RSquared", Num(GetDouble(hyperbolicFitting, "RSquared")) }
+                };
+            }
+            if (Shows("PARABOLIC") && quadraticFitting != null)
+            {
+                curves["Quadratic"] = new Dictionary<string, object>()
+                {
+                    { "Points", Sample(Get(quadraticFitting, "Fitting") as Func<double, double>, 100) },
+                    { "Minimum", PointOf(Get(quadraticFitting, "Minimum")) },
+                    { "RSquared", Num(GetDouble(quadraticFitting, "RSquared")) }
+                };
+            }
+            if (Shows("TREND") && trendlineFitting != null)
+            {
+                Func<double, double> Line(object trend)
+                {
+                    var slope = GetDouble(trend, "Slope");
+                    var offset = GetDouble(trend, "Offset");
+                    return trend == null ? null : x => slope * x + offset;
+                }
+                var leftTrend = Get(trendlineFitting, "LeftTrend");
+                var rightTrend = Get(trendlineFitting, "RightTrend");
+                curves["Trendlines"] = new Dictionary<string, object>()
+                {
+                    { "Left", Sample(Line(leftTrend), 2) },
+                    { "Right", Sample(Line(rightTrend), 2) },
+                    { "Intersection", PointOf(Get(trendlineFitting, "Intersection")) },
+                    { "LeftRSquared", Num(GetDouble(leftTrend, "RSquared")) },
+                    { "RightRSquared", Num(GetDouble(rightTrend, "RSquared")) }
+                };
+            }
+            if (contrastDetection && gaussianFitting != null)
+            {
+                curves["Gaussian"] = new Dictionary<string, object>()
+                {
+                    { "Points", Sample(Get(gaussianFitting, "Fitting") as Func<double, double>, 100) },
+                    { "Maximum", PointOf(Get(gaussianFitting, "Maximum")) }
+                };
+            }
+
+            var initialFocuserPosition = Get(currentVM, "InitialFocuserPosition") as int? ?? -1;
+            var finalFocuserPosition = Get(currentVM, "FinalFocuserPosition") as int? ?? -1;
+            var starCountMin = Get(currentVM, "AcceptedStarCountMin") as int? ?? -1;
+            var starCountMax = Get(currentVM, "AcceptedStarCountMax") as int? ?? -1;
+            var duration = Get(currentVM, "AutoFocusDuration") as TimeSpan? ?? TimeSpan.Zero;
+            var estimatedFinalHFR = GetDouble(Get(lastAutoFocusPoint, "Focuspoint"), "Y");
 
             HttpContext.Response.StatusCode = 200;
             return new Dictionary<string, object>()
             {
                 { "Success", true },
-                { "Timestamp",              Get(lastReport, "Timestamp") },
-                { "Filter",                 Get(lastReport, "Filter") },
-                { "Temperature",            GetDouble(lastReport, "Temperature") },
-                { "DurationSeconds",        durationObj is TimeSpan ts ? ts.TotalSeconds : double.NaN },
-                { "InitialFocuserPosition", GetInt(currentVM, "InitialFocuserPosition") },
-                { "FinalFocuserPosition",   GetInt(currentVM, "FinalFocuserPosition") },
-                { "InitialHFR",             GetDouble(currentVM, "InitialHFR") },
-                { "FinalHFR",               GetDouble(currentVM, "FinalHFR") },
-                { "EstimatedFinalHFR",      GetDouble(calcFocusPoint, "Value") },
-                { "Fitting",                Get(lastReport, "Fitting")?.ToString() },
-                { "RSquares", rSquaresObj == null ? null : new Dictionary<string, object>
+                // Clients show this HocusFocus view only while HocusFocus is the auto-focuser; otherwise the newest
+                // AF is NINA's own and this data is from an older run.
+                { "IsActiveAutoFocuser", IsHocusFocusActiveAutoFocuser() },
+                { "InProgress", inProgress },
+                { "Timestamp", timestamp == default ? null : timestamp },
+                { "Filter", Get(lastAutoFocusPoint, "Filter") as string },
+                { "Temperature", Num(GetDouble(lastAutoFocusPoint, "Temperature")) },
+                { "DurationSeconds", duration > TimeSpan.Zero ? duration.TotalSeconds : null },
+                { "InitialFocuserPosition", initialFocuserPosition >= 0 ? initialFocuserPosition : null },
+                { "FinalFocuserPosition", finalFocuserPosition >= 0 ? finalFocuserPosition : null },
+                { "InitialHFR", Positive(GetDouble(currentVM, "InitialHFR")) },
+                { "FinalHFR", Positive(GetDouble(currentVM, "FinalHFR")) },
+                { "EstimatedFinalHFR", Positive(estimatedFinalHFR) },
+                { "Method", method },
+                { "Fitting", contrastDetection ? "GAUSSIAN" : curveFitting },
+                { "RSquares", new Dictionary<string, object>()
                     {
-                        { "Hyperbolic", GetDouble(rSquaresObj, "Hyperbolic") },
-                        { "Quadratic",  GetDouble(rSquaresObj, "Quadratic") },
-                        { "LeftTrend",  GetDouble(rSquaresObj, "LeftTrend") },
-                        { "RightTrend", GetDouble(rSquaresObj, "RightTrend") }
+                        { "Hyperbolic", Num(GetDouble(hyperbolicFitting, "RSquared")) },
+                        { "Quadratic",  Num(GetDouble(quadraticFitting, "RSquared")) },
+                        { "LeftTrend",  Num(GetDouble(Get(trendlineFitting, "LeftTrend"), "RSquared")) },
+                        { "RightTrend", Num(GetDouble(Get(trendlineFitting, "RightTrend"), "RSquared")) }
                     }
+                },
+                { "HyperbolicMinimumStdError", Positive(minimumStdError) },
+                { "HyperbolicReducedChiSquared", Num(GetDouble(hyperbolicFitting, "ReducedChiSquared")) },
+                { "HyperbolicLeaveOneOutStdError", Positive(GetDouble(hyperbolicFitting, "LeaveOneOutStdError")) },
+                { "HyperbolicFitModel", Shows("HYPERBOLIC") ? Describe(Get(currentVM, "SelectedHyperbolicFitModel")) : null },
+                { "AcceptedStarCountMin", starCountMin >= 0 && starCountMax >= starCountMin ? starCountMin : null },
+                { "AcceptedStarCountMax", starCountMin >= 0 && starCountMax >= starCountMin ? starCountMax : null },
+                { "Points", points },
+                { "Curves", curves },
+                { "FinalFocusPoint", hasFinalPoint
+                    ? new Dictionary<string, object>()
+                    {
+                        { "Position", finalX },
+                        { "Value", finalY },
+                        { "Error", focusError },
+                        // Which estimate the error bar is: σ(focus), or the leave-one-out fallback.
+                        { "ErrorSource", focusError == null ? null : Positive(minimumStdError) != null ? "stdError" : "leaveOneOut" }
+                    }
+                    : null
                 },
             };
         }

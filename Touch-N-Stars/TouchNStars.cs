@@ -48,7 +48,8 @@ namespace TouchNStars {
         IFlatDeviceMediator flatDevice,
         ITwilightCalculator twilightCalculator,
         ISymbolBroker symbolBroker,
-        IFocuserMediator focuser) {
+        IFocuserMediator focuser,
+        IOptionsVM options) {
 
         public readonly IDeepSkyObjectSearchVM DeepSkyObjectSearchVM = DeepSkyObjectSearchVM;
         public readonly IImageDataFactory ImageDataFactory = ImageDataFactory;
@@ -67,6 +68,8 @@ namespace TouchNStars {
         public readonly ITwilightCalculator TwilightCalculator = twilightCalculator;
         public readonly ISymbolBroker SymbolBroker = symbolBroker;
         public readonly IFocuserMediator Focuser = focuser;
+        // Holds NINA's pluggable-behavior selectors, e.g. which auto-focuser runs AutoFocus.
+        public readonly IOptionsVM Options = options;
     }
 
     [Export(typeof(IPluginManifest))]
@@ -106,7 +109,8 @@ namespace TouchNStars {
                     IFlatDeviceMediator flatDeviceMediator,
                     ITwilightCalculator twilightCalculator,
                     ISymbolBroker symbolBroker,
-                    IFocuserMediator focuserMediator) {
+                    IFocuserMediator focuserMediator,
+                    IOptionsVM optionsVM) {
             if (Settings.Default.UpdateSettings) {
                 Settings.Default.Upgrade();
                 Settings.Default.UpdateSettings = false;
@@ -132,7 +136,8 @@ namespace TouchNStars {
                             flatDeviceMediator,
                             twilightCalculator,
                             symbolBroker,
-                            focuserMediator);
+                            focuserMediator,
+                            optionsVM);
 
             UpdateDefaultPortCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(() => {
                 Port = CachedPort;
