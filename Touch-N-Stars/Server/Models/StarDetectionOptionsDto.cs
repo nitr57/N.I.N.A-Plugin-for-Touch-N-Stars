@@ -57,5 +57,25 @@ namespace TouchNStars.Server.Models {
         public bool ExcludeSaturatedStarsFromHFR { get; set; }
         public bool UseOptimizedSettings { get; set; }
         public bool HasOptimizedSettings { get; set; }
+
+        /// <summary>
+        /// Software binning applied to the frame for star detection only (Bin1..Bin4). Added in HocusFocus v4.
+        /// </summary>
+        public string DetectionBinning { get; set; }
+
+        /// <summary>
+        /// HocusFocus' detection-binning recommendation, derived from the last measured in-focus HFR.
+        /// Read-only: the hint text, its longer reasoning, and whether HocusFocus wants it shown at all.
+        /// </summary>
+        public string DetectionBinningHint { get; set; }
+
+        public string DetectionBinningHintDetail { get; set; }
+        public bool DetectionBinningRecommendationVisible { get; set; }
+
+        /// <summary>
+        /// False while per-filter star detection is on: the options object is then an edit buffer for one
+        /// filter's snapshot rather than the global settings. Read-only here.
+        /// </summary>
+        public bool PersistToProfile { get; set; }
     }
 }

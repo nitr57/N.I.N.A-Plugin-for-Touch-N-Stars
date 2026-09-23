@@ -79,6 +79,12 @@ namespace TouchNStars.Server.Services {
                 dto.ExcludeSaturatedStarsFromHFR = GetPropertyValueAsType<bool>(starDetectionOptions, "ExcludeSaturatedStarsFromHFR", false);
                 dto.UseOptimizedSettings = GetPropertyValueAsType<bool>(starDetectionOptions, "UseOptimizedSettings", false);
                 dto.HasOptimizedSettings = GetPropertyValueAsType<bool>(starDetectionOptions, "HasOptimizedSettings", false);
+                dto.DetectionBinning = ConvertEnumToString(GetPropertyValue(starDetectionOptions, "DetectionBinning"));
+                dto.DetectionBinningHint = GetPropertyValueAsType<string>(starDetectionOptions, "DetectionBinningHint", "");
+                dto.DetectionBinningHintDetail = GetPropertyValueAsType<string>(starDetectionOptions, "DetectionBinningHintDetail", "");
+                dto.DetectionBinningRecommendationVisible = GetPropertyValueAsType<bool>(starDetectionOptions, "DetectionBinningRecommendationVisible", false);
+                // PersistToProfile is false while per-filter star detection owns the options object.
+                dto.PersistToProfile = GetPropertyValueAsType<bool>(starDetectionOptions, "PersistToProfile", true);
 
                 return dto;
             } catch (Exception ex) {
@@ -152,7 +158,8 @@ namespace TouchNStars.Server.Services {
                 SetPropertyValue(starDetectionOptions, "AdaptiveNoiseBlockSize", dto.AdaptiveNoiseBlockSize);
                 SetPropertyValue(starDetectionOptions, "ExcludeSaturatedStarsFromHFR", dto.ExcludeSaturatedStarsFromHFR);
                 SetPropertyValue(starDetectionOptions, "UseOptimizedSettings", dto.UseOptimizedSettings);
-                // HasOptimizedSettings is read-only (derived) — not set
+                SetPropertyValueFromString(starDetectionOptions, "DetectionBinning", dto.DetectionBinning);
+                // HasOptimizedSettings, the DetectionBinning hints and PersistToProfile are read-only — not set
 
                 return true;
             } catch (Exception ex) {

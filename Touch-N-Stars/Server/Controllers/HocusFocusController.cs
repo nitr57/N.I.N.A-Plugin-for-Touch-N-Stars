@@ -227,7 +227,9 @@ public class HocusFocusController : WebApiController
 
                                 // Generate curve points
                                 var step = (maxX - minX) / 20.0; // 20 points along the curve
-                                for (var x = minX; x <= maxX; x += step)
+                                // All points at one focuser position gives a zero step, and x += 0 never
+                                // reaches maxX: the request would spin forever on every poll.
+                                for (var x = minX; step > 0 && x <= maxX; x += step)
                                 {
                                     try
                                     {
@@ -439,6 +441,9 @@ public class HocusFocusController : WebApiController
             var autoFocusChartActivatedOnce = inspectorVMType.GetProperty("AutoFocusChartActivatedOnce")?.GetValue(inspectorVM);
             var fWHMContoursActive = inspectorVMType.GetProperty("FWHMContoursActive")?.GetValue(inspectorVM);
             var eccentricityVectorsActive = inspectorVMType.GetProperty("EccentricityVectorsActive")?.GetValue(inspectorVM);
+            // Whether the run's final exposure produced plot data (FWHM contour, eccentricity). Lets the client
+            // show those sections without fetching them first.
+            var exposureAnalysisActivatedOnce = inspectorVMType.GetProperty("ExposureAnalysisActivatedOnce")?.GetValue(inspectorVM);
 
             // Fetch command and get CanExecute state using cached method
             var runAFAnalysisCommand = inspectorVMType.GetProperty("RunAutoFocusAnalysisCommand")?.GetValue(inspectorVM);
@@ -463,7 +468,10 @@ public class HocusFocusController : WebApiController
                 { "AutoFocusChartActive", autoFocusChartActive ?? false },
                 { "AutoFocusChartActivatedOnce", autoFocusChartActivatedOnce ?? false },
                 { "FWHMContoursActive", fWHMContoursActive ?? false },
-                { "EccentricityVectorsActive", eccentricityVectorsActive ?? false }
+                { "EccentricityVectorsActive", eccentricityVectorsActive ?? false },
+                { "ExposureAnalysisActivatedOnce", exposureAnalysisActivatedOnce ?? false },
+                // Live runs are refused while a sequence runs; lets the client say so before the tap.
+                { "SequenceRunning", ImagingActivity.IsSequenceRunning() }
             };
         }
         catch (Exception ex)
@@ -483,6 +491,29 @@ public class HocusFocusController : WebApiController
     {
         try
         {
+            // A live run moves the focuser and takes exposures, so it must not start in the middle of a sequence.
+            if (ImagingActivity.IsSequenceRunning())
+            {
+                HttpContext.Response.StatusCode = 409;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", ImagingActivity.SequenceRunningMessage }
+                };
+            }
+
+            // The optimizer's live sweep drives the focuser too; the desktop wizard is modal, so the two never
+            // overlap there.
+            if (StarDetectionOptimizerSession.IsDrivingFocuser)
+            {
+                HttpContext.Response.StatusCode = 409;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "The star detection optimizer is running a live sweep. Let it finish or cancel it first: both would drive the focuser." }
+                };
+            }
+
             // Access HocusFocus InspectorVM via reflection to trigger detailed AutoFocus analysis
             var hocusFocusPluginType = Type.GetType("NINA.Joko.Plugins.HocusFocus.HocusFocusPlugin, NINA.Joko.Plugins.HocusFocus");
             if (hocusFocusPluginType == null)
@@ -1213,6 +1244,519 @@ public class HocusFocusController : WebApiController
             {
                 { "Success", false },
                 { "Error", $"Failed to read last AutoFocus run: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// The per-star sensor curve model (paraboloid fit) from the last Aberration Inspector run. HocusFocus only
+    /// produces it while InspectorOptions.SensorCurveModelEnabled is on, so ModelLoaded is false otherwise, and
+    /// before the first such run completes.
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/sensor-model")]
+    public object GetSensorModel()
+    {
+        try
+        {
+            var hocusFocusPluginType = Type.GetType("NINA.Joko.Plugins.HocusFocus.HocusFocusPlugin, NINA.Joko.Plugins.HocusFocus");
+            if (hocusFocusPluginType == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus plugin not loaded" }
+                };
+            }
+
+            var inspectorVM = hocusFocusPluginType.GetProperty("InspectorVM")?.GetValue(null);
+            if (inspectorVM == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus InspectorVM instance not available" }
+                };
+            }
+
+            object Get(object obj, string name) => obj?.GetType().GetProperty(name)?.GetValue(obj);
+            // The model leaves unfitted values as NaN, which is not a valid JSON number.
+            double? Num(object value) => value switch
+            {
+                double d when double.IsFinite(d) => d,
+                int i => i,
+                _ => null
+            };
+
+            var inspectorOptions = hocusFocusPluginType.GetProperty("InspectorOptions",
+                BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var sensorCurveModelEnabled = Get(inspectorOptions, "SensorCurveModelEnabled") as bool? ?? false;
+
+            var sensorModel = Get(inspectorVM, "SensorModel");
+            var modelLoaded = Get(sensorModel, "ModelLoaded") as bool? ?? false;
+            if (!modelLoaded)
+            {
+                return new Dictionary<string, object>()
+                {
+                    { "Success", true },
+                    { "ModelLoaded", false },
+                    { "SensorCurveModelEnabled", sensorCurveModelEnabled }
+                };
+            }
+
+            var result = Get(sensorModel, "SensorModelResult");
+            var model = Get(result, "Model");
+
+            // Same values, units and order as the Inspector pane's sensor model summary.
+            var summary = new Dictionary<string, object>()
+            {
+                { "StarsInModel",                       Num(Get(model, "StarsInModel")) },
+                { "GoodnessOfFit",                      Num(Get(model, "GoodnessOfFit")) },
+                { "RMSErrorMicrons",                    Num(Get(model, "RMSErrorMicrons")) },
+                { "TiltDegrees",                        Num(Get(Get(result, "Tilt"), "Degree")) },
+                { "TiltStdErrorDegrees",                Num(Get(Get(result, "TiltStdError"), "Degree")) },
+                { "CurvatureRadiusMillimeters",         Num(Get(result, "CurvatureRadiusMillimeters")) },
+                { "CurvatureRadiusStdErrorMillimeters", Num(Get(result, "CurvatureRadiusStdErrorMillimeters")) },
+                { "CurvatureEffectMicrons",             Num(Get(result, "CurvatureEffectMicrons")) },
+                { "TiltEffectMicrons",                  Num(Get(result, "TiltEffectMicrons")) },
+                { "SensorMeanPosition",                 Num(Get(result, "SensorMeanPosition")) },
+                { "AutoFocusMeanOffset",                Num(Get(result, "AutoFocusMeanOffset")) },
+                { "PixelSizeMicrons",                   Num(Get(result, "PixelSizeMicrons")) },
+                { "FocuserStepSizeMicrons",             Num(Get(result, "FocuserStepSizeMicrons")) },
+                { "FRatio",                             Num(Get(result, "FRatio")) },
+                { "CriticalFocusMicrons",               Num(Get(result, "CriticalFocusMicrons")) },
+                { "ReducedChiSquared",                  Num(Get(model, "ReducedChiSquared")) }
+            };
+
+            // HocusFocus' own verdict rows (fit quality, tilt, curvature, centering), each with an
+            // acceptable flag and the advice text the Inspector pane shows.
+            var analysisResults = new List<object>();
+            if (Get(result, "AnalysisResults") is System.Collections.IEnumerable rows)
+            {
+                foreach (var row in rows.Cast<object>().ToList())
+                {
+                    analysisResults.Add(new Dictionary<string, object>()
+                    {
+                        { "Name",       Get(row, "Name")?.ToString() },
+                        { "Value",      Get(row, "Value")?.ToString() },
+                        { "Acceptable", Get(row, "Acceptable") as bool? ?? false },
+                        { "Details",    Get(row, "Details")?.ToString() }
+                    });
+                }
+            }
+
+            var registrationReport = (Get(sensorModel, "RegistrationAndFitReport") as System.Collections.IEnumerable)?
+                .Cast<object>()
+                .Select(line => line?.ToString())
+                .ToList() ?? new List<string>();
+
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "ModelLoaded", true },
+                { "SensorCurveModelEnabled", sensorCurveModelEnabled },
+                { "Summary", summary },
+                { "AnalysisResults", analysisResults },
+                { "RegistrationAndFitReport", registrationReport }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to read sensor model: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// Per-cell star eccentricity across the frame, from the exposure HocusFocus analyzes at the end of an
+    /// Aberration Inspector run. Same grid and statistics as the Inspector's eccentricity vector plot
+    /// (InspectorVM.AnalyzeStarDetectionResult); the plot itself is WPF-only, so TNS draws it from these cells.
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/eccentricity")]
+    public object GetEccentricity()
+    {
+        try
+        {
+            var hocusFocusPluginType = Type.GetType("NINA.Joko.Plugins.HocusFocus.HocusFocusPlugin, NINA.Joko.Plugins.HocusFocus");
+            if (hocusFocusPluginType == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus plugin not loaded" }
+                };
+            }
+
+            var inspectorVM = hocusFocusPluginType.GetProperty("InspectorVM")?.GetValue(null);
+            if (inspectorVM == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus InspectorVM instance not available" }
+                };
+            }
+
+            // Fields too: Accord.Point (a star's Position) exposes X and Y as public fields, and a
+            // property-only lookup silently reads NaN, which bins every star into one corner cell.
+            object Get(object obj, string name) =>
+                obj?.GetType().GetProperty(name)?.GetValue(obj) ?? obj?.GetType().GetField(name)?.GetValue(obj);
+            double ToDouble(object value) => value == null ? double.NaN : Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+
+            var inspectorOptions = hocusFocusPluginType.GetProperty("InspectorOptions",
+                BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var colorMapEnabled = Get(inspectorOptions, "EccentricityColorMapEnabled") as bool? ?? true;
+
+            var result = Get(inspectorVM, "SnapshotAnalysisStarDetectionResult");
+            var imageSize = Get(result, "ImageSize");
+            var width = (int)ToDouble(Get(imageSize, "Width"));
+            var height = (int)ToDouble(Get(imageSize, "Height"));
+
+            // Only stars with a fitted PSF carry an eccentricity; HocusFocus hides the plot when there are none.
+            var stars = new List<(double X, double Y, double Eccentricity, double Theta)>();
+            if (Get(result, "StarList") is System.Collections.IEnumerable starList)
+            {
+                foreach (var star in starList.Cast<object>().ToList())
+                {
+                    var psf = Get(star, "PSF");
+                    if (psf == null)
+                    {
+                        continue;
+                    }
+                    var position = Get(star, "Position");
+                    stars.Add((ToDouble(Get(position, "X")), ToDouble(Get(position, "Y")),
+                        ToDouble(Get(psf, "Eccentricity")), ToDouble(Get(psf, "ThetaRadians"))));
+                }
+            }
+
+            // HocusFocus never clears the snapshot, only this flag (reset at the start of every run, set once
+            // its final exposure produced PSF-fitted stars). Without it a run whose final-exposure analysis
+            // failed would show the previous run's plot.
+            var exposureAnalyzed = Get(inspectorVM, "ExposureAnalysisActivatedOnce") as bool? ?? false;
+            if (!exposureAnalyzed || result == null || width <= 0 || height <= 0 || stars.Count == 0)
+            {
+                return new Dictionary<string, object>()
+                {
+                    { "Success", true },
+                    { "Available", false }
+                };
+            }
+
+            // Grid exactly as HocusFocus builds it: NumRegionsWide columns, square cells, odd row count.
+            var numRegionsWide = Math.Max(1, (int)ToDouble(Get(inspectorOptions, "NumRegionsWide")));
+            var regionSizePixels = Math.Max(1, width / numRegionsWide);
+            var numRegionsTall = Math.Max(1, height / regionSizePixels);
+            numRegionsTall += numRegionsTall % 2 == 0 ? 1 : 0;
+
+            var cellStars = new List<(double Eccentricity, double Theta)>[numRegionsWide, numRegionsTall];
+            for (var col = 0; col < numRegionsWide; ++col)
+            {
+                for (var row = 0; row < numRegionsTall; ++row)
+                {
+                    cellStars[col, row] = new List<(double, double)>();
+                }
+            }
+            foreach (var star in stars)
+            {
+                // A non-finite position would floor to 0 and pile into one corner cell; skip it.
+                if (double.IsNaN(star.Eccentricity) || !double.IsFinite(star.X) || !double.IsFinite(star.Y))
+                {
+                    continue;
+                }
+                // HocusFocus' bottom-up row (it plots with y up), flipped so rows count from the top and
+                // the client can draw in image orientation without flipping.
+                var bottomUpRow = (int)Math.Floor((height - star.Y - 1) / height * numRegionsTall);
+                var row = numRegionsTall - 1 - bottomUpRow;
+                var col = (int)Math.Floor(star.X / width * numRegionsWide);
+                cellStars[Math.Clamp(col, 0, numRegionsWide - 1), Math.Clamp(row, 0, numRegionsTall - 1)]
+                    .Add((star.Eccentricity, star.Theta));
+            }
+
+            var cells = new List<object>();
+            for (var row = 0; row < numRegionsTall; ++row)
+            {
+                for (var col = 0; col < numRegionsWide; ++col)
+                {
+                    var inCell = cellStars[col, row];
+                    if (inCell.Count == 0)
+                    {
+                        continue;
+                    }
+                    var sorted = inCell.Select(s => s.Eccentricity).OrderBy(e => e).ToList();
+                    var median = sorted.Count % 2 == 1
+                        ? sorted[sorted.Count / 2]
+                        : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2.0;
+                    // Orientation: mean PSF angle weighted by each star's eccentricity, as HocusFocus does,
+                    // so nearly round stars (whose angle is noise) barely count.
+                    var eccentricitySum = inCell.Sum(s => s.Eccentricity);
+                    var theta = eccentricitySum > 0
+                        ? inCell.Sum(s => s.Theta * s.Eccentricity) / eccentricitySum
+                        : 0.0;
+                    cells.Add(new Dictionary<string, object>()
+                    {
+                        { "Col", col },
+                        { "Row", row },
+                        { "Eccentricity", median },
+                        { "AngleDegrees", theta * 180.0 / Math.PI },
+                        { "StarCount", inCell.Count }
+                    });
+                }
+            }
+
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Available", true },
+                { "Columns", numRegionsWide },
+                { "Rows", numRegionsTall },
+                { "ImageWidth", width },
+                { "ImageHeight", height },
+                { "ColorMapEnabled", colorMapEnabled },
+                { "Cells", cells }
+            };
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to read eccentricity: {ex.Message}" }
+            };
+        }
+    }
+
+    /// <summary>
+    /// FWHM across the frame from the exposure HocusFocus analyzes at the end of an Aberration Inspector run:
+    /// the per-cell median FWHM plus the smooth surface HocusFocus' contour map draws through them. Mirrors
+    /// FWHMContourControl (WPF-only, not in the Linux build): same grid, same statistic, and the surface comes
+    /// from HocusFocus' own OrdinaryKrigingInterpolator so it is the identical fit.
+    /// </summary>
+    [Route(HttpVerbs.Get, "/hocusfocus/fwhm-contour")]
+    public object GetFwhmContour()
+    {
+        try
+        {
+            var hocusFocusPluginType = Type.GetType("NINA.Joko.Plugins.HocusFocus.HocusFocusPlugin, NINA.Joko.Plugins.HocusFocus");
+            if (hocusFocusPluginType == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus plugin not loaded" }
+                };
+            }
+
+            var inspectorVM = hocusFocusPluginType.GetProperty("InspectorVM")?.GetValue(null);
+            if (inspectorVM == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus InspectorVM instance not available" }
+                };
+            }
+
+            // Fields too: Accord.Point (a star's Position) exposes X and Y as public fields, and a
+            // property-only lookup silently reads NaN, which bins every star into one corner cell.
+            object Get(object obj, string name) =>
+                obj?.GetType().GetProperty(name)?.GetValue(obj) ?? obj?.GetType().GetField(name)?.GetValue(obj);
+            double ToDouble(object value) => value == null ? double.NaN : Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+            var unavailable = new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Available", false }
+            };
+
+            // Same gate as the eccentricity endpoint: HocusFocus never clears the snapshot, only this flag.
+            var exposureAnalyzed = Get(inspectorVM, "ExposureAnalysisActivatedOnce") as bool? ?? false;
+            var result = Get(inspectorVM, "SnapshotAnalysisStarDetectionResult");
+            if (!exposureAnalyzed || result == null)
+            {
+                return unavailable;
+            }
+
+            var inspectorOptions = hocusFocusPluginType.GetProperty("InspectorOptions",
+                BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var imageSize = Get(result, "ImageSize");
+            var width = (int)ToDouble(Get(imageSize, "Width"));
+            var height = (int)ToDouble(Get(imageSize, "Height"));
+            var numRegionsWide = (int)ToDouble(Get(inspectorOptions, "NumRegionsWide"));
+            if (width <= 0 || height <= 0 || numRegionsWide <= 1)
+            {
+                return unavailable;
+            }
+            var regionSizePixels = width / numRegionsWide;
+            if (regionSizePixels <= 0)
+            {
+                return unavailable;
+            }
+            var numRegionsTall = height / regionSizePixels;
+            numRegionsTall += numRegionsTall % 2 == 0 ? 1 : 0;
+            if (numRegionsTall <= 1)
+            {
+                return unavailable;
+            }
+
+            // Arcseconds when the pixel scale is known, pixels otherwise, as HocusFocus does.
+            var pixelScale = ToDouble(Get(result, "PixelScale"));
+            var useArcsecs = !double.IsNaN(pixelScale) && pixelScale > 0;
+            var fwhmProperty = useArcsecs ? "FWHMArcsecs" : "FWHMPixels";
+
+            // FWHMContourControl bins top-down (unlike the eccentricity plot), clamped to the grid.
+            var cellFwhms = new List<double>[numRegionsWide, numRegionsTall];
+            for (var col = 0; col < numRegionsWide; ++col)
+            {
+                for (var row = 0; row < numRegionsTall; ++row)
+                {
+                    cellFwhms[col, row] = new List<double>();
+                }
+            }
+            if (Get(result, "StarList") is System.Collections.IEnumerable starList)
+            {
+                foreach (var star in starList.Cast<object>().ToList())
+                {
+                    var psf = Get(star, "PSF");
+                    if (psf == null)
+                    {
+                        continue;
+                    }
+                    var fwhm = ToDouble(Get(psf, fwhmProperty));
+                    if (!double.IsFinite(fwhm))
+                    {
+                        continue;
+                    }
+                    var position = Get(star, "Position");
+                    var x = ToDouble(Get(position, "X"));
+                    var y = ToDouble(Get(position, "Y"));
+                    // A non-finite position would floor to 0 and pile into one corner cell; skip it.
+                    if (!double.IsFinite(x) || !double.IsFinite(y))
+                    {
+                        continue;
+                    }
+                    var row = Math.Clamp((int)Math.Floor(y / height * numRegionsTall), 0, numRegionsTall - 1);
+                    var col = Math.Clamp((int)Math.Floor(x / width * numRegionsWide), 0, numRegionsWide - 1);
+                    cellFwhms[col, row].Add(fwhm);
+                }
+            }
+
+            var samples = new List<(int Col, int Row, double Value, int StarCount)>();
+            for (var row = 0; row < numRegionsTall; ++row)
+            {
+                for (var col = 0; col < numRegionsWide; ++col)
+                {
+                    var values = cellFwhms[col, row];
+                    if (values.Count == 0)
+                    {
+                        continue;
+                    }
+                    var sorted = values.OrderBy(v => v).ToList();
+                    var median = sorted.Count % 2 == 1
+                        ? sorted[sorted.Count / 2]
+                        : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2.0;
+                    samples.Add((col, row, median, values.Count));
+                }
+            }
+            if (samples.Count == 0)
+            {
+                return unavailable;
+            }
+
+            // HocusFocus' kriging interpolator, reached by reflection like everything else here.
+            var hfAssembly = hocusFocusPluginType.Assembly;
+            var sampleType = hfAssembly.GetType("NINA.Joko.Plugins.HocusFocus.Utility.KrigingSample");
+            var krigingType = hfAssembly.GetType("NINA.Joko.Plugins.HocusFocus.Utility.OrdinaryKrigingInterpolator");
+            var createMethod = krigingType?.GetMethod("Create", BindingFlags.Public | BindingFlags.Static);
+            var gridMethod = krigingType?.GetMethod("InterpolateGrid", BindingFlags.Public | BindingFlags.Instance);
+            if (sampleType == null || createMethod == null || gridMethod == null)
+            {
+                HttpContext.Response.StatusCode = 503;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "HocusFocus OrdinaryKrigingInterpolator not found" }
+                };
+            }
+            var sampleList = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(sampleType));
+            foreach (var sample in samples)
+            {
+                sampleList.Add(Activator.CreateInstance(sampleType, (double)sample.Col, (double)sample.Row, sample.Value));
+            }
+            var createArgs = createMethod.GetParameters()
+                .Select((p, i) => i == 0 ? sampleList : p.DefaultValue)
+                .ToArray();
+            var interpolator = createMethod.Invoke(null, createArgs);
+
+            // HocusFocus samples 50 points per cell for a desktop window. About 100 across the frame is plenty
+            // once the client smooths between them (a 7-wide grid: 97 x 65, ~40 KB), and it keeps the payload
+            // small. The surface spans cell centre to cell centre, as there.
+            var upscalingFactor = Math.Clamp(96 / (numRegionsWide - 1), 4, 50);
+            var gridWidth = (numRegionsWide - 1) * upscalingFactor + 1;
+            var gridHeight = (numRegionsTall - 1) * upscalingFactor + 1;
+            var surface = (double[,])gridMethod.Invoke(interpolator,
+                new object[] { gridWidth, gridHeight, 0.0, (double)(numRegionsWide - 1), 0.0, (double)(numRegionsTall - 1) });
+
+            var rows = new List<double[]>(gridHeight);
+            var min = double.PositiveInfinity;
+            var max = double.NegativeInfinity;
+            for (var r = 0; r < gridHeight; ++r)
+            {
+                var line = new double[gridWidth];
+                for (var c = 0; c < gridWidth; ++c)
+                {
+                    var value = surface[r, c];
+                    line[c] = Math.Round(value, 3);
+                    if (double.IsFinite(value))
+                    {
+                        min = Math.Min(min, value);
+                        max = Math.Max(max, value);
+                    }
+                }
+                rows.Add(line);
+            }
+
+            return new Dictionary<string, object>()
+            {
+                { "Success", true },
+                { "Available", true },
+                { "Columns", numRegionsWide },
+                { "Rows", numRegionsTall },
+                { "Unit", useArcsecs ? "arcsec" : "px" },
+                { "SurfaceWidth", gridWidth },
+                { "SurfaceHeight", gridHeight },
+                { "Min", double.IsFinite(min) ? min : (double?)null },
+                { "Max", double.IsFinite(max) ? max : (double?)null },
+                { "Surface", rows },
+                { "Samples", samples.Select(sample => new Dictionary<string, object>()
+                    {
+                        { "Col", sample.Col },
+                        { "Row", sample.Row },
+                        { "Value", sample.Value },
+                        { "StarCount", sample.StarCount }
+                    }).ToList()
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            var inner = ex is TargetInvocationException tie && tie.InnerException != null ? tie.InnerException : ex;
+            Logger.Error(inner);
+            HttpContext.Response.StatusCode = 500;
+            return new Dictionary<string, object>()
+            {
+                { "Success", false },
+                { "Error", $"Failed to build FWHM contour: {inner.Message}" }
             };
         }
     }
