@@ -219,6 +219,8 @@ namespace TouchNStars {
             mdnsBroadcaster = null;
             Communicator.Dispose();
             Server.Controllers.PHD2Controller.CleanupPHD2Service();
+            // Close any open Wanderer ETA handles instead of leaving them to process exit
+            Server.Services.TilterService.Instance.Disconnect();
             return base.Teardown();
         }
 

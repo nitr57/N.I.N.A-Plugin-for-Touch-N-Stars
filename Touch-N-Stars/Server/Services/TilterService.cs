@@ -1,9 +1,9 @@
 using NINA.Core.Utility;
 using NINA.Plugins.TouchNStars.Tilter;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using Settings = TouchNStars.Properties.Settings;
 
 namespace TouchNStars.Server.Services;
@@ -18,8 +18,15 @@ public class TilterService
     private static TilterService _instance;
     private static readonly object _instanceLock = new object();
 
-    private Dictionary<int, TilterDeviceInfo> ConnectedDevices = new();
+    // Read by the 1 s status polling while connect/disconnect write it, from different requests.
+    private readonly ConcurrentDictionary<int, TilterDeviceInfo> ConnectedDevices = new();
     private const int MaxDevices = 32;
+
+    /// <summary>Screw ring radius of the Wanderer ETA, used when the device reports none.</summary>
+    private const double DefaultEtaRadius = 78.0;
+
+    /// <summary>Travel of each ETA actuator, in mm.</summary>
+    public const double EtaTravel = 1.2;
 
     /// <summary>
     /// Gets the singleton instance of TilterService
@@ -120,6 +127,8 @@ public class TilterService
         public float? RawPosition4 { get; set; }  // Raw calculated value before offsetting (4-screw manual tilters)
         public int ScrewCount { get; set; }       // Number of screws the positions above describe
         public string Message { get; set; }
+        public string ErrorCode { get; set; }     // "exceedsTravel" when the correction does not fit the ETA's travel
+        public double? RequiredTravel { get; set; } // Spread between the lowest and highest screw, in mm
     }
 
     /// <summary>
@@ -290,7 +299,7 @@ public class TilterService
             }
 
             // Remove from connected devices
-            ConnectedDevices.Remove(deviceId);
+            ConnectedDevices.TryRemove(deviceId, out _);
 
             Logger.Info($"TilterService: Successfully disconnected device {deviceId}");
             return true;
@@ -337,8 +346,9 @@ public class TilterService
             status.CurrentPosition2 = etaStatus.CurrentPosition2;
             status.CurrentPosition3 = etaStatus.CurrentPosition3;
 
-            // Use outer radius from device if available, otherwise use provided value
-            double radius = outerRadius ?? etaStatus.Radius;
+            // A caller-provided radius wins; otherwise the device's own, which is also what
+            // apply-tilt-plane calculates with, so the corners shown here match its screw targets.
+            double radius = outerRadius ?? (etaStatus.Radius > 0 ? etaStatus.Radius : DefaultEtaRadius);
 
             // Calculate image plane corner values
             CalculateImagePlaneCorners(status, radius);
@@ -349,55 +359,6 @@ public class TilterService
         }
 
         return status;
-    }
-
-    /// <summary>
-    /// Calculates the tilt (Z value) at any given point on the image plane
-    /// </summary>
-    public double GetTiltValueAtPoint(int deviceId, double cornerX, double cornerY, double? outerRadius = null)
-    {
-        try
-        {
-            // Manual tilter (device ID -1) is virtual - return 0
-            if (deviceId == -1)
-            {
-                Logger.Debug($"TilterService: Manual tilter (device {deviceId}) - returning tilt value 0");
-                return 0.0;
-            }
-
-            // Check if device is connected
-            if (!ConnectedDevices.ContainsKey(deviceId))
-            {
-                Logger.Error($"TilterService: Device {deviceId} is not connected");
-                return 0.0;
-            }
-
-            // Get current device status
-            var status = GetDeviceStatus(deviceId, outerRadius);
-
-            if (status == null)
-            {
-                Logger.Error($"TilterService: Failed to get status for device {deviceId}");
-                return 0.0;
-            }
-
-            // For this calculation we need the radius - use provided value or fetch from device
-            // If neither is available, we cannot calculate
-            double radius = outerRadius ?? 0.0;
-            if (radius <= 0)
-            {
-                Logger.Error($"TilterService: Outer radius not available for device {deviceId}");
-                return 0.0;
-            }
-
-            // Calculate tilt value at the specified point
-            return CalculateCornerValue(cornerX, cornerY, status.CurrentPosition1, status.CurrentPosition2, status.CurrentPosition3, radius);
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"TilterService: Error calculating tilt at point ({cornerX}, {cornerY}) for device {deviceId}: {ex.Message}");
-            return 0.0;
-        }
     }
 
     /// <summary>
@@ -470,39 +431,6 @@ public class TilterService
             Logger.Error($"TilterService: Error setting positions for device {deviceId}: {ex.Message}");
             return false;
         }
-    }
-
-    /// <summary>
-    /// Gets SDK version
-    /// </summary>
-    public string GetSDKVersion()
-    {
-        try
-        {
-            var versionBuilder = new StringBuilder(WandererSDK.WT_VERSION_LEN);
-            var result = WandererSDK.WTGetSDKVersion(versionBuilder);
-
-            if (result != WandererSDK.WTErrorType.Success)
-            {
-                Logger.Error($"TilterService: Failed to get SDK version: {result}");
-                return "Unknown";
-            }
-
-            return versionBuilder.ToString();
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"TilterService: Error getting SDK version: {ex.Message}");
-            return "Unknown";
-        }
-    }
-
-    /// <summary>
-    /// Gets list of currently connected devices
-    /// </summary>
-    public List<TilterDeviceInfo> GetConnectedDevices()
-    {
-        return ConnectedDevices.Values.ToList();
     }
 
     /// <summary>
@@ -867,6 +795,36 @@ public class TilterService
                 }
             }
 
+            if (!dontOffsetToZero)
+            {
+                // ETA hardware: every actuator must land inside 0..EtaTravel. Clamping one screw on its
+                // own would tip the plate somewhere else, so the whole set moves together instead
+                // (only backfocus changes), and a correction wider than the travel is refused.
+                double span = finals.Max() - finals.Min();
+                if (span > EtaTravel + 1e-9)
+                {
+                    Logger.Warning($"[CalculateActuatorPositions] Correction spans {span:F3} mm, more than the ETA's {EtaTravel} mm travel");
+                    return new ApplyTiltPlaneResultDTO
+                    {
+                        Success = false,
+                        ErrorCode = "exceedsTravel",
+                        RequiredTravel = Math.Round(span, 3),
+                        Message = $"The correction needs {span:F3} mm between the lowest and highest actuator, more than the {EtaTravel} mm the ETA can travel"
+                    };
+                }
+                double over = finals.Max() - EtaTravel;
+                double under = -finals.Min();
+                double fit = over > 0 ? -over : under > 0 ? under : 0;
+                if (fit != 0)
+                {
+                    for (int i = 0; i < screwCount; i++)
+                    {
+                        finals[i] += fit;
+                    }
+                    Logger.Info($"[CalculateActuatorPositions] Shifted by {fit:F6} mm to fit the ETA's travel");
+                }
+            }
+
             for (int i = 0; i < screwCount; i++)
             {
                 double value = finals[i];
@@ -882,8 +840,8 @@ public class TilterService
                 }
                 else
                 {
-                    // ETA hardware range
-                    value = Math.Max(0, Math.Min(1.2, value));
+                    // Already inside the travel; this only absorbs floating-point dust at the ends.
+                    value = Math.Clamp(value, 0, EtaTravel);
                 }
                 finals[i] = Math.Round(value, 6);
             }

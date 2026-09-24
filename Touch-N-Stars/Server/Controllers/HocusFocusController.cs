@@ -2479,10 +2479,20 @@ public class HocusFocusController : WebApiController
                 cornersArray.Add(cornerData);
             }
 
+            // The corner adjustments are focuser-step offsets. Which physical way that is depends on
+            // the focuser, so the client needs the direction to turn them into plate movement, and
+            // the step size to know whether the micron values exist at all (NaN without one).
+            var inspectorOptions = hocusFocusPluginType.GetProperty("InspectorOptions",
+                BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var effectiveMicrons = inspectorOptions?.GetType().GetProperty("EffectiveMicronsPerFocuserStep")?.GetValue(inspectorOptions) as double?;
+
             return new Dictionary<string, object>()
             {
                 { "Success", true },
-                { "tiltCornerMeasurements", cornersArray }
+                { "tiltCornerMeasurements", cornersArray },
+                { "focuserIncreasesTowardObjective",
+                    inspectorOptions?.GetType().GetProperty("FocuserIncreasesTowardObjective")?.GetValue(inspectorOptions) as bool? ?? false },
+                { "micronsPerFocuserStep", effectiveMicrons is double m && double.IsFinite(m) && m > 0 ? m : null }
             };
         }
         catch (Exception ex)
@@ -3665,8 +3675,8 @@ public class HocusFocusController : WebApiController
         try
         {
             var tilterService = TilterService.Instance;
-            // GetTilterStatus is only for real ETA devices which use 78.0mm outer radius
-            var status = tilterService.GetDeviceStatus(deviceId, 78.0);
+            // No radius passed: the device's own is used, the same one apply-tilt-plane calculates with.
+            var status = tilterService.GetDeviceStatus(deviceId);
 
             HttpContext.Response.StatusCode = 200;
             return new Dictionary<string, object>()
@@ -3766,6 +3776,20 @@ public class HocusFocusController : WebApiController
                 position3 = p3Val;
 
             var tilterService = TilterService.Instance;
+
+            // A new target while the actuators are still travelling would be taken mid-move. Refused
+            // here rather than only in the app, so a second client cannot slip one in either.
+            if (deviceId != -1 && tilterService.IsDeviceConnected(deviceId) && tilterService.GetDeviceStatus(deviceId).IsMoving)
+            {
+                HttpContext.Response.StatusCode = 409;
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", "The tilter is still moving" },
+                    { "ErrorCode", "moving" }
+                };
+            }
+
             bool success = tilterService.SetDevicePositions(deviceId, position1, position2, position3);
 
             HttpContext.Response.StatusCode = success ? 200 : 500;
@@ -4092,7 +4116,9 @@ public class HocusFocusController : WebApiController
                     return new Dictionary<string, object>()
                     {
                         { "Success", false },
-                        { "Error", result.Message }
+                        { "Error", result.Message },
+                        { "ErrorCode", result.ErrorCode },
+                        { "RequiredTravel", result.RequiredTravel }
                     };
                 }
 
