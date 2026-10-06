@@ -10,6 +10,24 @@ namespace TouchNStars.Server.Controllers;
 
 public partial class PHD2Controller
 {
+    [Route(HttpVerbs.Get, "/phd2/ai/guide-steps")]
+    public ApiResponse GetAIGuideSteps()
+    {
+        EnsurePHD2ServicesInitialized();
+        var settings = TouchNStars.Mediators.Profile.ActiveProfile.GuiderSettings;
+        return new ApiResponse { Success = true, StatusCode = 200, Type = "PHD2AIGraph",
+            Response = PHD2AIResponseData.ToPlain(phd2Service.GetAIGuideSteps(
+                settings.PHD2ServerUrl, (uint)settings.PHD2InstanceNumber, settings.PHD2HistorySize)) };
+    }
+
+    [Route(HttpVerbs.Post, "/phd2/ai/guide-steps/clear")]
+    public ApiResponse ClearAIGuideSteps()
+    {
+        EnsurePHD2ServicesInitialized();
+        phd2Service.ClearAIGuideSteps();
+        return new ApiResponse { Success = true, StatusCode = 200, Type = "PHD2AIGraph", Response = true };
+    }
+
     private async Task<ApiResponse> AIResponse(string method, bool readBody = false)
     {
         try

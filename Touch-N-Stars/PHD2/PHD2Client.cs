@@ -303,6 +303,7 @@ namespace TouchNStars.PHD2
 
             connection?.Close();
             connection = new PHD2Connection();
+            ClearAIGuideSteps();
 
             // Drop any responses left over from the previous connection and wake
             // any callers still waiting so they fail fast instead of timing out.
@@ -434,6 +435,7 @@ namespace TouchNStars.PHD2
 
         private void HandleEvent(JObject eventObj)
         {
+            RecordGraphEvent(eventObj);
             string eventType = (string)eventObj["Event"];
 
             switch (eventType)

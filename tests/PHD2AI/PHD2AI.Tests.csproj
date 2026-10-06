@@ -11,6 +11,7 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
     <Compile Include="../../Touch-N-Stars/PHD2/PHD2Client.cs" Link="PHD2Client.cs" />
     <Compile Include="../../Touch-N-Stars/PHD2/PHD2Client.AI.cs" Link="PHD2Client.AI.cs" />
+    <Compile Include="../../Touch-N-Stars/PHD2/PHD2Client.Graph.cs" Link="PHD2Client.Graph.cs" />
     <Compile Include="../../Touch-N-Stars/Server/Models/PHD2AIResponseData.cs" Link="PHD2AIResponseData.cs" />
   </ItemGroup>
 </Project>

@@ -1105,6 +1105,18 @@ models are preserved. Folder/file browsing continues to use the plugin's existin
 `/api/filesystem/browse` endpoint, not PHD2 RPC; PHD2 must be on the plugin host
 for browser-selected paths to identify the same files.
 
+`GET /api/phd2/ai/guide-steps` returns `{Supported, Steps}` from a bounded cache
+of native GuideStep events, including their AI mode/contribution and actual pulse
+fields. It does not send a mount RPC. Support is reported only for an AI-capable
+PHD2 connection matching NINA's configured PHD2 host and instance. Responses are
+limited to the configured graph history size (maximum 5000 samples).
+`POST /api/phd2/ai/guide-steps/clear` clears this cache without changing guiding.
+The frontend clears it together with the ordinary NINA graph. NINA history IDs
+are independent of PHD2 frame numbers, so the AI graph uses the complete cached
+event samples rather than attaching predictions to unrelated NINA graph IDs.
+Green RA markers require Active mode, a nonzero AI contribution and an actual,
+valid, unclipped RA guide pulse; Shadow predictions do not create markers.
+
 ---
 
 ## 🌟 Advanced Features
