@@ -28,6 +28,8 @@ public class PHD2AIClientTests
     [InlineData("ai_set_mode", "{\"mode\":\"enabled\"}")]
     [InlineData("ai_set_mode", "{}")]
     [InlineData("ai_select_model", "{\"path\":\"\"}")]
+    [InlineData("ai_set_storage_directory", "{\"path\":\"\"}")]
+    [InlineData("ai_set_storage_directory", "{}")]
     [InlineData("ai_train_model", "{}")]
     [InlineData("ai_start_training", "{\"duration_sec\":60,\"period_sec\":120}")]
     [InlineData("ai_start_training", "{\"period_sec\":10}")]
@@ -46,6 +48,7 @@ public class PHD2AIClientTests
     [InlineData("ai_set_mode", "{\"mode\":\"shadow\"}")]
     [InlineData("ai_set_prediction_gain", "{\"gain\":0.1}")]
     [InlineData("ai_select_model", "{\"path\":\"/home/pi/model.json\"}")]
+    [InlineData("ai_set_storage_directory", "{\"path\":\"/home/pi/Documents/PHD2\"}")]
     [InlineData("ai_cancel_training", "{}")]
     public async Task RequestsPreserveParametersAndMatchResponsesAmongEvents(string method, string json)
     {

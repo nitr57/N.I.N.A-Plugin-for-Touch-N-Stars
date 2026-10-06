@@ -1071,6 +1071,7 @@ means an unexpected backend failure. The frontend displays native explanations.
 | GET | `/status` | — | `ai_get_status` |
 | GET | `/validate` | — | `ai_validate_model` |
 | GET | `/models` | — | `ai_list_models` |
+| PUT | `/directory` | `{"path":"/home/pi/Documents/PHD2"}` | `ai_set_storage_directory` |
 | PUT | `/mode` | `{"mode":"disabled"}` (`shadow`, `active`) | `ai_set_mode` |
 | GET | `/gain` | — | `ai_get_prediction_gain` |
 | PUT | `/gain` | `{"gain":0.1}` | `ai_set_prediction_gain` |
@@ -1094,6 +1095,15 @@ Known-period recording must span at least two cycles; six cycles are preferable.
 Keep camera, optics, binning and profile unchanged while training. Native PHD2
 checks calibration, hardware fingerprint and correction limits. AI changes RA;
 DEC remains under its ordinary algorithm.
+
+Status also reports `storage_directory`, `default_storage_directory` and
+`model_directory`. The default root is the PHD2 user's Documents/PHD2 folder;
+instance/profile subfolders keep model libraries separate. The directory setter
+requires an existing readable/writable absolute folder, rejects changes during
+training or recording, and remembers the root per profile. Existing selected
+models are preserved. Folder/file browsing continues to use the plugin's existing
+`/api/filesystem/browse` endpoint, not PHD2 RPC; PHD2 must be on the plugin host
+for browser-selected paths to identify the same files.
 
 ---
 

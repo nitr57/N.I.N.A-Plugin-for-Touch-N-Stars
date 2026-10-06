@@ -67,6 +67,7 @@ async function until(check, timeout = 30000) {
   throw new Error('Timed out waiting for test state');
 }
 let guarded = false;
+let originalStorageDirectory = '';
 const report = { started: new Date().toISOString(), instance, base };
 try {
   const equipment = await rpc('get_current_equipment');
@@ -77,6 +78,26 @@ try {
   guarded = true;
   await http('POST', 'disconnect', {});
   await http('POST', 'connect', { instance, hostname: 'localhost' });
+  const initialAI = await http('GET', 'ai/status');
+  if (initialAI.storage_directory) {
+    originalStorageDirectory = initialAI.storage_directory;
+    const testDirectory = originalStorageDirectory + '/storage-test-' + Date.now();
+    const created = await fetch(base + '/api/filesystem/directory', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: testDirectory }), signal: AbortSignal.timeout(15000),
+    });
+    assert.equal(created.ok, true);
+    await http('PUT', 'ai/directory', { path: 'relative-folder' }, 409);
+    await http('PUT', 'ai/directory', { path: testDirectory + '/does-not-exist' }, 409);
+    const changed = await http('PUT', 'ai/directory', { path: testDirectory });
+    assert.equal(changed.storage_directory, testDirectory);
+    assert.ok(changed.model_directory.startsWith(testDirectory + '/instance-' + instance + '/'));
+    const listing = await fetch(base + '/api/filesystem/browse?path=' + encodeURIComponent(changed.model_directory));
+    assert.equal(listing.ok, true);
+    assert.equal((await listing.json()).currentPath, changed.model_directory);
+    report.storageDirectory = testDirectory;
+    console.log('Existing Touch-N-Stars file API and profile storage folder verified.');
+  }
   await http('PUT', 'ai/gain', { gain: 2 }, 400);
   await http('POST', 'ai/training/start', { duration_sec: '90', period_sec: 30 }, 400);
   await http('PUT', 'ai/mode', { mode: 'disabled' });
@@ -94,6 +115,8 @@ try {
   assert.equal((await http('POST', 'ai/training/cancel')).state, 'cancelled');
   await http('POST', 'ai/training/start', { duration_sec: 90, period_sec: 30 });
   await http('POST', 'ai/training/start', { duration_sec: 90, period_sec: 30 }, 409);
+  if (originalStorageDirectory)
+    await http('PUT', 'ai/directory', { path: originalStorageDirectory }, 409);
   await http('POST', 'ai/recording/start', { mode: 'passive', duration_sec: 60 }, 409);
   console.log('Recording ordinary guiding for 90 seconds...');
   const training = await until(async () => {
@@ -104,6 +127,10 @@ try {
   assert.ok(training.fit_frames >= 30);
   assert.ok(training.training_cycles >= 2);
   report.training = training;
+  if (report.storageDirectory) {
+    assert.ok(training.model_path.startsWith(report.storageDirectory + '/'));
+    assert.ok(training.recording_path.startsWith(report.storageDirectory + '/'));
+  }
   console.log('Native training complete:', training.fit_frames, 'frames');
   const status = await http('GET', 'ai/status');
   assert.equal(status.mode, 'disabled');
@@ -161,6 +188,8 @@ try {
     await rpc('stop_capture').catch(() => {});
     await until(async () => ['Stopped', 'Selected'].includes(await rpc('get_app_state')), 10000).catch(() => {});
     await rpc('set_connected', { connected: false }).catch(() => {});
+    if (originalStorageDirectory)
+      await http('PUT', 'ai/directory', { path: originalStorageDirectory }).catch(() => {});
     await http('POST', 'disconnect', {}).catch(() => {});
     await http('POST', 'connect', { instance: 1, hostname: 'localhost' }).catch(() => {});
   }

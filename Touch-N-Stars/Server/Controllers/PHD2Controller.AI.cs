@@ -44,6 +44,8 @@ public partial class PHD2Controller
     public Task<ApiResponse> ValidateAIModel() => AIResponse("ai_validate_model");
     [Route(HttpVerbs.Get, "/phd2/ai/models")]
     public Task<ApiResponse> GetAIModels() => AIResponse("ai_list_models");
+    [Route(HttpVerbs.Put, "/phd2/ai/directory")]
+    public Task<ApiResponse> SetAIDirectory() => AIResponse("ai_set_storage_directory", true);
     [Route(HttpVerbs.Put, "/phd2/ai/mode")]
     public Task<ApiResponse> SetAIMode() => AIResponse("ai_set_mode", true);
     [Route(HttpVerbs.Get, "/phd2/ai/gain")]

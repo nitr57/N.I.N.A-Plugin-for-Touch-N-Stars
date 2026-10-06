@@ -12,6 +12,7 @@ namespace TouchNStars.PHD2
             ["ai_get_status"] = [],
             ["ai_validate_model"] = [],
             ["ai_list_models"] = [],
+            ["ai_set_storage_directory"] = ["path"],
             ["ai_get_training_status"] = [],
             ["ai_cancel_training"] = [],
             ["ai_unload_model"] = [],
