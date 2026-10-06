@@ -24,10 +24,26 @@
     <PackageReference Condition="!$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))" Include="NINA.Plugin" Version="3.1.2.9001" />
     <PackageReference Condition="!$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))" Include="NINA.WPF.Base" Version="3.1.2.9001" />
   </ItemGroup>
-  <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
+  <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux))) and '$(PinsReferenceDirectory)' == ''">
     <ProjectReference Include="..\..\..\NINA.Plugin\NINA.Plugin.csproj" />
     <ProjectReference Include="..\..\..\System.Windows.Compat\System.Windows.Compat.csproj" />
     <PackageReference Include="System.Drawing.Common" Version="*" ExcludeAssets="all" />
+  </ItemGroup>
+  <!-- Build against the installed PINS image without rebuilding NINA itself. -->
+  <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux))) and '$(PinsReferenceDirectory)' != ''">
+    <Reference Include="$(PinsReferenceDirectory)/NINA*.dll">
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="$(PinsReferenceDirectory)/System.Windows*.dll">
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="$(PinsReferenceDirectory)/Presentation*.dll">
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="$(PinsReferenceDirectory)/CommunityToolkit.Mvvm.dll;$(PinsReferenceDirectory)/OxyPlot.dll;$(PinsReferenceDirectory)/System.Configuration.ConfigurationManager.dll;$(PinsReferenceDirectory)/Nito.Mvvm.Async.dll;$(PinsReferenceDirectory)/System.IO.Ports.dll">
+      <Private>false</Private>
+    </Reference>
+    <PackageReference Include="System.ComponentModel.Composition" Version="10.0.0" />
   </ItemGroup>
   <ItemGroup>
     <Compile Update="Properties\Settings.Designer.cs">
@@ -60,7 +76,7 @@
       DestinationFiles="@(WindowsPluginDeployFiles->'$(WindowsPluginDeployDir)\%(RecursiveDir)%(Filename)%(Extension)')"
       SkipUnchangedFiles="true" />
   </Target>
-  <Target Name="PostBuildLinux" AfterTargets="PostBuildEvent" Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
+  <Target Name="PostBuildLinux" AfterTargets="PostBuildEvent" Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux))) and '$(SkipPluginDeploy)' != 'true'">
     <Exec Command="mkdir -p $HOME/.local/share/NINA/Plugins/3.0.0/Touch\ N\ Stars" />
     <Exec Command="cp $(TargetPath) $HOME/.local/share/NINA/Plugins/3.0.0/Touch\ N\ Stars/" />
     <Exec Command="cp $(TargetDir)Common.Logging.dll $HOME/.local/share/NINA/Plugins/3.0.0/Touch\ N\ Stars/" />

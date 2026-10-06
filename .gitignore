@@ -101,3 +101,5 @@ Accord.dll.config
 *.zip
 .vscode/tasks.json
 Touch-N-Stars/.vscode/tasks.json
+/scripts/ai-pi-test-result.json
+/scripts/skysimulator-camera-test.jpg

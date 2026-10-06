@@ -16,7 +16,7 @@ namespace TouchNStars.Server.Controllers;
 /// <summary>
 /// API Controller for PHD2 guiding integration
 /// </summary>
-public class PHD2Controller : WebApiController
+public partial class PHD2Controller : WebApiController
 {
     private static PHD2Service phd2Service;
     private static PHD2ImageService phd2ImageService;

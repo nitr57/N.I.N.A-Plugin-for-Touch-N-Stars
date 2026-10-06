@@ -8,7 +8,7 @@ using TouchNStars.PHD2;
 
 namespace TouchNStars.Server.Services
 {
-    public class PHD2Service : IDisposable
+    public partial class PHD2Service : IDisposable
     {
         private PHD2Client client;
         private readonly object lockObject = new object();

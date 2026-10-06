@@ -236,7 +236,7 @@ namespace TouchNStars.PHD2
         }
     }
 
-    public class PHD2Client : IDisposable
+    public partial class PHD2Client : IDisposable
     {
         private readonly string hostname;
         private readonly uint instance;
@@ -475,6 +475,7 @@ namespace TouchNStars.PHD2
                     break;
 
                 case "LoopingExposures":
+                    AppState = "Looping";
                     // PHD2 includes SNR/HFD/StarMass in LoopingExposures when a star is found
                     if (eventObj["StarMass"] != null && CurrentStar != null)
                     {
@@ -485,6 +486,7 @@ namespace TouchNStars.PHD2
                     }
                     break;
 
+                case "LoopingExposuresStopped":
                 case "GuidingStopped":
                     AppState = "Stopped";
                     break;
