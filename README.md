@@ -17,3 +17,11 @@ Sollte der Ordner nicht vorhanden sein, bitte vorher erstellen.
   Der Port der API muss auf 1888 eingestellt sein und die V2 muss aktiv sein.
   Zusätzlich muss "Use Access-Control-Allow-Origin Header" aktiv sein.
 - Für das Three Point Polar Alignment wird die Version 2.2.2.0 oder neuer benötigt.
+
+### PHD2-KI-Guiding und PINS-Builds
+
+Die [bestehende PHD2-API-Dokumentation](PHD2_API_README.md#native-ai-guiding)
+beschreibt KI-Status, Modelle, Training und Betriebsmodi. Training und Vorhersage
+laufen direkt in PHD2; Windows NINA und PINS verwenden dieselbe Plugin-API.
+Linux-Builds gegen die Assemblies des Pi-Images und Simulatorprüfungen sind in
+der [englischen README](README_en.md#phd2-ai-guiding-and-pins-builds) beschrieben.
