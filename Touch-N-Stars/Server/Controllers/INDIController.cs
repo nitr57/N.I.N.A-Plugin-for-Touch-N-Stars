@@ -159,7 +159,7 @@ public class INDIController : WebApiController
     {
         try
         {
-            if (NativeOnStepXMount() is { } onStepX)
+            if (NativeOnStepXMount(device) is { } onStepX)
             {
                 HttpContext.Response.StatusCode = 200;
                 return new ApiResponse { Success = true, Response = OnStepXSlewRates(onStepX), StatusCode = 200, Type = "INDIMountSlewRates" };
@@ -198,7 +198,7 @@ public class INDIController : WebApiController
             var body = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
             var device = body != null && body.TryGetValue("device", out var d) ? d?.ToString() : null;
 
-            if (NativeOnStepXMount() is { } onStepX)
+            if (NativeOnStepXMount(device) is { } onStepX)
             {
                 if (body == null || !body.TryGetValue("index", out var onStepXIndexObj)
                     || !int.TryParse(onStepXIndexObj?.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var onStepXIndex))
@@ -209,7 +209,14 @@ public class INDIController : WebApiController
                 {
                     return ErrorResponse($"Slew rate index must be 0-{onStepX.MoveRatesDegreesPerSecond.Count - 1}", 400);
                 }
-                onStepX.SelectMoveRate(onStepXIndex);
+                try
+                {
+                    onStepX.SelectMoveRate(onStepXIndex);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ErrorResponse(ex.Message, 400);
+                }
                 HttpContext.Response.StatusCode = 200;
                 return new ApiResponse { Success = true, Response = new { device = onStepX.DisplayName, index = onStepXIndex }, StatusCode = 200, Type = "INDIMountSlewRate" };
             }
@@ -258,10 +265,14 @@ public class INDIController : WebApiController
 
     /// <summary>
     /// The mount connected in NINA when it is pins' native OnStepX driver rather than an INDI mount. It has OnStep's ten
-    /// move rates, offered with the same names and indices INDI's LX200_OnStep uses, so the client is unchanged.
+    /// move rates, offered with the same names and indices INDI's LX200_OnStep uses, so the client is unchanged. A request
+    /// naming another device is meant for an INDI mount.
     /// </summary>
-    internal static OnStepXTelescope NativeOnStepXMount()
-        => TouchNStars.Mediators?.Telescope?.GetDevice() as OnStepXTelescope is { Connected: true } mount ? mount : null;
+    internal static OnStepXTelescope NativeOnStepXMount(string device = null)
+        => TouchNStars.Mediators?.Telescope?.GetDevice() is OnStepXTelescope { Connected: true } mount
+            && (string.IsNullOrWhiteSpace(device) || device == mount.DisplayName || device == mount.Name)
+            ? mount
+            : null;
 
     private static SlewRateCapability OnStepXSlewRates(OnStepXTelescope mount)
     {

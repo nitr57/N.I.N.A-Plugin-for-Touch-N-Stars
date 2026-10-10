@@ -49,7 +49,7 @@ public class MountControlSocket : WebSocketModule
             var move = MountMover();
             if (move == null)
             {
-                response = Error("No INDI mount is currently connected");
+                response = Error("No mount is currently connected");
             }
             else
             {
@@ -100,6 +100,12 @@ public class MountControlSocket : WebSocketModule
                 move(TelescopeAxes.Primary, -primary);
                 break;
             case "stop":
+                lock (_lock)
+                {
+                    // a pending dead-man stop has nothing left to do
+                    _lastMoveAt = DateTime.UtcNow;
+                    _lastDirection = string.Empty;
+                }
                 StopAll(move);
                 return new ApiResponse { Success = true, Response = "Stopped Move", StatusCode = 200, Type = "MountControl" };
             default:

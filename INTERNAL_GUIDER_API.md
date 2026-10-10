@@ -49,7 +49,7 @@ The guide camera is the one in the guide camera slot of pins' equipment: choose 
 
 | Method | Route | Parameters | Response |
 |---|---|---|---|
-| GET | `/status` | | `{ available, connected, deviceId, deviceName, isNative, reason, status }`, always 200 so it can be polled. `status` is the `AdvancedGuiderStatus` (with the live coaching `hints` and `coachRunning`, and `decDrift: { direction, driftArcsecPerMin, safetyValveOpen }` in Dec guide mode Drift, else `null`), `null` unless a internal guider is connected. `status.timing` is the guide loop's timing, `null` before the first cycle: `{ fps, cycles, cycleMs, exposureMs, cameraMs, processingMs, frameToPulseMs, pulseMs, otherMs }` as medians over the last `cycles` (up to 20) cycles, and the last cycle in `lastCycleMs`, `lastCameraMs`, `lastProcessingMs`, `lastFrameToPulseMs`, `lastPulseMs`, `lastOtherMs`; see below. |
+| GET | `/status` | | `{ available, connected, deviceId, deviceName, isNative, reason, status }`, always 200 so it can be polled. `status` is the `AdvancedGuiderStatus` (with the live coaching `hints` and `coachRunning`, and `decDrift: { direction, driftArcsecPerMin, safetyValveOpen }` in Dec guide mode Drift, else `null`), `null` unless a internal guider is connected. `status.timing` is the guide loop's timing, `null` before the first cycle and while the loop does not run: `{ fps, cycles, cycleMs, exposureMs, cameraMs, processingMs, frameToPulseMs, pulseMs, otherMs }` as medians over the last `cycles` (up to 20) cycles, and the last cycle in `lastCycleMs`, `lastCameraMs`, `lastProcessingMs`, `lastFrameToPulseMs`, `lastPulseMs`, `lastOtherMs`; see below. |
 | GET | `/steps` | `max` (400, 1..5000) | `AdvancedGuideStep[]`, oldest first. |
 | GET | `/alerts` | `max` (100, 1..1000) | `AdvancedGuiderAlert[]`, oldest first. |
 | GET | `/calibration` | | `AdvancedGuiderCalibration` or `null`. |
@@ -60,7 +60,9 @@ The guide camera is the one in the guide camera slot of pins' equipment: choose 
 
 ### Timing
 
-A cycle runs from the start of one capture to the start of the next; `fps` is 1000 / median `cycleMs`.
+A cycle runs from the start of one capture to the start of the next; `fps` is 1000 / median `cycleMs`. `exposureMs`,
+`cameraMs`, `processingMs`, `pulseMs` and `otherMs` add up to the cycle; `frameToPulseMs` overlaps them. `timing` is
+`null` while the guide loop does not run.
 
 | Field | Part of the cycle |
 |---|---|
@@ -69,7 +71,7 @@ A cycle runs from the start of one capture to the start of the next; `fps` is 10
 | `processingMs` | Frame arrived to frame processed (stars, algorithms). |
 | `frameToPulseMs` | Frame arrived to the first pulse handed to the guide output, over cycles with pulses (`null` without). The command still has to reach the mount, about 9 ms on a 9600 baud serial line. |
 | `pulseMs` | Pulses handed over to the output reporting them done, over cycles with pulses. With pins' native OnStepX driver "done" means the controller no longer reports a pulse. |
-| `otherMs` | The rest: events, logs, the mount check before the next capture. |
+| `otherMs` | The rest: between processing and the pulses, then events, logs and the mount check before the next capture. |
 
 ## Guiding actions
 
