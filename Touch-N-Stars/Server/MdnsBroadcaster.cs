@@ -14,6 +14,7 @@ internal sealed class MdnsBroadcaster : IDisposable
     private readonly string serviceType;
     private readonly object syncRoot = new();
 
+    private readonly AvahiServicePublisher avahiPublisher = new();
     private MulticastService multicastService;
     private ServiceDiscovery serviceDiscovery;
     private ServiceProfile serviceProfile;
@@ -38,18 +39,16 @@ internal sealed class MdnsBroadcaster : IDisposable
 
         lock (syncRoot)
         {
+            if (OperatingSystem.IsLinux())
+            {
+                // Avahi owns host/address records and UDP 5353 on Linux.
+                avahiPublisher.StartOrUpdate(instanceName, serviceType, port, txtProperties);
+                return;
+            }
+
             EnsureStarted();
             var addresses = address != null ? new[] { address } : null;
-            // Avahi owns the Linux host identity. Marking the profile as shared
-            // lets the plugin keep publishing its dynamic service and port
-            // without competing with Avahi for the same host records.
-            bool sharedProfile = OperatingSystem.IsLinux();
-            var profile = new ServiceProfile(
-                instanceName,
-                serviceType,
-                (ushort)port,
-                addresses,
-                sharedProfile);
+            var profile = new ServiceProfile(instanceName, serviceType, (ushort)port, addresses);
             if (txtProperties != null)
             {
                 foreach (var pair in txtProperties)
@@ -68,6 +67,7 @@ internal sealed class MdnsBroadcaster : IDisposable
     {
         lock (syncRoot)
         {
+            avahiPublisher.Stop();
             if (!isRunning)
             {
                 return;
