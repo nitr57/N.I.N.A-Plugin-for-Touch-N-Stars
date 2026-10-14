@@ -35,13 +35,16 @@ public sealed class SafetyWatchdog
     private readonly IClock clock;
     private readonly Func<double> radius;
     private readonly Func<double> latitude;
+    private readonly Func<double> sunSetAltitude;
     private MountSnapshot last;
     private int ownMotion;
     private DateTime lastOwnMotionEnd = DateTime.MinValue;
 
     /// <param name="latitudeDegrees">The site latitude; a Sun below the horizon there is no hazard.</param>
-    public SafetyWatchdog(IConeMount mount, ISunProvider sun, IClock clock, Func<double> radiusDegrees, Func<double> latitudeDegrees)
+    /// <param name="sunSetAltitudeDegrees">Below this altitude the Sun is no hazard (<see cref="LimitSet.SunSetAltitudeDegrees"/>).</param>
+    public SafetyWatchdog(IConeMount mount, ISunProvider sun, IClock clock, Func<double> radiusDegrees, Func<double> latitudeDegrees, Func<double> sunSetAltitudeDegrees = null)
     {
+        sunSetAltitude = sunSetAltitudeDegrees ?? (() => LimitValidator.SunSetAltitudeDegrees);
         this.mount = mount;
         this.sun = sun;
         this.clock = clock;
@@ -112,7 +115,7 @@ public sealed class SafetyWatchdog
         HaDec sunNow = sun.SunAt(clock.UtcNow);
         double separation = Spherical.SeparationDegrees(now.HourAngleHours, now.DeclinationDegrees, sunNow.HourAngle, sunNow.Declination);
         double r = radius();
-        bool up = LimitValidator.SunUp(sunNow, latitude());
+        bool up = LimitValidator.SunUp(sunNow, latitude(), sunSetAltitude());
         Sun = new SunWatchStatus
         {
             SeparationDegrees = separation,

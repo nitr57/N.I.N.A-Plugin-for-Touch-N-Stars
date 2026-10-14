@@ -100,6 +100,7 @@ public sealed class ConeErrorService
     private AutoMeasurementSession auto;
     private ManualFlipSession manual;
     private bool starting;
+    private bool abortWhileStarting;
 
     public ConeErrorService(Func<IConeEnvironment> environment, ConeErrorStore store, bool backgroundLoops = true)
     {
@@ -137,10 +138,18 @@ public sealed class ConeErrorService
     public ConeErrorSettings PatchSettings(string json)
     {
         ConeErrorSettings current = Store.LoadSettings();
-        List<string> verified = current.VerifiedPierLabels;
+        // a copy: PopulateObject would append a sent list to the stored one in place
+        List<string> verified = current.VerifiedPierLabels.ToList();
         if (!string.IsNullOrWhiteSpace(json))
         {
-            Newtonsoft.Json.JsonConvert.PopulateObject(json, current);
+            try
+            {
+                Newtonsoft.Json.JsonConvert.PopulateObject(json, current);
+            }
+            catch (Newtonsoft.Json.JsonException ex)
+            {
+                throw new ConeErrorException("BadRequest", $"The settings are not valid: {ex.Message}");
+            }
         }
 
         current.VerifiedPierLabels = verified;
@@ -404,7 +413,9 @@ public sealed class ConeErrorService
         MountPastMeridianEastDegrees = mount?.PastMeridianEastDegrees,
         MountPastMeridianWestDegrees = mount?.PastMeridianWestDegrees,
         MountSource = mount?.Source,
-        SunExclusionDegrees = Math.Max(settings.SunExclusionDegrees, ConeErrorSettings.MinSunExclusionDegrees)
+        SunExclusionDegrees = Math.Max(settings.SunExclusionDegrees, ConeErrorSettings.MinSunExclusionDegrees),
+        // a pointing below the horizon (a dipped horizon from a height) can see a Sun below it too
+        SunSetAltitudeDegrees = Math.Min(LimitValidator.SunSetAltitudeDegrees, minAltitude - 2.0)
     };
 
     /// <summary>Starts a confirmed plan after planning it again with the current time (the sky has moved since).</summary>
@@ -574,6 +585,15 @@ public sealed class ConeErrorService
             end.ContinueWith(t => Logger.Error($"ConeError: ending the daytime check failed: {t.Exception}"), TaskContinuationOptions.OnlyOnFaulted);
         }
 
+        lock (sync)
+        {
+            if (starting)
+            {
+                // the daytime check is just beginning: it is ended as soon as it has begun
+                abortWhileStarting = true;
+            }
+        }
+
         if ((a == null || a.Finished) && (m == null || m.Finished))
         {
             // nothing of ours runs, but the user asked the mount to stop
@@ -639,9 +659,10 @@ public sealed class ConeErrorService
                 m = manual;
             }
 
+            // long enough for a running move to end (up to 15 s) and the INDI confirmation (up to 10 s)
             a?.Abort();
-            a?.Completion.Wait(TimeSpan.FromSeconds(5));
-            m?.AbortAsync().Wait(TimeSpan.FromSeconds(5));
+            a?.Completion.Wait(TimeSpan.FromSeconds(30));
+            m?.AbortAsync().Wait(TimeSpan.FromSeconds(30));
         }
         catch (Exception ex)
         {
@@ -693,8 +714,10 @@ public sealed class ConeErrorService
             }
 
             starting = true;
+            abortWhileStarting = false;
         }
 
+        bool aborted;
         try
         {
             // only a session that has begun is kept; a failed start leaves nothing behind
@@ -710,7 +733,15 @@ public sealed class ConeErrorService
             lock (sync)
             {
                 starting = false;
+                aborted = abortWhileStarting;
+                abortWhileStarting = false;
             }
+        }
+
+        if (aborted)
+        {
+            session.AbortAsync().Wait(TimeSpan.FromSeconds(30));
+            throw new ConeErrorException("Aborted", "Aborted while the daytime check was starting; tracking was restored.");
         }
 
         return session.GetStatus();

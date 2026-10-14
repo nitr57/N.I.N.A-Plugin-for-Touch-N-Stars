@@ -92,6 +92,9 @@ public sealed class ManualFlipSession
 
     public const int MaxCorrections = 3;
 
+    /// <summary>The counterweight question is only asked this close to the meridian, hours.</summary>
+    public const double MaxPierLabelCheckHourAngle = 4.0;
+
     /// <summary>A change of the pointing this large while no own move runs is a move or sync from elsewhere, degrees.</summary>
     public const double ExternalMoveDegrees = 2.0;
 
@@ -136,6 +139,7 @@ public sealed class ManualFlipSession
     private bool completed;
     private bool pierLabelsVerified;
     private bool pierLabelsInverted;
+    private bool pierLabelsAnswered;
     private (double Ha, double Dec, PierSideLabel? Side)? reference;
     private TaskCompletionSource moveDone;
     private CancellationTokenSource moveCts;
@@ -161,7 +165,7 @@ public sealed class ManualFlipSession
         this.store = store;
         this.options = options;
         this.backgroundLoop = backgroundLoop;
-        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees);
+        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees, () => options.Limits.SunSetAltitudeDegrees);
         watchdog.SunTooClose += OnSunTooClose;
         // the user re-centres with the jog pad: slews from elsewhere are expected here
         watchdog.DetectExternalSlews = false;
@@ -221,7 +225,9 @@ public sealed class ManualFlipSession
 
         if (snap.Tracking && !mount.SetTracking(false))
         {
-            Logger.Warning("ConeError: the mount refused to turn tracking off");
+            // the check needs a pointing fixed to the ground; nothing was changed, so nothing to restore
+            store.ClearJournal();
+            throw new ConeErrorException("TrackingNotOff", "The mount did not turn tracking off, which the daytime check needs.");
         }
 
         SetPhase(SessionPhase.Ready, "Aim at a distant landmark, then capture the position.");
@@ -543,8 +549,25 @@ public sealed class ManualFlipSession
         {
             SetOverride(false);
             KeepTrackingOff();
+            MountSnapshot after = null;
+            try
+            {
+                after = mount.Snapshot();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"ConeError: reading the mount after a move failed: {ex.Message}");
+            }
+
             lock (sync)
             {
+                // a stopped or failed move leaves the mount somewhere along the way: that is our own
+                // move, not one from elsewhere, so the captured landmark stays valid
+                if (!ended && after != null && after.Connected)
+                {
+                    reference = (after.HourAngleHours, after.DeclinationDegrees, after.Side);
+                }
+
                 if (moveCts == move)
                 {
                     moveCts = null;
@@ -788,8 +811,23 @@ public sealed class ManualFlipSession
             throw new ConeErrorException("NeedEastSide", "Move to the east pier side first; the check is made there.");
         }
 
+        // "counterweight on the west" holds on pierEast only within 6 h of the meridian (beyond it the
+        // counterweight points east); keep a margin
+        if (Math.Abs(snap.HourAngleHours) > MaxPierLabelCheckHourAngle)
+        {
+            throw new ConeErrorException(
+                "NeedNearMeridian",
+                $"The check needs the telescope within {MaxPierLabelCheckHourAngle:F0} h of the meridian; it points {Math.Abs(snap.HourAngleHours):F1} h away.");
+        }
+
         lock (sync)
         {
+            if (pierLabelsAnswered)
+            {
+                throw new ConeErrorException("AlreadyAnswered", "The counterweight check was already answered in this daytime check; end it and start again to answer anew.");
+            }
+
+            pierLabelsAnswered = true;
             pierLabelsVerified = counterweightWest;
             pierLabelsInverted = !counterweightWest;
         }
@@ -847,31 +885,51 @@ public sealed class ManualFlipSession
         bool ok = true;
         if (begun)
         {
+            MountSnapshot now = null;
             try
             {
-                lock (trackingLock)
-                {
-                    if (!mount.SetTracking(wasOn))
-                    {
-                        ok = false;
-                        Logger.Warning("ConeError: the mount refused to restore tracking");
-                    }
-                }
+                now = mount.Snapshot();
             }
             catch (Exception ex)
             {
-                ok = false;
-                Logger.Error($"ConeError: restoring tracking failed: {ex.Message}");
+                Logger.Warning($"ConeError: reading the mount before the restore failed: {ex.Message}");
             }
 
-            try
+            if (now == null || !now.Connected)
             {
-                await pierSide.RestoreAsync();
-            }
-            catch (Exception ex)
-            {
+                // SetTrackingEnabled answers false when disconnected, which would read as "tracking off: done";
+                // keep everything in the restore journal instead
                 ok = false;
-                Logger.Error($"ConeError: restoring the preferred pier side failed: {ex.Message}");
+                Logger.Warning("ConeError: the mount is not connected; its settings stay in the restore journal");
+            }
+            else
+            {
+                try
+                {
+                    lock (trackingLock)
+                    {
+                        if (!mount.SetTracking(wasOn))
+                        {
+                            ok = false;
+                            Logger.Warning("ConeError: the mount refused to restore tracking");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ok = false;
+                    Logger.Error($"ConeError: restoring tracking failed: {ex.Message}");
+                }
+
+                try
+                {
+                    await pierSide.RestoreAsync();
+                }
+                catch (Exception ex)
+                {
+                    ok = false;
+                    Logger.Error($"ConeError: restoring the preferred pier side failed: {ex.Message}");
+                }
             }
 
             if (ok)
@@ -1125,7 +1183,9 @@ public sealed class ManualFlipSession
                 CentredHourAngleEast = centredEast,
                 CentredHourAngleWest = centredWest,
                 LastMove = lastMove,
-                PierLabelsVerified = pierLabelsVerified
+                PierLabelsVerified = pierLabelsVerified,
+                PierLabelsAnswered = pierLabelsAnswered,
+                PierLabelsInverted = pierLabelsInverted
             };
         }
     }

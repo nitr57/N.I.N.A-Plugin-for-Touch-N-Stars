@@ -119,7 +119,8 @@ public sealed class NinaConeMount : IConeMount
     /// <see cref="ITelescopeMediator.SetTrackingEnabled"/> returns the tracking state after the call,
     /// not whether the call worked: compare it with the request.
     /// </summary>
-    public bool SetTracking(bool enabled) => telescope.SetTrackingEnabled(enabled) == enabled;
+    public bool SetTracking(bool enabled)
+        => telescope.GetInfo()?.Connected == true && telescope.SetTrackingEnabled(enabled) == enabled;
 }
 
 /// <summary>Capture through NINA's imaging mediator and solve with the profile's plate solver; never CenteringSolver (it syncs).</summary>

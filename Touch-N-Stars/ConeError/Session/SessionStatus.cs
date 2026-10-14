@@ -62,6 +62,8 @@ public sealed class ManualFlipStatus
     public double? CentredHourAngleWest { get; init; }
     public string LastMove { get; init; }
     public bool PierLabelsVerified { get; init; }
+    public bool PierLabelsAnswered { get; init; }
+    public bool PierLabelsInverted { get; init; }
 }
 
 public sealed class SessionStatus

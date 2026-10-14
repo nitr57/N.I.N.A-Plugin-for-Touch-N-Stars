@@ -397,6 +397,49 @@ public class ConeErrorApiTests
     }
 
     [Fact]
+    public async Task SettingsUpdatesCannotAddVerifiedMounts()
+    {
+        using var rig = new AutoRig();
+        using var host = new ConeErrorApiHost(rig);
+        rig.Store.SaveSettings(new ConeErrorSettings { VerifiedPierLabels = { "k" } });
+
+        await Send(host, HttpMethod.Put, "settings", new { verifiedPierLabels = new[] { "test|Fake mount" } });
+
+        Assert.Equal(new[] { "k" }, rig.Store.LoadSettings().VerifiedPierLabels);
+    }
+
+    [Fact]
+    public async Task ASettingsUpdateWithAWrongTypeIsABadRequest()
+    {
+        using var rig = new AutoRig();
+        using var host = new ConeErrorApiHost(rig);
+
+        (int status, JObject json) = await Send(host, HttpMethod.Put, "settings", new { repetitions = "many" });
+
+        Assert.Equal(400, status);
+        Assert.Equal("BadRequest", (string)json["code"]!);
+    }
+
+    [Fact]
+    public async Task AnAbortWhileTheDaytimeCheckStartsEndsIt()
+    {
+        using var rig = new AutoRig();
+        rig.Mount.Place(0.02, -38.0);
+        using var host = new ConeErrorApiHost(rig);
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.PierSide.OnRead = () => host.Service.Abort();
+
+        (int status, JObject json) = await host.Post("manual/begin");
+        rig.PierSide.OnRead = null;
+        (_, JObject after) = await host.Get("status");
+
+        Assert.Equal(409, status);
+        Assert.Equal("Aborted", (string)json["code"]!);
+        Assert.True(rig.Mount.Tracking);
+        Assert.False((bool)after["response"]!["active"]!);
+    }
+
+    [Fact]
     public async Task AbortStopsTheMountAlsoAfterASessionHasFinished()
     {
         using var rig = new AutoRig();

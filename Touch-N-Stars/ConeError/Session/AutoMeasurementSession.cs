@@ -99,7 +99,7 @@ public sealed class AutoMeasurementSession
         this.sun = sun;
         this.store = store;
         this.options = options;
-        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees);
+        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees, () => options.Limits.SunSetAltitudeDegrees);
         watchdog.SunTooClose += sep => AbortWith("SunTooClose", $"The telescope came within {sep:F1}° of the Sun; the measurement was stopped.");
         watchdog.UnexpectedMotion += reason => AbortWith("UnexpectedMotion", reason + " The measurement was stopped; restart it without syncing or moving the mount.");
         StartedUtc = clock.UtcNow;
@@ -147,14 +147,22 @@ public sealed class AutoMeasurementSession
             abortMessage ??= reason;
         }
 
-        // cancel first, so that nothing that wakes up below reads a live token
-        cts.Cancel();
+        // stop the mount first; then cancel, before the question is answered, so that nothing that
+        // wakes up reads a live token
+        SafeStop();
+        try
+        {
+            cts.Cancel();
+        }
+        catch (AggregateException ex)
+        {
+            Logger.Warning($"ConeError: a cancellation callback failed: {ex.GetBaseException().Message}");
+        }
+
         lock (sync)
         {
             answer?.TrySetResult(false);
         }
-
-        SafeStop();
     }
 
     private void SafeStop()

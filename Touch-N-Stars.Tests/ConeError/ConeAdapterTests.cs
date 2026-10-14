@@ -33,7 +33,6 @@ public class ConeAdapterTests
 
         Assert.DoesNotContain(nameof(ITelescopeMediator.Sync), calls);
         Assert.Contains(nameof(ITelescopeMediator.StopSlew), calls);
-        Assert.Contains(nameof(ITelescopeMediator.SetTrackingEnabled), calls);
         Assert.Equal(Epoch.JNOW, slewTarget!.Epoch);
         Assert.Equal(12.5, slewTarget.RA, 1e-9);
         Assert.Equal(3.0, slewTarget.Dec, 1e-9);
@@ -47,10 +46,24 @@ public class ConeAdapterTests
     public void SetTrackingReportsWhetherTrackingIsNowAsRequested(bool requested, bool stateAfter, bool expected)
     {
         // ITelescopeMediator.SetTrackingEnabled returns the tracking state after the call (TelescopeVM)
-        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) =>
-            method.Name == nameof(ITelescopeMediator.SetTrackingEnabled) ? stateAfter : null);
+        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) => method.Name switch
+        {
+            nameof(ITelescopeMediator.SetTrackingEnabled) => stateAfter,
+            nameof(ITelescopeMediator.GetInfo) => new NINA.Equipment.Equipment.MyTelescope.TelescopeInfo { Connected = true },
+            _ => null
+        });
 
         Assert.Equal(expected, new NinaConeMount(telescope).SetTracking(requested));
+    }
+
+    [Fact]
+    public void SetTrackingOnADisconnectedMountNeverSucceeds()
+    {
+        // TelescopeVM answers false when disconnected, which would read as "tracking off: done"
+        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) =>
+            method.Name == nameof(ITelescopeMediator.SetTrackingEnabled) ? false : null);
+
+        Assert.False(new NinaConeMount(telescope).SetTracking(false));
     }
 
     [Fact]

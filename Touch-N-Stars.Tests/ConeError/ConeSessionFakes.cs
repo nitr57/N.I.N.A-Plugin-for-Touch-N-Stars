@@ -113,6 +113,11 @@ public sealed class FakeMount : IConeMount
     /// <summary>A goto started by something else (another view or client) is running.</summary>
     public bool ExternalSlew { get; set; }
 
+    public bool Connected { get; set; } = true;
+
+    /// <summary>The mount keeps tracking when asked to stop.</summary>
+    public bool RefuseTrackingOff { get; set; }
+
 
     /// <summary>Degrees per second of a goto; the goto tracks meanwhile, like real drivers do.</summary>
     public double SlewSpeed { get; set; } = 2.0;
@@ -167,7 +172,7 @@ public sealed class FakeMount : IConeMount
         {
             double lst = Lst;
             double currentRa = Tracking ? ra : Spherical.RightAscension(lst, ha);
-            return new MountSnapshot(true, false, Tracking, Slewing || ExternalSlew, Side, lst, currentRa, dec, Latitude, longitude, "Fake mount", clock.UtcNow, AtHome);
+            return new MountSnapshot(Connected, false, Tracking, Slewing || ExternalSlew, Side, lst, currentRa, dec, Latitude, longitude, "Fake mount", clock.UtcNow, AtHome);
         }
     }
 
@@ -236,6 +241,11 @@ public sealed class FakeMount : IConeMount
         lock (sync)
         {
             TrackingCalls.Add(enabled);
+            if (!enabled && RefuseTrackingOff)
+            {
+                return false;
+            }
+
             if (Tracking && !enabled)
             {
                 ha = Spherical.HourAngle(Lst, ra);
@@ -271,6 +281,9 @@ public sealed class FakePierSide : IPierSideControl
     /// <summary>Reading the original setting fails (e.g. a serial error).</summary>
     public bool FailRead { get; set; }
 
+    /// <summary>Called when the original setting is read (the start of a session).</summary>
+    public Action? OnRead { get; set; }
+
     public PierSideLabel? Preferred => Setting switch
     {
         "East" => PierSideLabel.East,
@@ -278,7 +291,11 @@ public sealed class FakePierSide : IPierSideControl
         _ => null
     };
 
-    public string ReadOriginal() => FailRead ? throw new InvalidOperationException("serial read failed") : OriginalSetting ??= Setting;
+    public string ReadOriginal()
+    {
+        OnRead?.Invoke();
+        return FailRead ? throw new InvalidOperationException("serial read failed") : OriginalSetting ??= Setting;
+    }
 
     public Task PrepareAsync(PierSideLabel side, CancellationToken token)
     {

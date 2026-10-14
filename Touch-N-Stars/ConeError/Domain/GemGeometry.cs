@@ -74,8 +74,9 @@ public static class GemGeometry
 /// <item>both axes at the same angular rate, the shorter one stopping first;</item>
 /// <item>for RA travel of 135° or more (a flip), both of the above also the other way round the RA axis;</item>
 /// <item>for a pier side change, the same via the home position, which OnStepX visits by default
-/// (MFLIP_SKIP_HOME OFF, Goto.cpp), and below 20° altitude at latitudes under 45° also via its
-/// horizon-avoiding waypoint at 45° or 135° of the RA axis (Goto::waypoint);</item>
+/// (MFLIP_SKIP_HOME OFF, Goto.cpp), and via its horizon-avoiding waypoints (Goto::waypoint): 60° or
+/// 120° of the RA axis below 10° altitude more than 6 h from the meridian, else 45° or 135° below
+/// 20° altitude at latitudes under 45°;</item>
 /// <item>with <c>strict</c>, also RA first then Dec, and Dec first then RA.</item>
 /// </list>
 /// </summary>
@@ -112,14 +113,21 @@ public static class FlipPathSampler
             AddLeg(points, from, home, strict, stepDegrees);
             AddLeg(points, home, to, strict, stepDegrees);
 
-            if (startAltitudeDegrees < 20.0 && Math.Abs(latitudeDegrees) < 45.0)
+            var avoidRa = new List<double>();
+            if (startAltitudeDegrees < 10.0 && Math.Abs(GemGeometry.Pointing(from).HourAngle) > 6.0)
             {
-                foreach (double ra in new[] { 45.0, 135.0 })
-                {
-                    var avoid = new AxisAngles(ra, home.Dec);
-                    AddLeg(points, from, avoid, strict, stepDegrees);
-                    AddLeg(points, avoid, home, strict, stepDegrees);
-                }
+                avoidRa.AddRange(new[] { 60.0, 120.0 });
+            }
+            else if (startAltitudeDegrees < 20.0 && Math.Abs(latitudeDegrees) < 45.0)
+            {
+                avoidRa.AddRange(new[] { 45.0, 135.0 });
+            }
+
+            foreach (double ra in avoidRa)
+            {
+                var avoid = new AxisAngles(ra, home.Dec);
+                AddLeg(points, from, avoid, strict, stepDegrees);
+                AddLeg(points, avoid, home, strict, stepDegrees);
             }
         }
 

@@ -340,6 +340,31 @@ public class AutoMeasurementSessionTests
     }
 
     [Fact]
+    public async Task AbortStopsTheMountBeforeAnythingIsCancelled()
+    {
+        using var rig = new AutoRig();
+        bool stoppedBeforeCancel = false;
+        var flip = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (side, token) =>
+        {
+            if (side == PierSideLabel.West)
+            {
+                using CancellationTokenRegistration registration = token.Register(() => stoppedBeforeCancel = rig.Mount.StopCount > 0);
+                flip.TrySetResult();
+                await Task.Delay(Timeout.Infinite, token);
+            }
+        };
+        AutoMeasurementSession session = rig.Session();
+
+        session.Start();
+        await flip.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        session.Abort();
+        await session.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(stoppedBeforeCancel);
+    }
+
+    [Fact]
     public async Task ARunStartedAtHomeBeginsOnTheSideTheFirmwarePicks()
     {
         using var rig = new AutoRig();

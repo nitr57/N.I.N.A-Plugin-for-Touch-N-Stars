@@ -216,6 +216,34 @@ public class FlipPathSunTests
     }
 
     [Fact]
+    public void ASunBelowTheHorizonCountsWhenTheSessionMayPointBelowIt()
+    {
+        // From a height the horizon dips: with a minimum altitude of −8° a Sun 5° down can be seen.
+        var limits = new LimitSet { MinAltitudeDegrees = -8.0, PinsPastMeridianDegrees = 2.5, SunExclusionDegrees = 30.0, SunSetAltitudeDegrees = -10.0 };
+        var target = new HaDec(0.0, -45.0);
+        HaDec sun = new(1.2, -42.0);
+
+        EndpointCheck check = LimitValidator.ValidateEndpoint(limits, PierSideLabel.East, target.HourAngle, target.Declination, Latitude, new[] { sun });
+
+        Assert.True(Spherical.AltAz(sun.HourAngle, sun.Declination, Latitude).Altitude < -2.0);
+        Assert.False(check.SunBelowHorizon);
+        Assert.Contains(check.Violations, v => v.Code == LimitViolationCode.SunTooClose);
+    }
+
+    [Fact]
+    public void LowStartsFarFromTheMeridianAlsoCheckThe60And120DegreeWaypoint()
+    {
+        // OnStepX Goto::waypoint: below 10° altitude and more than 6 h from the meridian
+        AxisAngles from = GemGeometry.ToAxes(PierSideLabel.East, 9.0, 60.0, Latitude);
+        AxisAngles to = GemGeometry.ToAxes(PierSideLabel.West, 9.0, 60.0, Latitude);
+
+        IReadOnlyList<HaDec> high = FlipPathSampler.Sample(from, to, strict: false, Latitude, startAltitudeDegrees: 30.0);
+        IReadOnlyList<HaDec> low = FlipPathSampler.Sample(from, to, strict: false, Latitude, startAltitudeDegrees: 5.0);
+
+        Assert.True(low.Count > high.Count);
+    }
+
+    [Fact]
     public void LowLandmarksAtLowLatitudesAlsoCheckTheHorizonAvoidingWaypoint()
     {
         IReadOnlyList<HaDec> plain = FlipPathSampler.Sample(

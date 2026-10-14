@@ -31,6 +31,12 @@ public sealed class LimitSet
 
     public double SunExclusionDegrees { get; init; } = 30.0;
 
+    /// <summary>
+    /// A Sun lower than this refuses nothing. At most −2° (the visible disc sets at about −0.8°), and
+    /// lower when the session may point below the horizon (a dipped horizon from a height).
+    /// </summary>
+    public double SunSetAltitudeDegrees { get; init; } = LimitValidator.SunSetAltitudeDegrees;
+
     /// <summary>Where the mount values come from, e.g. "OnStepX", "INDI OnStep", or null when the mount reports none.</summary>
     public string MountSource { get; init; }
 
@@ -124,8 +130,8 @@ public static class LimitValidator
     public const double SunSetAltitudeDegrees = -2.0;
 
     /// <summary>Whether the Sun is high enough to matter at a latitude.</summary>
-    public static bool SunUp(HaDec sun, double latitudeDegrees)
-        => Spherical.AltAz(sun.HourAngle, sun.Declination, latitudeDegrees).Altitude >= SunSetAltitudeDegrees;
+    public static bool SunUp(HaDec sun, double latitudeDegrees, double setAltitudeDegrees = SunSetAltitudeDegrees)
+        => Spherical.AltAz(sun.HourAngle, sun.Declination, latitudeDegrees).Altitude >= setAltitudeDegrees;
 
     public static EndpointCheck ValidateEndpoint(
         LimitSet limits,
@@ -216,7 +222,7 @@ public static class LimitValidator
                 source));
         }
 
-        HaDec[] upSuns = suns.Where(s => SunUp(s, latitudeDegrees)).ToArray();
+        HaDec[] upSuns = suns.Where(s => SunUp(s, latitudeDegrees, limits.SunSetAltitudeDegrees)).ToArray();
         bool sunBelowHorizon = upSuns.Length == 0;
         double endpointSun = MinSunSeparation(new[] { new HaDec(hourAngleHours, declinationDegrees) }, suns);
         double endpointUpSun = sunBelowHorizon ? double.PositiveInfinity : MinSunSeparation(new[] { new HaDec(hourAngleHours, declinationDegrees) }, upSuns);
