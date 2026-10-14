@@ -683,7 +683,7 @@ public sealed class ConeErrorService
         return m.GetStatus();
     }
 
-    public ManualMovePlan PlanManualMove(PierSideLabel side) => ActiveManual().PlanMove(side);
+    public ManualMovePlan PlanManualMove(PierSideLabel side, bool overrideSunPath = false) => ActiveManual().PlanMove(side, overrideSunPath);
 
     /// <summary>Starts a confirmed move; plan problems are thrown here, the move itself reports through the status.</summary>
     public SessionStatus StartManualMove(string planId)

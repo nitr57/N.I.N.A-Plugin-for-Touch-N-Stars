@@ -48,6 +48,12 @@ public sealed class SafetyWatchdog
 
     public SunWatchStatus Sun { get; private set; }
 
+    /// <summary>
+    /// Whether the Sun within the radius stops a running move. Only an explicitly overridden daytime
+    /// move turns it off, so that the tube is not stopped mid-swing pointing near the Sun.
+    /// </summary>
+    public bool StopOnSun { get; set; } = true;
+
     /// <summary>Marks a move the session started itself; position changes until <see cref="EndOwnMotion"/> are expected.</summary>
     public void BeginOwnMotion() => Interlocked.Increment(ref ownMotion);
 
@@ -103,7 +109,7 @@ public sealed class SafetyWatchdog
 
         if (separation < r)
         {
-            if (now.Slewing || Volatile.Read(ref ownMotion) > 0)
+            if (StopOnSun && (now.Slewing || Volatile.Read(ref ownMotion) > 0))
             {
                 mount.Stop();
             }

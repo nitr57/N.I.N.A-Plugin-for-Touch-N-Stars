@@ -337,6 +337,29 @@ public class ConeErrorApiTests
     }
 
     [Fact]
+    public async Task TheSunPathOverrideIsPassedThroughPerPlan()
+    {
+        using var rig = new AutoRig();
+        rig.Mount.Place(0.02, -38.0);
+        using var host = new ConeErrorApiHost(rig);
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.Store.SaveSettings(new ConeErrorSettings { ManualMinAltitudeDegrees = 0.0 });
+        await host.Post("manual/begin");
+        await host.Post("manual/capture");
+        // the tube's swing passes the Sun, the landmark itself is far from it
+        rig.Sun.Fixed = new HaDec(3.0, 20.0);
+
+        (_, JObject refused) = await host.Post("manual/plan-move", new { side = "West" });
+        (_, JObject overridden) = await host.Post("manual/plan-move", new { side = "West", overrideSunPath = true });
+
+        Assert.False((bool)refused["response"]!["ok"]!);
+        Assert.True((bool)refused["response"]!["sunPathOverridable"]!);
+        Assert.True((bool)overridden["response"]!["ok"]!);
+        Assert.True((bool)overridden["response"]!["sunPathOverridden"]!);
+        await host.Post("manual/end");
+    }
+
+    [Fact]
     public async Task RestoreAppliesALeftoverJournalWithoutMoving()
     {
         using var rig = new AutoRig();

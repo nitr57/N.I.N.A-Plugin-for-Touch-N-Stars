@@ -122,7 +122,10 @@ public class ConeErrorController : WebApiController
     [Route(HttpVerbs.Post, "/cone-error/manual/capture")]
     public Task Capture() => Run(() => Task.FromResult<object>(Service.Capture()));
 
-    /// <summary>POST /api/cone-error/manual/plan-move {side: "East"|"West"} - the checks of the move to confirm.</summary>
+    /// <summary>
+    /// POST /api/cone-error/manual/plan-move {side: "East"|"West", overrideSunPath} - the checks of the move to
+    /// confirm; overrideSunPath overrides a refusal for the Sun near the path alone, for this one move.
+    /// </summary>
     [Route(HttpVerbs.Post, "/cone-error/manual/plan-move")]
     public Task PlanMove() => Run(async () =>
     {
@@ -132,7 +135,7 @@ public class ConeErrorController : WebApiController
             throw new ConeErrorException("BadRequest", "side must be East or West.");
         }
 
-        return Service.PlanManualMove(side);
+        return Service.PlanManualMove(side, (bool?)body["overrideSunPath"] ?? false);
     });
 
     /// <summary>POST /api/cone-error/manual/move {planId} - starts a confirmed move; progress through /status.</summary>

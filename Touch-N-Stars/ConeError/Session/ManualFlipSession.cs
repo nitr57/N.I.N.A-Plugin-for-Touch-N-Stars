@@ -34,7 +34,14 @@ public sealed class ManualMovePlan
 
     public string Refusal { get; init; }
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
-    public bool Ok => Refusal == null && Check != null && Check.Ok;
+
+    /// <summary>The only refusal is the Sun near the path: the user may override it for this one move.</summary>
+    public bool SunPathOverridable { get; init; }
+
+    /// <summary>The user overrode the path check for this move; the endpoint check still applied.</summary>
+    public bool SunPathOverridden { get; init; }
+
+    public bool Ok => Refusal == null && Check != null && (Check.Ok || (SunPathOverridden && ManualFlipSession.OnlySunPath(Check)));
 }
 
 /// <summary>The daytime estimate from the re-centred landmark.</summary>
@@ -76,6 +83,9 @@ public sealed class ManualFlipSession
 
     public const string CapsWarning = "Cap the finder and the guide scope; never look through the eyepiece while the mount moves.";
 
+    public const string OverrideWarning =
+        "Sun check overridden: on its way the tube may pass {0:F0}° from the Sun. Cap every optic; nobody may look through the eyepiece or the finder.";
+
     private readonly IConeMount mount;
     private readonly IPierSideControl pierSide;
     private readonly IClock clock;
@@ -102,6 +112,7 @@ public sealed class ManualFlipSession
     private double? centredEast;
     private double? centredWest;
     private string lastMove;
+    private bool overrideActive;
     private CancellationTokenSource moveCts;
     private DateTime lastSeen;
     private DateTime lastActivity;
@@ -241,7 +252,16 @@ public sealed class ManualFlipSession
         return GetManualStatus();
     }
 
-    public ManualMovePlan PlanMove(PierSideLabel target)
+    /// <summary>A refused check whose only violations are the Sun near the path (the endpoint is clear).</summary>
+    public static bool OnlySunPath(EndpointCheck check)
+        => check != null && check.Violations.Count > 0 && check.Violations.All(v => v.Code == LimitViolationCode.SunTooCloseOnPath);
+
+    /// <summary>
+    /// Plans a move to the other pier side. With <paramref name="overrideSunPath"/> a refusal for the
+    /// Sun near the path alone is overridden for this one plan; the endpoint, the limits and every
+    /// other check still refuse.
+    /// </summary>
+    public ManualMovePlan PlanMove(PierSideLabel target, bool overrideSunPath = false)
     {
         EnsureActive();
         Touch();
@@ -295,10 +315,18 @@ public sealed class ManualFlipSession
                 TimeSpan.Zero);
         }
 
+        bool overridable = OnlySunPath(check);
+        bool overridden = overrideSunPath && overridable;
         var warnings = new List<string> { CapsWarning };
         if (check.PastMeridianDegrees > 0.0)
         {
             warnings.Add(CollisionWarning);
+        }
+
+        if (overridden)
+        {
+            warnings.Insert(0, string.Format(System.Globalization.CultureInfo.InvariantCulture, OverrideWarning, check.PathSunSeparationDegrees));
+            Logger.Warning($"ConeError: sun path check overridden by the user for a move to the {target} side; closest approach {check.PathSunSeparationDegrees:F1}°, radius {options.Limits.SunExclusionDegrees:F0}°");
         }
 
         return Store(new ManualMovePlan
@@ -311,7 +339,9 @@ public sealed class ManualFlipSession
             Declination = c.Value.Dec,
             Check = check,
             NextAllowedUtc = next,
-            Warnings = warnings
+            Warnings = warnings,
+            SunPathOverridable = overridable,
+            SunPathOverridden = overridden
         });
     }
 
@@ -385,9 +415,15 @@ public sealed class ManualFlipSession
         {
             MountSnapshot snap = mount.Snapshot();
             EndpointCheck recheck = CheckMove(snap, target, c.Ha, c.Dec, clock.UtcNow);
-            if (!recheck.Ok)
+            if (!Allowed(recheck, plan.SunPathOverridden))
             {
                 throw new ConeErrorException("PlanRefused", "The move is no longer allowed: " + LimitValidator.Describe(recheck.Violations));
+            }
+
+            if (plan.SunPathOverridden)
+            {
+                // Stopping mid-swing would leave the tube pointing near the Sun: alert only for this move.
+                SetOverride(true);
             }
 
             await pierSide.PrepareAsync(target, move.Token);
@@ -404,7 +440,7 @@ public sealed class ManualFlipSession
             for (int i = 0; i < MaxCorrections && !Arrived(arrived, c.Ha, c.Dec); i++)
             {
                 EndpointCheck small = CheckMove(arrived, target, c.Ha, c.Dec, clock.UtcNow);
-                if (!small.Ok)
+                if (!Allowed(small, plan.SunPathOverridden))
                 {
                     throw new ConeErrorException("PlanRefused", "The correction is not allowed: " + LimitValidator.Describe(small.Violations));
                 }
@@ -446,6 +482,7 @@ public sealed class ManualFlipSession
         }
         finally
         {
+            SetOverride(false);
             KeepTrackingOff();
             lock (sync)
             {
@@ -457,6 +494,18 @@ public sealed class ManualFlipSession
 
             move.Dispose();
         }
+    }
+
+    private static bool Allowed(EndpointCheck check, bool sunPathOverridden) => check.Ok || (sunPathOverridden && OnlySunPath(check));
+
+    private void SetOverride(bool active)
+    {
+        lock (sync)
+        {
+            overrideActive = active;
+        }
+
+        watchdog.StopOnSun = !active;
     }
 
     private async Task SlewToCapturedAsync(double ha, double dec, CancellationToken token)
@@ -725,6 +774,12 @@ public sealed class ManualFlipSession
         CancellationTokenSource move;
         lock (sync)
         {
+            if (overrideActive)
+            {
+                // the user overrode the path check for this move: the status shows the alert, the move goes on
+                return;
+            }
+
             move = moveCts;
             if (move != null)
             {

@@ -266,6 +266,122 @@ public class ManualFlipSessionTests
         Assert.InRange(plan.NextAllowedUtc.Value, new DateTime(2026, 6, 21, 18, 0, 0, DateTimeKind.Utc), new DateTime(2026, 6, 21, 20, 0, 0, DateTimeKind.Utc));
     }
 
+    private static readonly DateTime JuneAfternoon = new(2026, 6, 21, 15, 0, 0, DateTimeKind.Utc);
+
+    [Fact]
+    public async Task TheSunPathCheckCanBeOverriddenForOneMove()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan refused = rig.Session.PlanMove(PierSideLabel.West);
+        ManualMovePlan overridden = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+        await rig.Session.MoveAsync(overridden.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(refused.Ok);
+        Assert.True(refused.SunPathOverridable);
+        Assert.False(refused.SunPathOverridden);
+        Assert.True(overridden.Ok);
+        Assert.True(overridden.SunPathOverridden);
+        Assert.Contains(overridden.Warnings, w => w.StartsWith("Sun check overridden"));
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+    }
+
+    [Fact]
+    public void TheEndpointCheckCanNeverBeOverridden()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+        rig.Sun.Fixed = new HaDec(0.3, -30.0);
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        Assert.False(plan.Ok);
+        Assert.False(plan.SunPathOverridable);
+        Assert.False(plan.SunPathOverridden);
+        Assert.Contains(plan.Check.Violations, v => v.Code == LimitViolationCode.SunTooClose);
+    }
+
+    [Fact]
+    public void TheOverrideNeverSkipsTheLimits()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Mount.Place(0.5, -38.0);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        Assert.False(plan.Ok);
+        Assert.False(plan.SunPathOverridable);
+        Assert.Contains(plan.Check.Violations, v => v.Code == LimitViolationCode.PastMeridianLimit);
+    }
+
+    [Fact]
+    public async Task TheOverrideHoldsForOneMoveOnly()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan overridden = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+        await rig.Session.MoveAsync(overridden.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        ManualMovePlan back = rig.Session.PlanMove(PierSideLabel.East);
+
+        Assert.False(back.Ok);
+        Assert.True(back.SunPathOverridable);
+        Assert.True(rig.Session.Watchdog.StopOnSun);
+    }
+
+    [Fact]
+    public async Task DuringAnOverriddenMoveTheWatchdogAlertsButDoesNotStopTheSwing()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Mount.OnSlew = (_, _) =>
+        {
+            // the tube swings past the Sun on its way; the app keeps polling meanwhile
+            rig.Session.Heartbeat();
+            rig.Sun.Fixed = new HaDec(rig.Mount.HourAngle, rig.Mount.Declination + 5.0);
+            rig.Session.CheckBackground();
+            Assert.True(rig.Session.GetStatus().Sun.Critical);
+            rig.Sun.Fixed = null;
+            return Task.CompletedTask;
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        await rig.Session.MoveAsync(plan.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, rig.Mount.StopCount);
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+        Assert.Null(rig.Session.GetStatus().Error);
+    }
+
+    [Fact]
+    public async Task WithoutAnOverrideTheWatchdogStopsAMoveThatComesNearTheSun()
+    {
+        using var rig = new ManualRig();
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            rig.Sun.Fixed = new HaDec(rig.Mount.HourAngle, rig.Mount.Declination + 5.0);
+            rig.Session.CheckBackground();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+        Assert.True(plan.Ok);
+
+        await rig.Session.MoveAsync(plan.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(rig.Mount.StopCount >= 1);
+        Assert.Equal("SunTooClose", rig.Session.GetStatus().Error.Code);
+        Assert.Equal(PierSideLabel.East, rig.Mount.Side);
+    }
+
     [Fact]
     public async Task APlanThatBecameUnsafeIsRefusedAtExecution()
     {
