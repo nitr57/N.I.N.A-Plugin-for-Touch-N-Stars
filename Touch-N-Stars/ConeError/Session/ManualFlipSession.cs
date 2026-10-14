@@ -98,6 +98,9 @@ public sealed class ManualFlipSession
     /// <summary>A change of the pointing this large while no own move runs is a move or sync from elsewhere, degrees.</summary>
     public const double ExternalMoveDegrees = 2.0;
 
+    /// <summary>After an own move the mount counts as at rest when two background checks agree this closely, arcmin.</summary>
+    public const double AtRestArcmin = 1.0;
+
     /// <summary>Time a correction is expected to take before tracking is off again, on top of the settle time, seconds.</summary>
     public const double CorrectionOverheadSeconds = 3.0;
 
@@ -141,6 +144,8 @@ public sealed class ManualFlipSession
     private bool pierLabelsInverted;
     private bool pierLabelsAnswered;
     private (double Ha, double Dec, PierSideLabel? Side)? reference;
+    private bool rebasePending;
+    private MountSnapshot rebaseSample;
     private TaskCompletionSource moveDone;
     private CancellationTokenSource moveCts;
     private DateTime lastSeen;
@@ -225,7 +230,17 @@ public sealed class ManualFlipSession
 
         if (snap.Tracking && !mount.SetTracking(false))
         {
-            // the check needs a pointing fixed to the ground; nothing was changed, so nothing to restore
+            // the check needs a pointing fixed to the ground; a driver that lags may still have turned
+            // tracking off, so ask for it on again (as it was) before giving up
+            try
+            {
+                mount.SetTracking(true);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"ConeError: turning tracking back on failed: {ex.Message}");
+            }
+
             store.ClearJournal();
             throw new ConeErrorException("TrackingNotOff", "The mount did not turn tracking off, which the daytime check needs.");
         }
@@ -290,6 +305,8 @@ public sealed class ManualFlipSession
             centredEast = snap.Side == PierSideLabel.East ? snap.HourAngleHours : null;
             centredWest = snap.Side == PierSideLabel.West ? snap.HourAngleHours : null;
             reference = (snap.HourAngleHours, snap.DeclinationDegrees, snap.Side);
+            rebasePending = false;
+            rebaseSample = null;
             result = null;
             previous = null;
             phase = SessionPhase.Ready;
@@ -549,24 +566,13 @@ public sealed class ManualFlipSession
         {
             SetOverride(false);
             KeepTrackingOff();
-            MountSnapshot after = null;
-            try
-            {
-                after = mount.Snapshot();
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"ConeError: reading the mount after a move failed: {ex.Message}");
-            }
-
             lock (sync)
             {
-                // a stopped or failed move leaves the mount somewhere along the way: that is our own
-                // move, not one from elsewhere, so the captured landmark stays valid
-                if (!ended && after != null && after.Connected)
-                {
-                    reference = (after.HourAngleHours, after.DeclinationDegrees, after.Side);
-                }
+                // A stopped or failed move leaves the mount somewhere along the way, and OnStepX's
+                // emergency stop coasts up to 2° per axis (SLEW_RAPID_STOP_DIST): that is our own move,
+                // not one from elsewhere. The new reference is taken once the mount is at rest.
+                rebasePending = true;
+                rebaseSample = null;
 
                 if (moveCts == move)
                 {
@@ -1058,7 +1064,33 @@ public sealed class ManualFlipSession
 
         lock (sync)
         {
-            if (reference is not { } r || ended)
+            if (ended)
+            {
+                return;
+            }
+
+            if (rebasePending)
+            {
+                // after an own move: wait until two checks agree, then take the new reference
+                bool atRest = !snap.Slewing
+                    && rebaseSample != null
+                    && rebaseSample.Side == snap.Side
+                    && Spherical.SeparationDegrees(rebaseSample.HourAngleHours, rebaseSample.DeclinationDegrees, snap.HourAngleHours, snap.DeclinationDegrees) * 60.0 < AtRestArcmin;
+                if (atRest)
+                {
+                    reference = (snap.HourAngleHours, snap.DeclinationDegrees, snap.Side);
+                    rebasePending = false;
+                    rebaseSample = null;
+                }
+                else
+                {
+                    rebaseSample = snap;
+                }
+
+                return;
+            }
+
+            if (reference is not { } r)
             {
                 return;
             }
@@ -1177,6 +1209,7 @@ public sealed class ManualFlipSession
                 CapturedAltitude = captured?.Alt,
                 CapturedAzimuth = captured?.Az,
                 CurrentSide = snap?.Side?.ToString(),
+                CurrentHourAngle = snap?.HourAngleHours,
                 TrackingWasOn = trackingWasOn,
                 EastCheck = eastCheck,
                 WestCheck = westCheck,

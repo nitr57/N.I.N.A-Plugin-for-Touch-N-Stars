@@ -55,6 +55,7 @@ public sealed class ManualFlipStatus
     public double? CapturedAltitude { get; init; }
     public double? CapturedAzimuth { get; init; }
     public string CurrentSide { get; init; }
+    public double? CurrentHourAngle { get; init; }
     public bool TrackingWasOn { get; init; }
     public EndpointCheck EastCheck { get; init; }
     public EndpointCheck WestCheck { get; init; }

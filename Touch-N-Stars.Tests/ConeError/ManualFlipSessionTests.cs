@@ -601,6 +601,60 @@ public class ManualFlipSessionTests
     }
 
     [Fact]
+    public async Task AStopThatCoastsKeepsTheCaptureAndLaterMovesAreStillDetected()
+    {
+        using var rig = new ManualRig();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            rig.Mount.Place(2.5, 35.0);
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        Task move = rig.Session.MoveAsync(rig.Session.PlanMove(PierSideLabel.West).PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        rig.Session.StopMove();
+        await move.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // OnStepX's emergency stop coasts up to 2° per axis: the next checks still see it moving
+        rig.Session.CheckBackground();
+        rig.Mount.Place(2.5 + 2.0 / 15.0, 37.0);
+        rig.Session.CheckBackground();
+        rig.Mount.Place(2.5 + 2.6 / 15.0, 37.4);
+        rig.Session.CheckBackground();
+        rig.Session.CheckBackground();
+        Assert.NotNull(rig.Session.GetStatus().Manual.CapturedHourAngle);
+        Assert.Null(rig.Session.GetStatus().Error);
+
+        // at rest now; a goto from elsewhere is still caught
+        rig.Mount.Place(-3.0, 10.0);
+        rig.Session.CheckBackground();
+        Assert.Equal("MovedElsewhere", rig.Session.GetStatus().Error.Code);
+    }
+
+    [Fact]
+    public void TrackingIsAskedOnAgainWhenTheMountDoesNotReportItOff()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Mount.RefuseTrackingOff = true;
+
+        Assert.Throws<ConeErrorException>(() => rig.Session.Begin());
+
+        Assert.Equal(new[] { false, true }, rig.Mount.TrackingCalls);
+    }
+
+    [Fact]
+    public void TheStatusCarriesTheCurrentHourAngleForTheCounterweightCheck()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+
+        Assert.Equal(0.02, rig.Session.GetStatus().Manual.CurrentHourAngle!.Value, 1e-6);
+    }
+
+    [Fact]
     public async Task ASunStopKeepsItsMessage()
     {
         using var rig = new ManualRig();

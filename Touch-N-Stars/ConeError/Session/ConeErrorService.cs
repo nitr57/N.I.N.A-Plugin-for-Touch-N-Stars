@@ -659,10 +659,20 @@ public sealed class ConeErrorService
                 m = manual;
             }
 
-            // long enough for a running move to end (up to 15 s) and the INDI confirmation (up to 10 s)
+            // one budget, long enough for a running move to end (up to 15 s) and the INDI confirmation (up to 10 s)
             a?.Abort();
-            a?.Completion.Wait(TimeSpan.FromSeconds(30));
-            m?.AbortAsync().Wait(TimeSpan.FromSeconds(30));
+            var pending = new List<Task>();
+            if (a != null)
+            {
+                pending.Add(a.Completion);
+            }
+
+            if (m != null)
+            {
+                pending.Add(m.AbortAsync());
+            }
+
+            Task.WaitAll(pending.ToArray(), TimeSpan.FromSeconds(30));
         }
         catch (Exception ex)
         {
