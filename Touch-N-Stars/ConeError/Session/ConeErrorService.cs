@@ -13,12 +13,19 @@ public sealed class AutoPlanRequest
     public int? Repetitions { get; set; }
     public double? Declination { get; set; }
     public double? ExposureSeconds { get; set; }
+
+    /// <summary>The phone's clock, for the server-side clock check.</summary>
+    public DateTime? ClientTimeUtc { get; set; }
 }
 
 public sealed class AutoPlanResponse
 {
     public string PlanId { get; init; }
     public DateTime ExpiresUtc { get; init; }
+
+    /// <summary>Seconds the plan is valid from its creation, so that clients need not compare clocks.</summary>
+    public double ExpiresInSeconds { get; init; }
+
     public AutoPlan Plan { get; init; }
     public PairTiming Timing { get; init; }
     public double ExposureSeconds { get; init; }
@@ -92,6 +99,7 @@ public sealed class ConeErrorService
     private readonly Dictionary<string, (AutoPlanRequest Request, AutoPlanResponse Response)> autoPlans = new();
     private AutoMeasurementSession auto;
     private ManualFlipSession manual;
+    private bool starting;
 
     public ConeErrorService(Func<IConeEnvironment> environment, ConeErrorStore store, bool backgroundLoops = true)
     {
@@ -123,6 +131,20 @@ public sealed class ConeErrorService
         ConeErrorSettings current = Store.LoadSettings();
         settings.VerifiedPierLabels = current.VerifiedPierLabels;
         return Store.SaveSettings(settings);
+    }
+
+    /// <summary>Applies only the fields a client sent (JSON object) on top of the stored settings.</summary>
+    public ConeErrorSettings PatchSettings(string json)
+    {
+        ConeErrorSettings current = Store.LoadSettings();
+        List<string> verified = current.VerifiedPierLabels;
+        if (!string.IsNullOrWhiteSpace(json))
+        {
+            Newtonsoft.Json.JsonConvert.PopulateObject(json, current);
+        }
+
+        current.VerifiedPierLabels = verified;
+        return Store.SaveSettings(current);
     }
 
     public IReadOnlyList<ConeResultRecord> Results() => Store.LoadResults().OrderByDescending(r => r.TimestampUtc).ToList();
@@ -304,7 +326,7 @@ public sealed class ConeErrorService
     public AutoPlanResponse PlanAuto(AutoPlanRequest request)
     {
         IConeEnvironment env = environment();
-        Preconditions pre = GetPreconditions(null);
+        Preconditions pre = GetPreconditions(request.ClientTimeUtc);
         if (pre.AutoBlockers.Count > 0)
         {
             throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.AutoBlockers));
@@ -347,7 +369,8 @@ public sealed class ConeErrorService
             NowUtc = now,
             LocalSiderealTimeHours = mount.LocalSiderealTimeHours,
             LatitudeDegrees = profile.Latitude,
-            CurrentSide = mount.Side,
+            // at home OnStepX picks the side from the sign of the hour angle: West for the first target
+            CurrentSide = mount.AtHome ? PierSideLabel.West : mount.Side,
             Repetitions = repetitions,
             Declination = request.Declination,
             Timing = timing,
@@ -360,6 +383,7 @@ public sealed class ConeErrorService
         {
             PlanId = Guid.NewGuid().ToString("N"),
             ExpiresUtc = now + AutoPlanLifetime,
+            ExpiresInSeconds = AutoPlanLifetime.TotalSeconds,
             Plan = plan,
             Timing = timing,
             ExposureSeconds = exposure,
@@ -428,6 +452,14 @@ public sealed class ConeErrorService
             throw new ConeErrorException("PlanRefused", fresh.Plan.Refusal ?? LimitValidator.Describe(fresh.Plan.Violations));
         }
 
+        // the confirmed envelope is never widened silently
+        if (fresh.Plan.MaxAbsHourAngleDegrees > planned.Response.Plan.MaxAbsHourAngleDegrees + 1e-6
+            || fresh.Plan.NormalSidesOnly != planned.Response.Plan.NormalSidesOnly
+            || fresh.Repetitions != planned.Response.Repetitions)
+        {
+            throw new ConeErrorException("PlanChanged", "The plan changed since it was confirmed; plan again.");
+        }
+
         string key = MountKey(pre.Profile, pre.Mount);
         var session = new AutoMeasurementSession(
             env.Mount,
@@ -445,8 +477,9 @@ public sealed class ConeErrorService
                 Timing = fresh.Timing,
                 Limits = Limits(settings, pre.Profile, driver.Limits, settings.AutoMinAltitudeDegrees),
                 LatitudeDegrees = pre.Profile.Latitude,
-                MaxAbsHourAngleDegrees = Math.Max(fresh.Plan.MaxAbsHourAngleDegrees, planned.Response.Plan.MaxAbsHourAngleDegrees),
+                MaxAbsHourAngleDegrees = planned.Response.Plan.MaxAbsHourAngleDegrees,
                 AskPierLabels = fresh.AskPierLabels,
+                NormalSidesOnly = fresh.Plan.NormalSidesOnly,
                 MountKey = key,
                 Profile = pre.Profile
             },
@@ -493,7 +526,7 @@ public sealed class ConeErrorService
 
     #region Status and abort
 
-    private bool IsSessionActive() => (auto != null && !auto.Finished) || (manual != null && !manual.Finished);
+    private bool IsSessionActive() => starting || (auto != null && !auto.Finished) || (manual != null && !manual.Finished);
 
     public SessionStatus Status()
     {
@@ -541,7 +574,7 @@ public sealed class ConeErrorService
             end.ContinueWith(t => Logger.Error($"ConeError: ending the daytime check failed: {t.Exception}"), TaskContinuationOptions.OnlyOnFaulted);
         }
 
-        if (a == null && m == null)
+        if ((a == null || a.Finished) && (m == null || m.Finished))
         {
             // nothing of ours runs, but the user asked the mount to stop
             try
@@ -620,10 +653,10 @@ public sealed class ConeErrorService
 
     #region Daytime check
 
-    public SessionStatus BeginManual()
+    public SessionStatus BeginManual(DateTime? clientUtc = null)
     {
         IConeEnvironment env = environment();
-        Preconditions pre = GetPreconditions(null);
+        Preconditions pre = GetPreconditions(clientUtc);
         if (pre.ManualBlockers.Count > 0)
         {
             throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.ManualBlockers));
@@ -644,9 +677,13 @@ public sealed class ConeErrorService
                 StrictPath = settings.StrictPath,
                 DovetailMm = settings.DovetailMm,
                 MountKey = MountKey(pre.Profile, pre.Mount),
-                Profile = pre.Profile
+                Profile = pre.Profile,
+                SettleSeconds = pre.Profile.SettleSeconds,
+                PierLabelsVerified = settings.VerifiedPierLabels.Contains(MountKey(pre.Profile, pre.Mount))
             },
             backgroundLoops);
+        string key = MountKey(pre.Profile, pre.Mount);
+        session.PierLabelsConfirmed += () => RememberPierLabels(key);
 
         lock (sync)
         {
@@ -655,12 +692,36 @@ public sealed class ConeErrorService
                 throw new ConeErrorException("Busy", "A cone error session is already running.");
             }
 
-            manual = session;
-            auto = null;
+            starting = true;
         }
 
-        session.Begin();
+        try
+        {
+            // only a session that has begun is kept; a failed start leaves nothing behind
+            session.Begin();
+            lock (sync)
+            {
+                manual = session;
+                auto = null;
+            }
+        }
+        finally
+        {
+            lock (sync)
+            {
+                starting = false;
+            }
+        }
+
         return session.GetStatus();
+    }
+
+    /// <summary>The one-time counterweight check of the daytime check (on the east pier side).</summary>
+    public SessionStatus ManualPierLabels(bool counterweightWest)
+    {
+        ManualFlipSession m = ActiveManual();
+        m.ConfirmPierLabels(counterweightWest);
+        return m.GetStatus();
     }
 
     private ManualFlipSession ActiveManual()

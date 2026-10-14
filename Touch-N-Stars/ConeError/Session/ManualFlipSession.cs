@@ -16,6 +16,12 @@ public sealed class ManualFlipOptions
     public double? DovetailMm { get; init; }
     public string MountKey { get; init; }
     public ProfileFacts Profile { get; init; }
+
+    /// <summary>The profile's settle time, during which NINA keeps tracking on after a goto.</summary>
+    public double SettleSeconds { get; init; }
+
+    /// <summary>The user has confirmed this mount's pier side labels against the counterweight.</summary>
+    public bool PierLabelsVerified { get; init; }
 }
 
 /// <summary>A planned move of the daytime check, valid for <see cref="ManualFlipSession.PlanLifetime"/>.</summary>
@@ -23,6 +29,10 @@ public sealed class ManualMovePlan
 {
     public string PlanId { get; init; }
     public DateTime ExpiresUtc { get; init; }
+
+    /// <summary>Seconds the plan is valid from its creation, so that clients need not compare clocks.</summary>
+    public double ExpiresInSeconds { get; init; }
+
     public string FromSide { get; init; }
     public string ToSide { get; init; }
     public double HourAngle { get; init; }
@@ -53,6 +63,10 @@ public sealed class ManualEstimate
     public double? ShimMm { get; init; }
     public string ShimEnd { get; init; }
     public string Refusal { get; init; }
+
+    /// <summary>A stable code for the refusal, e.g. PierLabelsUnverified.</summary>
+    public string RefusalCode { get; init; }
+
     public ConeResultRecord Result { get; init; }
     public ConeResultRecord Previous { get; init; }
 }
@@ -76,7 +90,13 @@ public sealed class ManualFlipSession
     /// <summary>A move ends within this of the captured position (arcmin on the sky), else it is corrected.</summary>
     public const double ArrivalToleranceArcmin = 1.0;
 
-    public const int MaxCorrections = 2;
+    public const int MaxCorrections = 3;
+
+    /// <summary>A change of the pointing this large while no own move runs is a move or sync from elsewhere, degrees.</summary>
+    public const double ExternalMoveDegrees = 2.0;
+
+    /// <summary>Time a correction is expected to take before tracking is off again, on top of the settle time, seconds.</summary>
+    public const double CorrectionOverheadSeconds = 3.0;
 
     public const string CollisionWarning =
         "Stay at the mount: on the counterweight-up side a low tube can hit the tripod or the pier.";
@@ -113,6 +133,11 @@ public sealed class ManualFlipSession
     private double? centredWest;
     private string lastMove;
     private bool overrideActive;
+    private bool completed;
+    private bool pierLabelsVerified;
+    private bool pierLabelsInverted;
+    private (double Ha, double Dec, PierSideLabel? Side)? reference;
+    private TaskCompletionSource moveDone;
     private CancellationTokenSource moveCts;
     private DateTime lastSeen;
     private DateTime lastActivity;
@@ -136,8 +161,11 @@ public sealed class ManualFlipSession
         this.store = store;
         this.options = options;
         this.backgroundLoop = backgroundLoop;
-        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees);
+        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees);
         watchdog.SunTooClose += OnSunTooClose;
+        // the user re-centres with the jog pad: slews from elsewhere are expected here
+        watchdog.DetectExternalSlews = false;
+        pierLabelsVerified = options.PierLabelsVerified;
         StartedUtc = clock.UtcNow;
         lastSeen = lastActivity = StartedUtc;
     }
@@ -146,13 +174,17 @@ public sealed class ManualFlipSession
 
     internal SafetyWatchdog Watchdog => watchdog;
 
+    /// <summary>Raised when the user confirmed the pier labels, so that the service can remember the mount.</summary>
+    public event Action PierLabelsConfirmed;
+
+    /// <summary>True once the mode has ended and its restore has run.</summary>
     public bool Finished
     {
         get
         {
             lock (sync)
             {
-                return ended;
+                return completed;
             }
         }
     }
@@ -226,6 +258,14 @@ public sealed class ManualFlipSession
             throw new ConeErrorException("PierSideUnknown", "The mount does not report its pier side.");
         }
 
+        lock (sync)
+        {
+            if (phase == SessionPhase.Moving)
+            {
+                throw new ConeErrorException("Busy", "A move is running.");
+            }
+        }
+
         if (snap.Slewing)
         {
             throw new ConeErrorException("MountMoving", "Wait until the mount stands still.");
@@ -243,6 +283,7 @@ public sealed class ManualFlipSession
             westCheck = west;
             centredEast = snap.Side == PierSideLabel.East ? snap.HourAngleHours : null;
             centredWest = snap.Side == PierSideLabel.West ? snap.HourAngleHours : null;
+            reference = (snap.HourAngleHours, snap.DeclinationDegrees, snap.Side);
             result = null;
             previous = null;
             phase = SessionPhase.Ready;
@@ -333,6 +374,7 @@ public sealed class ManualFlipSession
         {
             PlanId = NewId(),
             ExpiresUtc = now + PlanLifetime,
+            ExpiresInSeconds = PlanLifetime.TotalSeconds,
             FromSide = snap.Side?.ToString(),
             ToSide = target.ToString(),
             HourAngle = c.Value.Ha,
@@ -380,8 +422,14 @@ public sealed class ManualFlipSession
         ManualMovePlan plan;
         (double Ha, double Dec, PierSideLabel Side, double Alt, double Az) c;
         CancellationTokenSource move;
+        TaskCompletionSource done;
         lock (sync)
         {
+            if (ended)
+            {
+                throw new ConeErrorException("NotActive", "The daytime check has ended.");
+            }
+
             if (planId == null || !plans.TryGetValue(planId, out plan))
             {
                 throw new ConeErrorException("PlanUnknown", "This move was not planned or was replaced; plan it again.");
@@ -406,6 +454,8 @@ public sealed class ManualFlipSession
             c = captured.Value;
             moveCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
             move = moveCts;
+            moveDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            done = moveDone;
             phase = SessionPhase.Moving;
             message = $"Moving to the {plan.ToSide.ToLowerInvariant()} pier side";
         }
@@ -427,7 +477,8 @@ public sealed class ManualFlipSession
             }
 
             await pierSide.PrepareAsync(target, move.Token);
-            await SlewToCapturedAsync(c.Ha, c.Dec, move.Token);
+            move.Token.ThrowIfCancellationRequested();
+            await SlewToCapturedAsync(c.Ha, c.Dec, 0.0, move.Token);
 
             MountSnapshot arrived = mount.Snapshot();
             if (arrived.Side != target)
@@ -437,6 +488,10 @@ public sealed class ManualFlipSession
                     $"The mount was asked for the {target.ToString().ToLowerInvariant()} pier side but reports {arrived.Side?.ToString().ToLowerInvariant() ?? "an unknown side"}; no further moves.");
             }
 
+            // NINA keeps tracking on while the mount settles after a goto, so each correction aims
+            // ahead by the time it is expected to take until tracking is off again (measured after
+            // the first one).
+            double predicted = options.SettleSeconds + CorrectionOverheadSeconds;
             for (int i = 0; i < MaxCorrections && !Arrived(arrived, c.Ha, c.Dec); i++)
             {
                 EndpointCheck small = CheckMove(arrived, target, c.Ha, c.Dec, clock.UtcNow);
@@ -445,15 +500,19 @@ public sealed class ManualFlipSession
                     throw new ConeErrorException("PlanRefused", "The correction is not allowed: " + LimitValidator.Describe(small.Violations));
                 }
 
-                await SlewToCapturedAsync(c.Ha, c.Dec, move.Token);
+                predicted = await SlewToCapturedAsync(c.Ha, c.Dec, predicted, move.Token);
                 arrived = mount.Snapshot();
             }
 
+            double off = ArrivalErrorArcmin(arrived, c.Ha, c.Dec);
             lock (sync)
             {
                 phase = SessionPhase.Ready;
-                lastMove = $"Arrived on the {target.ToString().ToLowerInvariant()} pier side, {ArrivalErrorArcmin(arrived, c.Ha, c.Dec):F1}′ from the captured position.";
-                message = lastMove + " Compare the landmark; re-centre it with the jog pad for an estimate.";
+                reference = (arrived.HourAngleHours, arrived.DeclinationDegrees, arrived.Side);
+                lastMove = $"Arrived on the {target.ToString().ToLowerInvariant()} pier side, {off:F1}′ from the captured position.";
+                message = off <= ArrivalToleranceArcmin
+                    ? lastMove + " Compare the landmark; re-centre it with the jog pad for an estimate."
+                    : lastMove + $" That is more than {ArrivalToleranceArcmin:F0}′: the landmark's shift includes it.";
                 error = null;
             }
         }
@@ -490,9 +549,16 @@ public sealed class ManualFlipSession
                 {
                     moveCts = null;
                 }
+
+                // never leave the mode stuck in Moving (it disables everything in the app)
+                if (!ended && phase == SessionPhase.Moving)
+                {
+                    phase = SessionPhase.Ready;
+                }
             }
 
             move.Dispose();
+            done.TrySetResult();
         }
     }
 
@@ -508,10 +574,15 @@ public sealed class ManualFlipSession
         watchdog.StopOnSun = !active;
     }
 
-    private async Task SlewToCapturedAsync(double ha, double dec, CancellationToken token)
+    /// <summary>
+    /// Slews to the captured hour angle and declination, aiming <paramref name="aheadSeconds"/> ahead
+    /// (the mount tracks until tracking is turned off again). Returns how long it took, seconds.
+    /// </summary>
+    private async Task<double> SlewToCapturedAsync(double ha, double dec, double aheadSeconds, CancellationToken token)
     {
+        DateTime started = clock.UtcNow;
         MountSnapshot snap = mount.Snapshot();
-        double ra = Spherical.RightAscension(snap.LocalSiderealTimeHours, ha);
+        double ra = Spherical.RightAscension(snap.LocalSiderealTimeHours + TargetPlanner.Sidereal(aheadSeconds), ha);
         watchdog.BeginOwnMotion();
         try
         {
@@ -519,9 +590,11 @@ public sealed class ManualFlipSession
         }
         finally
         {
-            watchdog.EndOwnMotion();
             KeepTrackingOff();
+            watchdog.EndOwnMotion();
         }
+
+        return (clock.UtcNow - started).TotalSeconds;
     }
 
     /// <summary>
@@ -534,9 +607,12 @@ public sealed class ManualFlipSession
         {
             lock (trackingLock)
             {
-                if (Finished)
+                lock (sync)
                 {
-                    return;
+                    if (ended)
+                    {
+                        return;
+                    }
                 }
 
                 MountSnapshot snap = mount.Snapshot();
@@ -596,11 +672,40 @@ public sealed class ManualFlipSession
         }
 
         double measured = ConeMath.ManualConeArcmin(west.Value, east.Value, dec);
+        bool verified;
+        bool inverted;
+        lock (sync)
+        {
+            verified = pierLabelsVerified;
+            inverted = pierLabelsInverted;
+        }
+
+        if (inverted)
+        {
+            return new ManualEstimate
+            {
+                MeasuredArcmin = measured,
+                RefusalCode = "PierLabelsInverted",
+                Refusal = "The mount reports its pier side the other way round; the shim advice would point at the wrong end. Check the driver's pier side setting."
+            };
+        }
+
+        if (!verified)
+        {
+            return new ManualEstimate
+            {
+                MeasuredArcmin = measured,
+                RefusalCode = "PierLabelsUnverified",
+                Refusal = "Confirm once where the counterweight is (on the east pier side), so that the shim advice cannot point at the wrong end."
+            };
+        }
+
         if (axisOffsetMm is not > 0 || landmarkDistanceMeters is not > 0)
         {
             return new ManualEstimate
             {
                 MeasuredArcmin = measured,
+                RefusalCode = "ParallaxInputsMissing",
                 Refusal = "Enter the distance from the RA axis to the tube centre and the landmark distance; the parallax of a near landmark looks exactly like cone error."
             };
         }
@@ -613,6 +718,7 @@ public sealed class ManualFlipSession
             {
                 MeasuredArcmin = measured,
                 ParallaxArcmin = parallax,
+                RefusalCode = "LandmarkTooClose",
                 Refusal = $"The landmark is too close: its parallax of {parallax:F2}′ is above {MaxParallaxArcmin}′. Use a landmark at least {minDistance / 1000.0:F1} km away."
             };
         }
@@ -668,6 +774,32 @@ public sealed class ManualFlipSession
         };
     }
 
+    /// <summary>
+    /// The one-time check of the pier side labels: on the east pier side near the meridian the
+    /// counterweight must be on the west. A "no" refuses every estimate of this session.
+    /// </summary>
+    public void ConfirmPierLabels(bool counterweightWest)
+    {
+        EnsureActive();
+        Touch();
+        MountSnapshot snap = mount.Snapshot();
+        if (snap.Side != PierSideLabel.East)
+        {
+            throw new ConeErrorException("NeedEastSide", "Move to the east pier side first; the check is made there.");
+        }
+
+        lock (sync)
+        {
+            pierLabelsVerified = counterweightWest;
+            pierLabelsInverted = !counterweightWest;
+        }
+
+        if (counterweightWest)
+        {
+            PierLabelsConfirmed?.Invoke();
+        }
+    }
+
     /// <summary>Stops a running move now; the mode stays active.</summary>
     public void StopMove()
     {
@@ -691,6 +823,7 @@ public sealed class ManualFlipSession
     private async Task EndAsync(SessionPhase final)
     {
         bool wasOn;
+        TaskCompletionSource running;
         lock (sync)
         {
             if (ended)
@@ -701,9 +834,16 @@ public sealed class ManualFlipSession
             ended = true;
             moveCts?.Cancel();
             wasOn = trackingWasOn;
+            running = moveDone;
         }
 
         cts.Cancel();
+        if (running != null)
+        {
+            // let a cancelled move finish its own clean-up before the settings are restored
+            await Task.WhenAny(running.Task, Task.Delay(TimeSpan.FromSeconds(15)));
+        }
+
         bool ok = true;
         if (begun)
         {
@@ -744,7 +884,9 @@ public sealed class ManualFlipSession
         {
             restorePending = !ok;
             phase = final;
-            message = final == SessionPhase.Aborted ? "Aborted; tracking restored." : "Daytime check ended; tracking restored.";
+            message = !ok
+                ? "The daytime check ended, but restoring the mount's settings failed; restore them from the panel."
+                : final == SessionPhase.Aborted ? "Aborted; tracking restored." : "Daytime check ended; tracking restored.";
         }
 
         try
@@ -754,6 +896,11 @@ public sealed class ManualFlipSession
         catch (Exception)
         {
             // the loop ends with the session
+        }
+
+        lock (sync)
+        {
+            completed = true;
         }
     }
 
@@ -804,19 +951,79 @@ public sealed class ManualFlipSession
             idle = !moving && now - lastActivity > IdleTimeout && now - lastSeen > IdleTimeout;
         }
 
+        bool overridden;
+        lock (sync)
+        {
+            overridden = overrideActive;
+        }
+
         if (moving && now - LastSeen > Deadman)
         {
-            SafeStop();
-            SetError("ConnectionLost", "The app stopped answering during a move, so the mount was stopped.");
-            lock (sync)
+            if (overridden)
             {
-                moveCts?.Cancel();
+                // stopping mid-swing would leave the tube near the Sun; the user overrode the path check
+                SetError("ConnectionLost", "The app stopped answering during the overridden move; the mount was not stopped mid-swing.");
             }
+            else
+            {
+                SafeStop();
+                SetError("ConnectionLost", "The app stopped answering during a move, so the mount was stopped.");
+                lock (sync)
+                {
+                    moveCts?.Cancel();
+                }
+            }
+        }
+
+        if (!moving)
+        {
+            CheckExternalMove();
         }
 
         if (idle)
         {
             _ = EndAsync();
+        }
+    }
+
+    /// <summary>
+    /// A goto or sync from elsewhere (TNS framing, another client) makes the captured position
+    /// meaningless; re-centring with the jog pad moves far less than <see cref="ExternalMoveDegrees"/>.
+    /// </summary>
+    private void CheckExternalMove()
+    {
+        MountSnapshot snap = mount.Snapshot();
+        if (snap == null || !snap.Connected)
+        {
+            return;
+        }
+
+        lock (sync)
+        {
+            if (reference is not { } r || ended)
+            {
+                return;
+            }
+
+            double moved = Spherical.SeparationDegrees(r.Ha, r.Dec, snap.HourAngleHours, snap.DeclinationDegrees);
+            if (moved <= ExternalMoveDegrees && r.Side == snap.Side)
+            {
+                return;
+            }
+
+            captured = null;
+            centredEast = null;
+            centredWest = null;
+            eastCheck = null;
+            westCheck = null;
+            reference = null;
+            plans.Clear();
+            error = new SessionError
+            {
+                Code = "MovedElsewhere",
+                Message = $"The mount was moved or synced by something else ({moved:F1}°); capture the position again."
+            };
+            message = error.Message;
         }
     }
 
@@ -917,7 +1124,8 @@ public sealed class ManualFlipSession
                 WestCheck = westCheck,
                 CentredHourAngleEast = centredEast,
                 CentredHourAngleWest = centredWest,
-                LastMove = lastMove
+                LastMove = lastMove,
+                PierLabelsVerified = pierLabelsVerified
             };
         }
     }
@@ -933,7 +1141,7 @@ public sealed class ManualFlipSession
                 Phase = phase,
                 Message = message,
                 StartedUtc = StartedUtc,
-                Active = !ended,
+                Active = !completed,
                 CurrentSide = manual.CurrentSide,
                 Manual = manual,
                 Sun = watchdog.Sun,

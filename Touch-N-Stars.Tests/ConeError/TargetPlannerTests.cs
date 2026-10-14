@@ -111,14 +111,26 @@ public class TargetPlannerTests
         Assert.True(plan.MaxAbsHourAngleDegrees < 2.5);
     }
 
-    [Fact]
-    public void RefusesWhenTheMeridianOverlapIsShorterThanAPair()
+    [Theory]
+    [InlineData(0.1)]
+    [InlineData(0.0)]
+    public void WithASmallMeridianLimitEveryPairIsMeasuredOnTheNormalSides(double pastMeridian)
     {
-        // A mount that allows only 0.1° past the meridian cannot hold one side while the other is measured.
-        AutoPlan plan = TargetPlanner.Plan(Input(pastMeridian: 0.1));
+        // A mount that allows (almost) nothing past the meridian cannot alternate the side order;
+        // West first (HA < 0), East second (HA > 0) keeps both samples counterweight-down.
+        AutoPlan plan = TargetPlanner.Plan(Input(pastMeridian: pastMeridian, side: PierSideLabel.East));
 
-        Assert.False(plan.Ok);
-        Assert.Contains(plan.Violations, v => v.Code == LimitViolationCode.PastMeridianLimit);
+        Assert.True(plan.Ok, plan.Refusal ?? LimitValidator.Describe(plan.Violations));
+        Assert.True(plan.NormalSidesOnly);
+        Assert.All(plan.Steps, s => Assert.True(s.Check.PastMeridianDegrees <= 0.0));
+        Assert.All(plan.Steps.Where((_, i) => i % 2 == 0), s => Assert.Equal(PierSideLabel.West, s.Side));
+        Assert.Equal("flip", plan.Steps[0].Kind);
+    }
+
+    [Fact]
+    public void ARoomyMeridianLimitKeepsTheAlternatingOrder()
+    {
+        Assert.False(TargetPlanner.Plan(Input(pastMeridian: 2.5)).NormalSidesOnly);
     }
 
     [Fact]

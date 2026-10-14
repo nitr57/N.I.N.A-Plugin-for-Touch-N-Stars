@@ -21,7 +21,8 @@ public sealed record MountSnapshot(
     double SiteLatitude,
     double SiteLongitude,
     string Name,
-    DateTime TimestampUtc)
+    DateTime TimestampUtc,
+    bool AtHome = false)
 {
     public double HourAngleHours => Spherical.HourAngle(LocalSiderealTimeHours, RightAscensionHours);
 }
@@ -37,7 +38,7 @@ public interface IConeMount
     /// <summary>Stops any motion now (abort slew); must return immediately.</summary>
     void Stop();
 
-    /// <summary>Turns tracking on or off; false when the mount refuses.</summary>
+    /// <summary>Turns tracking on or off; true when tracking is now as requested.</summary>
     bool SetTracking(bool enabled);
 }
 

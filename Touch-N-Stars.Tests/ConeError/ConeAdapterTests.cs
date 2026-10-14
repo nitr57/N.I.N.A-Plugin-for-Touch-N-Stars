@@ -39,6 +39,20 @@ public class ConeAdapterTests
         Assert.Equal(3.0, slewTarget.Dec, 1e-9);
     }
 
+    [Theory]
+    [InlineData(false, false, true)]
+    [InlineData(true, true, true)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    public void SetTrackingReportsWhetherTrackingIsNowAsRequested(bool requested, bool stateAfter, bool expected)
+    {
+        // ITelescopeMediator.SetTrackingEnabled returns the tracking state after the call (TelescopeVM)
+        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) =>
+            method.Name == nameof(ITelescopeMediator.SetTrackingEnabled) ? stateAfter : null);
+
+        Assert.Equal(expected, new NinaConeMount(telescope).SetTracking(requested));
+    }
+
     [Fact]
     public async Task ARefusedSlewIsAnError()
     {
@@ -73,17 +87,79 @@ public class ConeAdapterTests
     }
 
     [Fact]
-    public void UnconfirmedIndiLimitsAreIgnored()
+    public void IndiLimitsPolledWithStateIdleAreUsed()
+    {
+        // lx200_OnStep refreshes these with apply() and leaves the state Idle
+        var snapshot = new INDIDeviceSnapshot
+        {
+            Properties =
+            {
+                Property(NinaMountDriverInspector.IndiMinutesPastMeridian, "Idle", ("East", 12.0), ("West", 8.0)),
+                Property(NinaMountDriverInspector.IndiElevationLimit, "Idle", ("minAlt", 0.0), ("maxAlt", 88.0))
+            }
+        };
+
+        MountLimits limits = NinaMountDriverInspector.IndiOnStepLimits(snapshot);
+
+        Assert.Equal(3.0, limits.PastMeridianEastDegrees);
+        Assert.Equal(2.0, limits.PastMeridianWestDegrees);
+        Assert.Equal(88.0, limits.OverheadDegrees);
+        Assert.Equal("INDI OnStep", limits.Source);
+    }
+
+    [Theory]
+    [InlineData("Alert")]
+    [InlineData("Busy")]
+    public void IndiLimitsInAlertOrBusyAreIgnoredAndNotClaimedAsTheSource(string state)
     {
         var snapshot = new INDIDeviceSnapshot
         {
-            Properties = { Property(NinaMountDriverInspector.IndiMinutesPastMeridian, "Alert", ("East", 20.0), ("West", 20.0)) }
+            Properties = { Property(NinaMountDriverInspector.IndiMinutesPastMeridian, state, ("East", 20.0), ("West", 20.0)) }
         };
 
         MountLimits limits = NinaMountDriverInspector.IndiOnStepLimits(snapshot);
 
         Assert.Null(limits.PastMeridianEastDegrees);
         Assert.Null(limits.HorizonDegrees);
+        Assert.Null(limits.Source);
+    }
+
+    [Fact]
+    public void TheIndiPierSideChangeIsConfirmedOnlyByANewerDriverUpdate()
+    {
+        INDIPropertySnapshot Switch(string state, string timestamp, params string[] on)
+        {
+            var p = new INDIPropertySnapshot { Name = NinaMountDriverInspector.IndiPreferredPierSide, State = state, Timestamp = timestamp, Type = "switch" };
+            foreach (string e in new[] { "1", "2", "3" })
+            {
+                p.Elements.Add(new INDIElementSnapshot { Name = e, Value = on.Contains(e) });
+            }
+
+            return p;
+        }
+
+        // the local copy right after SetProperty: old timestamp, element already On
+        Assert.False(IndiOnStepPierSideControl.IsConfirmed(Switch("Ok", "t0", "2"), "t0", "2"));
+        // the stock driver's answer to OnStepX's '1': switch reset, Busy
+        Assert.False(IndiOnStepPierSideControl.IsConfirmed(Switch("Busy", "t1"), "t0", "2"));
+        // its next poll read :GX96# back
+        Assert.True(IndiOnStepPierSideControl.IsConfirmed(Switch("Ok", "t2", "2"), "t0", "2"));
+        // the mount kept the old value
+        Assert.False(IndiOnStepPierSideControl.IsConfirmed(Switch("Ok", "t2", "1"), "t0", "2"));
+    }
+
+    [Fact]
+    public void AnAmbiguousIndiSwitchIsResolvedByGx96OrTakenAsBest()
+    {
+        var property = new INDIPropertySnapshot { Name = NinaMountDriverInspector.IndiPreferredPierSide, State = "Ok" };
+        property.Elements.Add(new INDIElementSnapshot { Name = "1", Value = true });
+        property.Elements.Add(new INDIElementSnapshot { Name = "2", Value = true });
+        property.Elements.Add(new INDIElementSnapshot { Name = "3", Value = false });
+
+        Assert.Equal("East", IndiOnStepPierSideControl.Interpret(property, () => "E"));
+        Assert.Equal("Best", IndiOnStepPierSideControl.Interpret(property, () => throw new NotImplementedException("serial")));
+        property.Elements[1].Value = false;
+        Assert.Equal("West", IndiOnStepPierSideControl.Interpret(property));
     }
 
     [Theory]

@@ -25,6 +25,9 @@ public sealed class AutoRunOptions
     /// <summary>Ask once whether the counterweight is where the reported pier side says.</summary>
     public bool AskPierLabels { get; init; }
 
+    /// <summary>Measure every pair west first, east second (the plan's <see cref="AutoPlan.NormalSidesOnly"/>).</summary>
+    public bool NormalSidesOnly { get; init; }
+
     public string MountKey { get; init; }
     public ProfileFacts Profile { get; init; }
 }
@@ -74,6 +77,7 @@ public sealed class AutoMeasurementSession
     private int questionIds;
     private bool restorePending;
     private bool pierLabelsChecked;
+    private bool completed;
     private string abortCode;
     private string abortMessage;
 
@@ -95,7 +99,7 @@ public sealed class AutoMeasurementSession
         this.sun = sun;
         this.store = store;
         this.options = options;
-        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees);
+        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees);
         watchdog.SunTooClose += sep => AbortWith("SunTooClose", $"The telescope came within {sep:F1}° of the Sun; the measurement was stopped.");
         watchdog.UnexpectedMotion += reason => AbortWith("UnexpectedMotion", reason + " The measurement was stopped; restart it without syncing or moving the mount.");
         StartedUtc = clock.UtcNow;
@@ -117,7 +121,7 @@ public sealed class AutoMeasurementSession
         {
             lock (sync)
             {
-                return phase is SessionPhase.Complete or SessionPhase.Failed or SessionPhase.Aborted;
+                return completed;
             }
         }
     }
@@ -141,11 +145,16 @@ public sealed class AutoMeasurementSession
 
             abortCode ??= code;
             abortMessage ??= reason;
+        }
+
+        // cancel first, so that nothing that wakes up below reads a live token
+        cts.Cancel();
+        lock (sync)
+        {
             answer?.TrySetResult(false);
         }
 
         SafeStop();
-        cts.Cancel();
     }
 
     private void SafeStop()
@@ -193,7 +202,7 @@ public sealed class AutoMeasurementSession
                 Phase = phase,
                 Message = message,
                 StartedUtc = StartedUtc,
-                Active = !(phase is SessionPhase.Complete or SessionPhase.Failed or SessionPhase.Aborted),
+                Active = !completed,
                 PairIndex = pairIndex,
                 Repetitions = options.Repetitions,
                 CurrentSide = currentSide?.ToString(),
@@ -235,7 +244,10 @@ public sealed class AutoMeasurementSession
             });
             changedPierSide = true;
 
-            currentSide = mount.Snapshot()?.Side ?? PierSideLabel.East;
+            MountSnapshot start = mount.Snapshot();
+            // At home OnStepX ignores the preferred pier side and takes the side from the sign of the
+            // hour angle (Goto.cpp setTarget); the first target is east of the meridian, so West.
+            currentSide = start == null ? PierSideLabel.East : start.AtHome ? PierSideLabel.West : start.Side ?? PierSideLabel.East;
             for (int p = 0; p < options.Repetitions; p++)
             {
                 token.ThrowIfCancellationRequested();
@@ -249,8 +261,10 @@ public sealed class AutoMeasurementSession
 
             Finish();
         }
-        catch (OperationCanceledException) when (abortCode != null)
+        catch (Exception) when (Volatile.Read(ref abortCode) != null)
         {
+            // an abort also makes the goto or the exposure it interrupted fail; report the abort
+            SafeStop();
             Fail(SessionPhase.Aborted, abortCode, abortMessage);
         }
         catch (ConeErrorException ex)
@@ -262,7 +276,7 @@ public sealed class AutoMeasurementSession
         {
             Logger.Error($"ConeError: measurement failed: {ex}");
             SafeStop();
-            Fail(abortCode != null ? SessionPhase.Aborted : SessionPhase.Failed, abortCode ?? "Error", abortMessage ?? ex.Message);
+            Fail(SessionPhase.Failed, "Error", ex.Message);
         }
         finally
         {
@@ -271,6 +285,11 @@ public sealed class AutoMeasurementSession
             if (changedPierSide)
             {
                 await RestoreAsync();
+            }
+
+            lock (sync)
+            {
+                completed = true;
             }
         }
     }
@@ -307,11 +326,13 @@ public sealed class AutoMeasurementSession
     private async Task MeasurePairAsync(int p, CancellationToken token)
     {
         PairTiming timing = options.Timing;
-        PierSideLabel first = currentSide ?? PierSideLabel.East;
+        PierSideLabel first = options.NormalSidesOnly ? PierSideLabel.West : currentSide ?? PierSideLabel.East;
         PierSideLabel second = ConeMath.Other(first);
 
         MountSnapshot snap = mount.Snapshot();
-        double slew = p == 0 ? timing.SlewSeconds : Math.Min(timing.SlewSeconds, 30.0);
+        double slew = p == 0
+            ? timing.SlewSeconds
+            : first != currentSide ? timing.FlipSeconds : Math.Min(timing.SlewSeconds, 30.0);
         double centre = slew + timing.SettleSeconds + timing.ExposureSeconds / 2.0 + timing.BetweenSidesSeconds / 2.0;
         double ra = Spherical.WrapHours24(snap.LocalSiderealTimeHours + TargetPlanner.Sidereal(centre));
         double dec = options.DeclinationDegrees;
@@ -327,6 +348,7 @@ public sealed class AutoMeasurementSession
         foreach (PierSideLabel side in new[] { first, second })
         {
             double expectedIn = (side == first ? slew : timing.FlipSeconds) + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
+            token.ThrowIfCancellationRequested();
             SideSample sample = await MeasureSideAsync(p, side, ra, dec, expectedIn, token);
             if (!sample.Ok)
             {
@@ -399,6 +421,7 @@ public sealed class AutoMeasurementSession
 
         SetPhase(SessionPhase.Slewing, $"Pair {p + 1}: {(side == currentSide ? "slewing" : "flipping")} to the {side.ToString().ToLowerInvariant()} pier side");
         await pierSide.PrepareAsync(side, token);
+        token.ThrowIfCancellationRequested();
         watchdog.BeginOwnMotion();
         try
         {
@@ -498,6 +521,11 @@ public sealed class AutoMeasurementSession
         }
 
         token.ThrowIfCancellationRequested();
+        if (Volatile.Read(ref abortCode) != null)
+        {
+            throw new OperationCanceledException(token);
+        }
+
         if (finished != pending.Task)
         {
             throw new ConeErrorException("QuestionTimeout", "No answer to the pier side check; the measurement stopped.");

@@ -27,9 +27,10 @@ public class FlipPathSunTests
     public void FlipPathGoesOverThePoleAndEndsOnTheSamePointing()
     {
         IReadOnlyList<HaDec> path = FlipPathSampler.Sample(
-            GemGeometry.ToAxes(PierSideLabel.East, 0.0, -38.0),
-            GemGeometry.ToAxes(PierSideLabel.West, 0.0, -38.0),
-            strict: false);
+            GemGeometry.ToAxes(PierSideLabel.East, 0.0, -38.0, Latitude),
+            GemGeometry.ToAxes(PierSideLabel.West, 0.0, -38.0, Latitude),
+            strict: false,
+            Latitude);
 
         Assert.Contains(path, p => p.Declination > 89.0);
         Assert.Equal(0.0, path[^1].HourAngle, 1e-9);
@@ -40,8 +41,11 @@ public class FlipPathSunTests
     [Fact]
     public void BothSidesOfTheSamePointingHaveTheSameSkyPosition()
     {
-        HaDec east = GemGeometry.Pointing(GemGeometry.ToAxes(PierSideLabel.East, 1.3, 12.0));
-        HaDec west = GemGeometry.Pointing(GemGeometry.ToAxes(PierSideLabel.West, 1.3, 12.0));
+        HaDec east = GemGeometry.Pointing(GemGeometry.ToAxes(PierSideLabel.East, 1.3, 12.0, Latitude));
+        HaDec west = GemGeometry.Pointing(GemGeometry.ToAxes(PierSideLabel.West, 1.3, 12.0, Latitude));
+        HaDec southWest = GemGeometry.Pointing(GemGeometry.ToAxes(PierSideLabel.West, 1.3, 12.0, -35.0));
+        Assert.Equal(east.HourAngle, southWest.HourAngle, 1e-9);
+        Assert.Equal(east.Declination, southWest.Declination, 1e-9);
 
         Assert.Equal(east.HourAngle, west.HourAngle, 1e-9);
         Assert.Equal(east.Declination, west.Declination, 1e-9);
@@ -81,16 +85,35 @@ public class FlipPathSunTests
     [Fact]
     public void StrictPathsAlsoRefuseASunOnlyTheRaFirstSwingWouldPass()
     {
+        // A target on the celestial equator; a spring-morning Sun 10° up in the east, 75° away.
+        // Only turning the RA axis first sweeps the tube along the equator past it.
+        var target = new HaDec(0.0, 0.0);
+        HaDec[] sun = { new(-5.0, 0.0) };
+
+        EndpointCheck normal = LimitValidator.ValidateMove(DaytimeLimits(), PierSideLabel.East, target, PierSideLabel.West, target, Latitude, sun, strictPath: false);
+        EndpointCheck strict = LimitValidator.ValidateMove(DaytimeLimits(), PierSideLabel.East, target, PierSideLabel.West, target, Latitude, sun, strictPath: true);
+
+        Assert.True(normal.Ok, LimitValidator.Describe(normal.Violations));
+        Assert.Contains(strict.Violations, v => v.Code == LimitViolationCode.SunTooCloseOnPath);
+    }
+
+    [Fact]
+    public void ASunBelowTheHorizonRefusesNothing()
+    {
+        // 8° below the horizon, geometrically next to the swing
         HaDec[] sun = { new(5.0, -23.0) };
 
-        Assert.True(Flip(sun, strict: false).Ok);
-        Assert.Contains(Flip(sun, strict: true).Violations, v => v.Code == LimitViolationCode.SunTooCloseOnPath);
+        EndpointCheck check = LimitValidator.ValidateMove(
+            DaytimeLimits(), PierSideLabel.East, new HaDec(0.0, 0.0), PierSideLabel.West, new HaDec(0.0, 0.0), Latitude, sun, strictPath: true);
+
+        Assert.True(check.Ok);
+        Assert.True(check.SunBelowHorizon);
     }
 
     [Fact]
     public void ShortMovesOnlyCheckTheShortWayRound()
     {
-        IReadOnlyList<HaDec> path = FlipPathSampler.Sample(new AxisAngles(10.0, 20.0), new AxisAngles(12.0, 21.0), strict: false);
+        IReadOnlyList<HaDec> path = FlipPathSampler.Sample(new AxisAngles(10.0, 20.0), new AxisAngles(12.0, 21.0), strict: false, Latitude);
 
         Assert.All(path, p => Assert.InRange(p.HourAngle * 15.0, 9.9, 12.1));
     }
@@ -146,6 +169,69 @@ public class FlipPathSunTests
 
         Assert.False(check.Ok);
         Assert.True(check.PathSunSeparationDegrees < check.SunSeparationDegrees);
+    }
+
+    [Fact]
+    public void SouthernFlipSwingsOverTheSouthPole()
+    {
+        // 35° S, landmark 2° above the northern horizon on the meridian
+        IReadOnlyList<HaDec> path = FlipPathSampler.Sample(
+            GemGeometry.ToAxes(PierSideLabel.East, 0.0, 53.0, -35.0),
+            GemGeometry.ToAxes(PierSideLabel.West, 0.0, 53.0, -35.0),
+            strict: false,
+            -35.0);
+
+        Assert.Contains(path, p => p.Declination < -89.0);
+        Assert.DoesNotContain(path, p => p.Declination > 53.5);
+    }
+
+    [Fact]
+    public void SouthernSunNearTheRealSwingIsRefused()
+    {
+        // A mid-morning Sun 60° from the landmark: sampling over the north pole kept 48° from it,
+        // the real swing over the south pole passes about 2° from it.
+        var landmark = new HaDec(0.0, 53.0);
+        EndpointCheck check = LimitValidator.ValidateMove(
+            DaytimeLimits(), PierSideLabel.East, landmark, PierSideLabel.West, landmark, -35.0, new[] { new HaDec(-3.0, 5.0) }, strictPath: false);
+
+        Assert.True(check.SunSeparationDegrees > 55.0);
+        Assert.Contains(check.Violations, v => v.Code == LimitViolationCode.SunTooCloseOnPath);
+        Assert.True(check.PathSunSeparationDegrees < 5.0);
+    }
+
+    [Fact]
+    public void OnStepXsRouteViaHomeIsSampled()
+    {
+        // OnStepX flips via the home position by default (MFLIP_SKIP_HOME OFF). Its second leg at
+        // equal rates points at about (−3 h, 45°) where the direct paths are at 26° or 83°.
+        AxisAngles from = GemGeometry.ToAxes(PierSideLabel.East, 0.0, -38.0, Latitude);
+        AxisAngles to = GemGeometry.ToAxes(PierSideLabel.West, 0.0, -38.0, Latitude);
+        var viaHomePoint = new HaDec(-3.0, 45.0);
+
+        IReadOnlyList<HaDec> path = FlipPathSampler.Sample(from, to, strict: false, Latitude);
+        double nearest = path.Min(p => Spherical.SeparationDegrees(p.HourAngle, p.Declination, viaHomePoint.HourAngle, viaHomePoint.Declination));
+
+        Assert.True(nearest < 1.0);
+        Assert.Contains(path, p => p.Declination > 89.5);
+    }
+
+    [Fact]
+    public void LowLandmarksAtLowLatitudesAlsoCheckTheHorizonAvoidingWaypoint()
+    {
+        IReadOnlyList<HaDec> plain = FlipPathSampler.Sample(
+            GemGeometry.ToAxes(PierSideLabel.East, 0.0, -70.0, 20.0),
+            GemGeometry.ToAxes(PierSideLabel.West, 0.0, -70.0, 20.0),
+            strict: false,
+            20.0,
+            startAltitudeDegrees: 60.0);
+        IReadOnlyList<HaDec> low = FlipPathSampler.Sample(
+            GemGeometry.ToAxes(PierSideLabel.East, 0.0, -70.0, 20.0),
+            GemGeometry.ToAxes(PierSideLabel.West, 0.0, -70.0, 20.0),
+            strict: false,
+            20.0,
+            startAltitudeDegrees: 0.0);
+
+        Assert.True(low.Count > plain.Count);
     }
 
     private static HaDec Sun(DateTime utc)

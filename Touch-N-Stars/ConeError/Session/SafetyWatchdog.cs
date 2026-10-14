@@ -12,7 +12,9 @@ namespace TouchNStars.ConeError.Session;
 /// <item>the Sun relative to the current pointing: a warning within radius + 5°; within the radius
 /// any running move is stopped and the session is told (it does not move the mount by itself);</item>
 /// <item>a position jump while neither the session nor the mount is slewing (a sync or a move from
-/// elsewhere), which would corrupt the measurement.</item>
+/// elsewhere), which would corrupt the measurement;</item>
+/// <item>a goto the session did not start (TNS framing or centring, another client), when
+/// <see cref="DetectExternalSlews"/> is on.</item>
 /// </list>
 /// <see cref="Check"/> is the testable step; <see cref="RunAsync"/> calls it in a loop.
 /// </summary>
@@ -25,19 +27,26 @@ public sealed class SafetyWatchdog
 
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(1);
 
+    /// <summary>After an own move the driver may still report slewing for a moment.</summary>
+    public static readonly TimeSpan OwnMotionGrace = TimeSpan.FromSeconds(5);
+
     private readonly IConeMount mount;
     private readonly ISunProvider sun;
     private readonly IClock clock;
     private readonly Func<double> radius;
+    private readonly Func<double> latitude;
     private MountSnapshot last;
     private int ownMotion;
+    private DateTime lastOwnMotionEnd = DateTime.MinValue;
 
-    public SafetyWatchdog(IConeMount mount, ISunProvider sun, IClock clock, Func<double> radiusDegrees)
+    /// <param name="latitudeDegrees">The site latitude; a Sun below the horizon there is no hazard.</param>
+    public SafetyWatchdog(IConeMount mount, ISunProvider sun, IClock clock, Func<double> radiusDegrees, Func<double> latitudeDegrees)
     {
         this.mount = mount;
         this.sun = sun;
         this.clock = clock;
         radius = radiusDegrees;
+        latitude = latitudeDegrees;
     }
 
     /// <summary>The Sun came within the radius of the current pointing.</summary>
@@ -54,12 +63,16 @@ public sealed class SafetyWatchdog
     /// </summary>
     public bool StopOnSun { get; set; } = true;
 
+    /// <summary>Whether a slew the session did not start counts as unexpected motion; off for the daytime check, whose user re-centres with the jog pad.</summary>
+    public bool DetectExternalSlews { get; set; } = true;
+
     /// <summary>Marks a move the session started itself; position changes until <see cref="EndOwnMotion"/> are expected.</summary>
     public void BeginOwnMotion() => Interlocked.Increment(ref ownMotion);
 
     public void EndOwnMotion()
     {
         Interlocked.Decrement(ref ownMotion);
+        lastOwnMotionEnd = clock.UtcNow;
         last = null;
     }
 
@@ -99,15 +112,16 @@ public sealed class SafetyWatchdog
         HaDec sunNow = sun.SunAt(clock.UtcNow);
         double separation = Spherical.SeparationDegrees(now.HourAngleHours, now.DeclinationDegrees, sunNow.HourAngle, sunNow.Declination);
         double r = radius();
+        bool up = LimitValidator.SunUp(sunNow, latitude());
         Sun = new SunWatchStatus
         {
             SeparationDegrees = separation,
             RadiusDegrees = r,
-            Warning = separation < r + WarningMarginDegrees,
-            Critical = separation < r
+            Warning = up && separation < r + WarningMarginDegrees,
+            Critical = up && separation < r
         };
 
-        if (separation < r)
+        if (up && separation < r)
         {
             if (StopOnSun && (now.Slewing || Volatile.Read(ref ownMotion) > 0))
             {
@@ -117,9 +131,20 @@ public sealed class SafetyWatchdog
             SunTooClose?.Invoke(separation);
         }
 
-        if (Volatile.Read(ref ownMotion) > 0 || now.Slewing)
+        if (Volatile.Read(ref ownMotion) > 0)
         {
             last = null;
+            return;
+        }
+
+        if (now.Slewing)
+        {
+            last = null;
+            if (DetectExternalSlews && clock.UtcNow - lastOwnMotionEnd > OwnMotionGrace)
+            {
+                UnexpectedMotion?.Invoke("The mount started a goto that the measurement did not ask for (another view or client).");
+            }
+
             return;
         }
 

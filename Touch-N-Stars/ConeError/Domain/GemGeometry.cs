@@ -6,7 +6,9 @@ namespace TouchNStars.ConeError.Domain;
 /// <summary>
 /// Mechanical axis angles of a German equatorial mount, in degrees. <see cref="Ra"/> turns the Dec axis
 /// about the polar axis; <see cref="Dec"/> turns the tube about the Dec axis. On pierEast a pointing
-/// (h, δ) has the axes (15·h, δ); on pierWest (15·h + 180, 180 − δ), i.e. through the pole.
+/// (h, δ) has the axes (15·h, δ). On pierWest the tube is through the visible pole: (15·h + 180,
+/// 180 − δ) in the northern hemisphere, (15·h + 180, −180 − δ) in the southern one, so that a flip
+/// swings over the pole the mount actually points at (as OnStepX's Transform::mountToInstrument does).
 /// </summary>
 public readonly record struct AxisAngles(double Ra, double Dec);
 
@@ -15,20 +17,31 @@ public readonly record struct HaDec(double HourAngle, double Declination);
 
 /// <summary>
 /// The ideal (error-free) kinematics of a German equatorial mount in the frame
-/// X = (HA 0, Dec 0), Y = east, Z = celestial pole. The Dec axis unit vector (from the mount toward
-/// the tube) is u = (sin A, cos A, 0) and the optical axis (cos B cos A, −cos B sin A, sin B).
+/// X = (HA 0, Dec 0), Y = east, Z = north celestial pole. The Dec axis unit vector (from the mount
+/// toward the tube) is u = (sin A, cos A, 0) and the optical axis (cos B cos A, −cos B sin A, sin B).
 /// With these, pierEast (u = (sin h, cos h, 0)) is the counterweight-down side for hour angles
 /// 0..12 h in both hemispheres, which is NINA's <c>MeridianFlip.ExpectedPierSide</c>.
 /// </summary>
 public static class GemGeometry
 {
-    public static AxisAngles ToAxes(PierSideLabel side, double hourAngleHours, double declinationDegrees)
+    public static AxisAngles ToAxes(PierSideLabel side, double hourAngleHours, double declinationDegrees, double latitudeDegrees)
     {
         double a = Spherical.WrapHours12(hourAngleHours) * 15.0;
-        return side == PierSideLabel.East
-            ? new AxisAngles(a, declinationDegrees)
-            : new AxisAngles(a + 180.0, 180.0 - declinationDegrees);
+        if (side == PierSideLabel.East)
+        {
+            return new AxisAngles(a, declinationDegrees);
+        }
+
+        return latitudeDegrees >= 0.0
+            ? new AxisAngles(a + 180.0, 180.0 - declinationDegrees)
+            : new AxisAngles(a + 180.0, -180.0 - declinationDegrees);
     }
+
+    /// <summary>The home (park) position: tube at the visible pole, counterweight down.</summary>
+    public static AxisAngles Home(double latitudeDegrees) => new(90.0, latitudeDegrees >= 0.0 ? 90.0 : -90.0);
+
+    /// <summary>Whether axis angles are the beyond-the-pole form (pierWest).</summary>
+    public static bool BeyondPole(AxisAngles axes) => Math.Abs(Spherical.WrapDegrees180(axes.Dec)) > 90.0;
 
     /// <summary>Unit vector of the ideal optical axis for axis angles.</summary>
     public static Vector3 OpticalAxis(AxisAngles axes)
@@ -59,7 +72,10 @@ public static class GemGeometry
 /// <list type="bullet">
 /// <item>both axes in proportion (straight in axis space);</item>
 /// <item>both axes at the same angular rate, the shorter one stopping first;</item>
-/// <item>for RA travel of 90° or more (a flip), both of the above also the other way round the RA axis;</item>
+/// <item>for RA travel of 135° or more (a flip), both of the above also the other way round the RA axis;</item>
+/// <item>for a pier side change, the same via the home position, which OnStepX visits by default
+/// (MFLIP_SKIP_HOME OFF, Goto.cpp), and below 20° altitude at latitudes under 45° also via its
+/// horizon-avoiding waypoint at 45° or 135° of the RA axis (Goto::waypoint);</item>
 /// <item>with <c>strict</c>, also RA first then Dec, and Dec first then RA.</item>
 /// </list>
 /// </summary>
@@ -67,16 +83,51 @@ public static class FlipPathSampler
 {
     public const double DefaultStepDegrees = 0.5;
 
-    /// <summary>RA travel from which the long way round the RA axis is also considered.</summary>
-    public const double BothDirectionsFromDegrees = 90.0;
+    /// <summary>
+    /// RA travel from which the long way round the RA axis is also considered: a flip (about 180°),
+    /// whose direction the mount does not tell. A shorter leg, such as the 90° to the home position,
+    /// takes the short way.
+    /// </summary>
+    public const double BothDirectionsFromDegrees = 135.0;
 
-    public static IReadOnlyList<HaDec> Sample(AxisAngles from, AxisAngles to, bool strict, double stepDegrees = DefaultStepDegrees)
+    public static IReadOnlyList<HaDec> Sample(
+        AxisAngles from,
+        AxisAngles to,
+        bool strict,
+        double latitudeDegrees,
+        double startAltitudeDegrees = 90.0,
+        double stepDegrees = DefaultStepDegrees)
     {
         if (stepDegrees <= 0.0)
         {
             throw new ArgumentOutOfRangeException(nameof(stepDegrees));
         }
 
+        var points = new List<HaDec>();
+        AddLeg(points, from, to, strict, stepDegrees);
+
+        if (GemGeometry.BeyondPole(from) != GemGeometry.BeyondPole(to))
+        {
+            AxisAngles home = GemGeometry.Home(latitudeDegrees);
+            AddLeg(points, from, home, strict, stepDegrees);
+            AddLeg(points, home, to, strict, stepDegrees);
+
+            if (startAltitudeDegrees < 20.0 && Math.Abs(latitudeDegrees) < 45.0)
+            {
+                foreach (double ra in new[] { 45.0, 135.0 })
+                {
+                    var avoid = new AxisAngles(ra, home.Dec);
+                    AddLeg(points, from, avoid, strict, stepDegrees);
+                    AddLeg(points, avoid, home, strict, stepDegrees);
+                }
+            }
+        }
+
+        return points;
+    }
+
+    private static void AddLeg(List<HaDec> points, AxisAngles from, AxisAngles to, bool strict, double stepDegrees)
+    {
         double dRa = Spherical.WrapDegrees180(to.Ra - from.Ra);
         double dDec = to.Dec - from.Dec;
 
@@ -86,7 +137,6 @@ public static class FlipPathSampler
             raTravels.Add(dRa > 0.0 ? dRa - 360.0 : dRa + 360.0);
         }
 
-        var points = new List<HaDec>();
         foreach (double ra in raTravels)
         {
             AddProportional(points, from, ra, dDec, stepDegrees);
@@ -97,8 +147,6 @@ public static class FlipPathSampler
                 AddDecFirst(points, from, ra, dDec, stepDegrees);
             }
         }
-
-        return points;
     }
 
     private static int Steps(double travel, double stepDegrees) => Math.Max(1, (int)Math.Ceiling(Math.Abs(travel) / stepDegrees));

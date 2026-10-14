@@ -99,6 +99,9 @@ public sealed class EndpointCheck
     /// <summary>Smallest separation from the Sun at this endpoint over all checked times.</summary>
     public double SunSeparationDegrees { get; init; }
 
+    /// <summary>The Sun is below <see cref="LimitValidator.SunSetAltitudeDegrees"/> at every checked time: no sun hazard.</summary>
+    public bool SunBelowHorizon { get; init; }
+
     /// <summary>Smallest separation from the Sun along the move to this endpoint, or NaN when no path was checked.</summary>
     public double PathSunSeparationDegrees { get; init; } = double.NaN;
 
@@ -114,6 +117,16 @@ public sealed class EndpointCheck
 /// </summary>
 public static class LimitValidator
 {
+    /// <summary>
+    /// A Sun lower than this cannot shine into the optics (its visible disc sets at about −0.8° with
+    /// refraction), so it does not refuse a move. Degrees.
+    /// </summary>
+    public const double SunSetAltitudeDegrees = -2.0;
+
+    /// <summary>Whether the Sun is high enough to matter at a latitude.</summary>
+    public static bool SunUp(HaDec sun, double latitudeDegrees)
+        => Spherical.AltAz(sun.HourAngle, sun.Declination, latitudeDegrees).Altitude >= SunSetAltitudeDegrees;
+
     public static EndpointCheck ValidateEndpoint(
         LimitSet limits,
         PierSideLabel side,
@@ -136,10 +149,13 @@ public static class LimitValidator
         IReadOnlyList<HaDec> suns,
         bool strictPath)
     {
+        (double startAltitude, _) = Spherical.AltAz(from.HourAngle, from.Declination, latitudeDegrees);
         IReadOnlyList<HaDec> path = FlipPathSampler.Sample(
-            GemGeometry.ToAxes(fromSide, from.HourAngle, from.Declination),
-            GemGeometry.ToAxes(toSide, to.HourAngle, to.Declination),
-            strictPath);
+            GemGeometry.ToAxes(fromSide, from.HourAngle, from.Declination, latitudeDegrees),
+            GemGeometry.ToAxes(toSide, to.HourAngle, to.Declination, latitudeDegrees),
+            strictPath,
+            latitudeDegrees,
+            startAltitude);
 
         return Validate(limits, toSide, to.HourAngle, to.Declination, latitudeDegrees, suns, path);
     }
@@ -200,13 +216,16 @@ public static class LimitValidator
                 source));
         }
 
+        HaDec[] upSuns = suns.Where(s => SunUp(s, latitudeDegrees)).ToArray();
+        bool sunBelowHorizon = upSuns.Length == 0;
         double endpointSun = MinSunSeparation(new[] { new HaDec(hourAngleHours, declinationDegrees) }, suns);
-        if (endpointSun < limits.SunExclusionDegrees)
+        double endpointUpSun = sunBelowHorizon ? double.PositiveInfinity : MinSunSeparation(new[] { new HaDec(hourAngleHours, declinationDegrees) }, upSuns);
+        if (endpointUpSun < limits.SunExclusionDegrees)
         {
             violations.Add(new LimitViolation(
                 LimitViolationCode.SunTooClose,
-                $"The position is {endpointSun:F1}° from the Sun; the exclusion radius is {limits.SunExclusionDegrees:F0}°.",
-                endpointSun,
+                $"The position is {endpointUpSun:F1}° from the Sun; the exclusion radius is {limits.SunExclusionDegrees:F0}°.",
+                endpointUpSun,
                 limits.SunExclusionDegrees,
                 "PINS sun exclusion"));
         }
@@ -215,12 +234,13 @@ public static class LimitValidator
         if (path != null)
         {
             pathSun = MinSunSeparation(path, suns);
-            if (pathSun < limits.SunExclusionDegrees && endpointSun >= limits.SunExclusionDegrees)
+            double pathUpSun = sunBelowHorizon ? double.PositiveInfinity : MinSunSeparation(path, upSuns);
+            if (pathUpSun < limits.SunExclusionDegrees && endpointUpSun >= limits.SunExclusionDegrees)
             {
                 violations.Add(new LimitViolation(
                     LimitViolationCode.SunTooCloseOnPath,
-                    $"The move may pass {pathSun:F1}° from the Sun on its way; the exclusion radius is {limits.SunExclusionDegrees:F0}°.",
-                    pathSun,
+                    $"The move may pass {pathUpSun:F1}° from the Sun on its way; the exclusion radius is {limits.SunExclusionDegrees:F0}°.",
+                    pathUpSun,
                     limits.SunExclusionDegrees,
                     "PINS sun exclusion"));
             }
@@ -238,6 +258,7 @@ public static class LimitValidator
             MinAltitudeDegrees = minAltitude,
             SunSeparationDegrees = endpointSun,
             PathSunSeparationDegrees = pathSun,
+            SunBelowHorizon = sunBelowHorizon,
             Violations = violations
         };
     }

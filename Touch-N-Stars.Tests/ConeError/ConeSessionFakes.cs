@@ -104,6 +104,16 @@ public sealed class FakeMount : IConeMount
     /// <summary>The mount ignores the preferred pier side and stays where it is.</summary>
     public bool IgnorePierSide { get; set; }
 
+    /// <summary>At home OnStepX ignores the preferred side and takes it from the sign of the hour angle (Goto.cpp).</summary>
+    public bool AtHome { get; set; }
+
+    /// <summary>NINA's settle time after a goto, during which the driver keeps tracking on.</summary>
+    public double SettleSeconds { get; set; }
+
+    /// <summary>A goto started by something else (another view or client) is running.</summary>
+    public bool ExternalSlew { get; set; }
+
+
     /// <summary>Degrees per second of a goto; the goto tracks meanwhile, like real drivers do.</summary>
     public double SlewSpeed { get; set; } = 2.0;
 
@@ -157,13 +167,17 @@ public sealed class FakeMount : IConeMount
         {
             double lst = Lst;
             double currentRa = Tracking ? ra : Spherical.RightAscension(lst, ha);
-            return new MountSnapshot(true, false, Tracking, Slewing, Side, lst, currentRa, dec, Latitude, longitude, "Fake mount", clock.UtcNow);
+            return new MountSnapshot(true, false, Tracking, Slewing || ExternalSlew, Side, lst, currentRa, dec, Latitude, longitude, "Fake mount", clock.UtcNow, AtHome);
         }
     }
 
     public async Task SlewAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
     {
         PierSideLabel target = IgnorePierSide || PierSide == null ? Side : PierSide.Preferred ?? Side;
+        if (AtHome)
+        {
+            target = Spherical.HourAngle(Lst, rightAscensionHours) < 0.0 ? PierSideLabel.West : PierSideLabel.East;
+        }
         lock (sync)
         {
             Slews.Add((rightAscensionHours, declinationDegrees, target));
@@ -193,7 +207,11 @@ public sealed class FakeMount : IConeMount
                 dec = declinationDegrees;
                 ha = Spherical.HourAngle(Lst, ra);
                 Side = target;
+                AtHome = false;
             }
+
+            // NINA waits the settle time with tracking still on
+            await clock.Delay(TimeSpan.FromSeconds(SettleSeconds), token);
         }
         finally
         {
@@ -250,6 +268,9 @@ public sealed class FakePierSide : IPierSideControl
     public int Prepares { get; private set; }
     public bool FailRestore { get; set; }
 
+    /// <summary>Reading the original setting fails (e.g. a serial error).</summary>
+    public bool FailRead { get; set; }
+
     public PierSideLabel? Preferred => Setting switch
     {
         "East" => PierSideLabel.East,
@@ -257,7 +278,7 @@ public sealed class FakePierSide : IPierSideControl
         _ => null
     };
 
-    public string ReadOriginal() => OriginalSetting ??= Setting;
+    public string ReadOriginal() => FailRead ? throw new InvalidOperationException("serial read failed") : OriginalSetting ??= Setting;
 
     public Task PrepareAsync(PierSideLabel side, CancellationToken token)
     {
@@ -375,7 +396,7 @@ public sealed class AutoRig : IDisposable
 
     public static readonly PairTiming Timing = new(SlewSeconds: 120, FlipSeconds: 90, SettleSeconds: 2, ExposureSeconds: 5, SolveSeconds: 30);
 
-    public AutoMeasurementSession Session(int repetitions = 4, bool askPierLabels = false, double maxAbsHa = 2.5) => new(
+    public AutoMeasurementSession Session(int repetitions = 4, bool askPierLabels = false, double maxAbsHa = 2.5, bool normalSidesOnly = false) => new(
         Mount,
         PierSide,
         Imager,
@@ -393,6 +414,7 @@ public sealed class AutoRig : IDisposable
             LatitudeDegrees = 50.0,
             MaxAbsHourAngleDegrees = maxAbsHa,
             AskPierLabels = askPierLabels,
+            NormalSidesOnly = normalSidesOnly,
             MountKey = "test|Fake mount",
             Profile = new ProfileFacts("test", "Test", 50.0, 10.0, null, 10.0, 0.0, 5.0, 400.0, "ASTAP", null)
         },

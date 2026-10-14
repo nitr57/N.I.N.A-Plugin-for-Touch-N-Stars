@@ -301,6 +301,151 @@ public class AutoMeasurementSessionTests
         Assert.Equal("Best", rig.Store.LoadJournal().PreferredPierSide);
     }
 
+    [Fact]
+    public async Task AbortWhileTheCounterweightQuestionIsOpenIsAnAbortNotInvertedLabels()
+    {
+        using var rig = new AutoRig();
+        AutoMeasurementSession session = rig.Session(askPierLabels: true);
+
+        session.Start();
+        await WaitForQuestion(session);
+        session.Abort();
+        await session.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+
+        SessionStatus status = session.GetStatus();
+        Assert.Equal(SessionPhase.Aborted, status.Phase);
+        Assert.Equal("Aborted", status.Error.Code);
+    }
+
+    [Fact]
+    public async Task AGotoThatFailsBecauseOfTheAbortIsReportedAsAborted()
+    {
+        using var rig = new AutoRig();
+        AutoMeasurementSession session = rig.Session();
+        rig.Mount.OnSlew = (side, _) =>
+        {
+            if (side == PierSideLabel.West)
+            {
+                session.Abort();
+                throw new ConeErrorException("SlewFailed", "The mount refused the slew: aborted");
+            }
+
+            return Task.CompletedTask;
+        };
+
+        SessionStatus status = await AutoRig.Run(session);
+
+        Assert.Equal(SessionPhase.Aborted, status.Phase);
+        Assert.Equal("Aborted", status.Error.Code);
+    }
+
+    [Fact]
+    public async Task ARunStartedAtHomeBeginsOnTheSideTheFirmwarePicks()
+    {
+        using var rig = new AutoRig();
+        rig.Mount.AtHome = true;
+
+        SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 2));
+
+        Assert.Equal(SessionPhase.Complete, status.Phase);
+        Assert.Equal(PierSideLabel.West, rig.Mount.Slews[0].Side);
+    }
+
+    [Fact]
+    public async Task NormalSidesOnlyMeasuresEveryPairWestThenEastWithoutPastMeridianSamples()
+    {
+        using var rig = new AutoRig(tiltArcmin: 3.0, pastMeridian: 0.0);
+
+        SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 3, normalSidesOnly: true));
+
+        Assert.Equal(SessionPhase.Complete, status.Phase);
+        Assert.Equal(-3.0, status.Result.ConeArcmin, 0.05);
+        Assert.Equal(
+            new[] { PierSideLabel.West, PierSideLabel.East, PierSideLabel.West, PierSideLabel.East, PierSideLabel.West, PierSideLabel.East },
+            rig.Mount.Slews.Select(x => x.Side));
+    }
+
+    [Fact]
+    public async Task AGotoFromElsewhereStopsTheRun()
+    {
+        using var rig = new AutoRig();
+        AutoMeasurementSession session = rig.Session();
+        rig.Imager.DuringExposure = call =>
+        {
+            if (call == 1)
+            {
+                rig.Clock.Advance(TimeSpan.FromSeconds(10));
+                rig.Mount.ExternalSlew = true;
+                session.Watchdog.Check();
+                rig.Mount.ExternalSlew = false;
+            }
+        };
+
+        SessionStatus status = await AutoRig.Run(session);
+
+        Assert.Equal(SessionPhase.Aborted, status.Phase);
+        Assert.Equal("UnexpectedMotion", status.Error.Code);
+    }
+
+    [Fact]
+    public async Task TheSessionCountsAsActiveUntilItsRestoreHasRun()
+    {
+        using var rig = new AutoRig();
+        var restoring = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slowRestore = new SlowRestorePierSide(rig.PierSide, restoring, release.Task);
+        rig.Mount.PierSide = rig.PierSide;
+        var session = new AutoMeasurementSession(
+            rig.Mount, slowRestore, rig.Imager, rig.Clock, rig.Sun, rig.Store,
+            new AutoRunOptions
+            {
+                Repetitions = 2, DeclinationDegrees = 0.0, ExposureSeconds = 5.0, DovetailMm = 200.0, Timing = AutoRig.Timing,
+                Limits = rig.Limits, LatitudeDegrees = 50.0, MaxAbsHourAngleDegrees = 2.5, MountKey = "k"
+            },
+            watchdogLoop: false);
+
+        session.Start();
+        await restoring.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        bool finishedDuringRestore = session.Finished;
+        bool activeDuringRestore = session.GetStatus().Active;
+        release.SetResult();
+        await session.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(finishedDuringRestore);
+        Assert.True(activeDuringRestore);
+        Assert.True(session.Finished);
+    }
+
+    private sealed class SlowRestorePierSide : IPierSideControl
+    {
+        private readonly FakePierSide inner;
+        private readonly TaskCompletionSource restoring;
+        private readonly Task release;
+
+        public SlowRestorePierSide(FakePierSide inner, TaskCompletionSource restoring, Task release)
+        {
+            this.inner = inner;
+            this.restoring = restoring;
+            this.release = release;
+        }
+
+        public bool Supported => true;
+        public string Description => "slow";
+        public string UnsupportedReason => null!;
+        public string OriginalSetting => inner.OriginalSetting!;
+        public string ReadOriginal() => inner.ReadOriginal();
+        public Task PrepareAsync(PierSideLabel side, CancellationToken token) => inner.PrepareAsync(side, token);
+
+        public async Task RestoreAsync()
+        {
+            restoring.TrySetResult();
+            await release;
+            await inner.RestoreAsync();
+        }
+
+        public Task RestoreToAsync(string setting) => inner.RestoreToAsync(setting);
+    }
+
     private static async Task<SessionQuestion> WaitForQuestion(AutoMeasurementSession session)
     {
         for (int i = 0; i < 500; i++)

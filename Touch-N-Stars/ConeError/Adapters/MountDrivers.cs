@@ -56,7 +56,7 @@ public sealed class NinaMountDriverInspector : IMountDriverInspector
             {
                 return new MountDriverInfo(
                     "INDI OnStep",
-                    new IndiOnStepPierSideControl(indi.DeviceName),
+                    new IndiOnStepPierSideControl(indi.DeviceName, () => telescope.SendCommandString(":GX96#", true)),
                     IndiOnStepLimits(snapshot),
                     OnStepModelProbe.Probe(telescope));
             }
@@ -82,7 +82,8 @@ public sealed class NinaMountDriverInspector : IMountDriverInspector
             OnStepXMountSettings s = onStepX.GetMountSettings();
             // OnStepX applies the east limit on PIER_SIDE_EAST when h < -limit (Guide.cpp), which is the
             // past-meridian angle of NINA's pierEast; the west limit likewise.
-            return new MountLimits(s.HorizonLimit, s.OverheadLimit, s.MeridianLimitEast, s.MeridianLimitWest, "OnStepX");
+            bool any = s.HorizonLimit.HasValue || s.OverheadLimit.HasValue || s.MeridianLimitEast.HasValue || s.MeridianLimitWest.HasValue;
+            return new MountLimits(s.HorizonLimit, s.OverheadLimit, s.MeridianLimitEast, s.MeridianLimitWest, any ? "OnStepX" : null);
         }
         catch (Exception ex)
         {
@@ -91,22 +92,30 @@ public sealed class NinaMountDriverInspector : IMountDriverInspector
         }
     }
 
-    /// <summary>"Minutes Past Meridian" holds :GXE9#/:GXEA# (minutes of time, 4 per degree); "Slew elevation Limit" :Gh#/:Go#.</summary>
+    /// <summary>
+    /// "Minutes Past Meridian" holds :GXE9#/:GXEA# (minutes of time, 4 per degree); "Slew elevation
+    /// Limit" :Gh#/:Go#. lx200_OnStep refreshes both from the mount with apply() and leaves their state
+    /// Idle (lx200_OnStep.cpp ReadScopeStatus), so Idle and Ok values count; Busy (a write in progress)
+    /// and Alert do not. The source names the mount only when at least one value was read.
+    /// </summary>
     public static MountLimits IndiOnStepLimits(INDIDeviceSnapshot snapshot)
     {
         INDIPropertySnapshot meridian = snapshot?.Properties.FirstOrDefault(p => p.Name == IndiMinutesPastMeridian);
         INDIPropertySnapshot elevation = snapshot?.Properties.FirstOrDefault(p => p.Name == IndiElevationLimit);
-        double? east = Number(meridian, "East", ok: true) / 4.0;
-        double? west = Number(meridian, "West", ok: true) / 4.0;
-        double? min = Number(elevation, "minAlt", ok: true);
-        double? max = Number(elevation, "maxAlt", ok: true);
-        return new MountLimits(min, max, east, west, "INDI OnStep");
+        double? east = Number(meridian, "East") / 4.0;
+        double? west = Number(meridian, "West") / 4.0;
+        double? min = Number(elevation, "minAlt");
+        double? max = Number(elevation, "maxAlt");
+        bool any = east.HasValue || west.HasValue || min.HasValue || max.HasValue;
+        return new MountLimits(min, max, east, west, any ? "INDI OnStep" : null);
     }
 
-    /// <summary>A number element of a property the driver has confirmed (state Ok); null otherwise.</summary>
-    private static double? Number(INDIPropertySnapshot property, string element, bool ok)
+    /// <summary>A number element of a property whose values are settled (state Idle or Ok); null otherwise.</summary>
+    private static double? Number(INDIPropertySnapshot property, string element)
     {
-        if (property == null || (ok && !string.Equals(property.State, "Ok", StringComparison.OrdinalIgnoreCase)))
+        if (property == null
+            || !(string.Equals(property.State, "Ok", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(property.State, "Idle", StringComparison.OrdinalIgnoreCase)))
         {
             return null;
         }
@@ -157,8 +166,9 @@ public sealed class OnStepXPierSideControl : IPierSideControl
     {
         token.ThrowIfCancellationRequested();
         ReadOriginal();
-        Set(side == PierSideLabel.East ? "East" : "West");
+        // set before sending: a change that is sent but not acknowledged must still be restored
         changed = true;
+        Set(side == PierSideLabel.East ? "East" : "West");
         return Task.CompletedTask;
     }
 
@@ -194,17 +204,30 @@ public sealed class OnStepXPierSideControl : IPierSideControl
     }
 }
 
-/// <summary>The INDI OnStep and Proxisky drivers: the "Preferred Pier Side" switch (1 = West, 2 = East, 3 = Best).</summary>
+/// <summary>
+/// The INDI OnStep and Proxisky drivers: the "Preferred Pier Side" switch (1 = West, 2 = East, 3 = Best).
+/// <para>
+/// The stock lx200_OnStep counts only a '0' reply as success, but OnStepX answers '1' when it accepts
+/// :SX96 (ProcessCmds.cpp). So on success the driver resets the switch and leaves it Busy, and the
+/// real value comes back with its next status poll, which reads :GX96# and sets the element On with
+/// state Ok. INDIClient.SetProperty also changes the local copy at once. A change therefore counts as
+/// confirmed only once the driver has sent the property again (a newer timestamp) with state Ok and
+/// the requested element On.
+/// </para>
+/// </summary>
 public sealed class IndiOnStepPierSideControl : IPierSideControl
 {
-    private static readonly TimeSpan Confirmation = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan Confirmation = TimeSpan.FromSeconds(10);
     private readonly string device;
+    private readonly Func<string> rawPreferredQuery;
     private string original;
     private bool changed;
 
-    public IndiOnStepPierSideControl(string device)
+    /// <param name="rawPreferredQuery">Sends :GX96# directly (INDI over TCP only), for an ambiguous switch; may throw.</param>
+    public IndiOnStepPierSideControl(string device, Func<string> rawPreferredQuery = null)
     {
         this.device = device;
+        this.rawPreferredQuery = rawPreferredQuery;
     }
 
     public bool Supported => true;
@@ -222,24 +245,62 @@ public sealed class IndiOnStepPierSideControl : IPierSideControl
     {
         if (original == null)
         {
-            INDIPropertySnapshot property = Property();
-            string on = property?.Elements.FirstOrDefault(e => e.Value is true)?.Name;
-            original = on switch
-            {
-                "1" => "West",
-                "2" => "East",
-                _ => "Best"
-            };
+            original = Interpret(Property(), rawPreferredQuery);
         }
 
         return original;
     }
 
+    /// <summary>
+    /// The setting the switch shows. The driver's poll sets the element it read On without clearing
+    /// the others, so after a change from elsewhere two can be On; then :GX96# decides if it can be
+    /// sent, else "Best" (the OnStepX default).
+    /// </summary>
+    public static string Interpret(INDIPropertySnapshot property, Func<string> rawPreferredQuery = null)
+    {
+        List<string> on = property?.Elements.Where(e => e.Value is true).Select(e => e.Name).ToList() ?? new List<string>();
+        if (on.Count == 1)
+        {
+            return Name(on[0]);
+        }
+
+        if (on.Count > 1 && rawPreferredQuery != null)
+        {
+            try
+            {
+                string reply = rawPreferredQuery()?.Trim().TrimEnd('#').ToUpperInvariant();
+                if (reply is "E" or "W" or "B")
+                {
+                    return reply switch { "E" => "East", "W" => "West", _ => "Best" };
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug($"ConeError: :GX96# not available: {ex.Message}");
+            }
+        }
+
+        if (on.Count > 1)
+        {
+            Logger.Warning($"ConeError: the preferred pier side switch shows {string.Join(", ", on.Select(Name))}; taking Best as the original");
+        }
+
+        return "Best";
+    }
+
+    private static string Name(string element) => element switch
+    {
+        "1" => "West",
+        "2" => "East",
+        _ => "Best"
+    };
+
     public async Task PrepareAsync(PierSideLabel side, CancellationToken token)
     {
         ReadOriginal();
-        await SetAsync(side == PierSideLabel.East ? "East" : "West", token);
+        // set before sending: a change that is sent but not confirmed must still be restored
         changed = true;
+        await SetAsync(side == PierSideLabel.East ? "East" : "West", token);
     }
 
     public async Task RestoreAsync()
@@ -261,6 +322,7 @@ public sealed class IndiOnStepPierSideControl : IPierSideControl
             "EAST" or "E" => "2",
             _ => "3"
         };
+        string before = Property()?.Timestamp;
         var elements = new Dictionary<string, object> { ["1"] = element == "1", ["2"] = element == "2", ["3"] = element == "3" };
         if (!INDIClient.Instance.SetProperty(device, NinaMountDriverInspector.IndiPreferredPierSide, elements, out string error))
         {
@@ -270,23 +332,27 @@ public sealed class IndiOnStepPierSideControl : IPierSideControl
         DateTime until = DateTime.UtcNow + Confirmation;
         while (DateTime.UtcNow < until)
         {
-            INDIPropertySnapshot property = Property();
-            if (string.Equals(property?.State, "Alert", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new ConeErrorException("PierSideRefused", $"The mount refused the preferred pier side {setting}.");
-            }
-
-            if (string.Equals(property?.State, "Ok", StringComparison.OrdinalIgnoreCase)
-                && property.Elements.FirstOrDefault(e => e.Name == element)?.Value is true)
+            await Task.Delay(200, token);
+            if (IsConfirmed(Property(), before, element))
             {
                 return;
             }
 
-            await Task.Delay(200, token);
+            if (string.Equals(Property()?.State, "Alert", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ConeErrorException("PierSideRefused", $"The mount refused the preferred pier side {setting}.");
+            }
         }
 
         throw new ConeErrorException("PierSideRefused", $"The INDI driver did not confirm the preferred pier side {setting}.");
     }
+
+    /// <summary>The driver has sent the property since <paramref name="timestampBefore"/>, with state Ok and the element On.</summary>
+    public static bool IsConfirmed(INDIPropertySnapshot property, string timestampBefore, string element)
+        => property != null
+            && !string.Equals(property.Timestamp, timestampBefore, StringComparison.Ordinal)
+            && string.Equals(property.State, "Ok", StringComparison.OrdinalIgnoreCase)
+            && property.Elements.FirstOrDefault(e => e.Name == element)?.Value is true;
 }
 
 /// <summary>

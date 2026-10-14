@@ -73,8 +73,13 @@ public class ConeErrorController : WebApiController
     [Route(HttpVerbs.Get, "/cone-error/settings")]
     public Task GetSettings() => Run(() => Task.FromResult<object>(Service.GetSettings()));
 
+    /// <summary>PUT /api/cone-error/settings - only the fields sent change; the rest stays as stored.</summary>
     [Route(HttpVerbs.Put, "/cone-error/settings")]
-    public Task PutSettings() => Run(async () => Service.SaveSettings(await Body<ConeErrorSettings>() ?? new ConeErrorSettings()));
+    public Task PutSettings() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        return Service.PatchSettings(body.ToString());
+    });
 
     /// <summary>GET /api/cone-error/status - the running or last session; always 200 so it can be polled.</summary>
     [Route(HttpVerbs.Get, "/cone-error/status")]
@@ -116,8 +121,26 @@ public class ConeErrorController : WebApiController
         return Service.Status();
     });
 
+    /// <summary>POST /api/cone-error/manual/begin {clientTimeUtc} - turns tracking off for the daytime check.</summary>
     [Route(HttpVerbs.Post, "/cone-error/manual/begin")]
-    public Task BeginManual() => Run(() => Task.FromResult<object>(Service.BeginManual()));
+    public Task BeginManual() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        return Service.BeginManual((DateTime?)body["clientTimeUtc"]);
+    });
+
+    /// <summary>POST /api/cone-error/manual/pier-labels {counterweightWest} - the one-time counterweight check on the east side.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/pier-labels")]
+    public Task ManualPierLabels() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        if (body["counterweightWest"] == null)
+        {
+            throw new ConeErrorException("BadRequest", "counterweightWest is required.");
+        }
+
+        return Service.ManualPierLabels((bool)body["counterweightWest"]);
+    });
 
     [Route(HttpVerbs.Post, "/cone-error/manual/capture")]
     public Task Capture() => Run(() => Task.FromResult<object>(Service.Capture()));

@@ -85,7 +85,8 @@ public sealed class NinaConeMount : IConeMount
             info.SiteLatitude,
             info.SiteLongitude,
             info.Name,
-            DateTime.UtcNow);
+            DateTime.UtcNow,
+            device?.AtHome ?? info.AtHome);
     }
 
     public async Task SlewAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
@@ -114,7 +115,11 @@ public sealed class NinaConeMount : IConeMount
 
     public void Stop() => telescope.StopSlew();
 
-    public bool SetTracking(bool enabled) => telescope.SetTrackingEnabled(enabled);
+    /// <summary>
+    /// <see cref="ITelescopeMediator.SetTrackingEnabled"/> returns the tracking state after the call,
+    /// not whether the call worked: compare it with the request.
+    /// </summary>
+    public bool SetTracking(bool enabled) => telescope.SetTrackingEnabled(enabled) == enabled;
 }
 
 /// <summary>Capture through NINA's imaging mediator and solve with the profile's plate solver; never CenteringSolver (it syncs).</summary>

@@ -66,6 +66,13 @@ public sealed class AutoPlan
     /// <summary>The largest |hour angle| any sample is planned at, degrees; the confirmed envelope.</summary>
     public double MaxAbsHourAngleDegrees { get; init; }
 
+    /// <summary>
+    /// Every pair is measured west side first, east side second, so that no sample is ever past the
+    /// meridian (counterweight up). Used when the meridian limits are too small for the alternating
+    /// order, at the cost of one more flip per pair.
+    /// </summary>
+    public bool NormalSidesOnly { get; init; }
+
     public double EstimatedSeconds { get; init; }
     public IReadOnlyList<LimitViolation> Violations { get; init; } = Array.Empty<LimitViolation>();
     public string Refusal { get; init; }
@@ -78,7 +85,10 @@ public sealed class AutoPlan
 /// 30°), measured on both pier sides per repetition. Each pair gets its own target, placed so that
 /// its two exposures sit symmetrically around the meridian (residual polar misalignment then cancels
 /// in the difference), and consecutive pairs alternate the side order so that each pair after the
-/// first needs one flip and one short slew.
+/// first needs one flip and one short slew. When the past-meridian limit of either side is smaller
+/// than half a pair's hour-angle window, the alternating order is impossible (one sample of every other
+/// pair would be counterweight-up on each side); then every pair is measured West first (HA &lt; 0) and
+/// East second (HA &gt; 0), both counterweight-down.
 /// </summary>
 public static class TargetPlanner
 {
@@ -88,6 +98,9 @@ public static class TargetPlanner
 
     /// <summary>Extra altitude kept above the minimum when the declination is suggested.</summary>
     public const double SuggestionAltitudeMarginDegrees = 5.0;
+
+    /// <summary>Spare past-meridian allowance the alternating order needs on top of half a pair's window, degrees.</summary>
+    public const double AlternatingMarginDegrees = 0.25;
 
     public static AutoPlan Plan(PlannerInput input)
     {
@@ -146,13 +159,20 @@ public static class TargetPlanner
         PairTiming timing = input.Timing;
         var steps = new List<PlannedStep>();
         var violations = new List<LimitViolation>();
-        PierSideLabel firstSide = input.CurrentSide ?? PierSideLabel.East;
+        double halfWindow = Sidereal(timing.BetweenSidesSeconds / 2.0) * 15.0;
+        bool normalSidesOnly = Math.Min(
+            input.Limits.EffectivePastMeridianDegrees(PierSideLabel.East),
+            input.Limits.EffectivePastMeridianDegrees(PierSideLabel.West)) < halfWindow + AlternatingMarginDegrees;
+        PierSideLabel firstSide = normalSidesOnly ? PierSideLabel.West : input.CurrentSide ?? PierSideLabel.East;
+        PierSideLabel? previous = input.CurrentSide;
         double maxAbsHa = 0.0;
         double elapsed = 0.0;
 
         for (int pair = 0; pair < input.Repetitions; pair++)
         {
-            double slew = pair == 0 ? timing.SlewSeconds : Math.Min(timing.SlewSeconds, 30.0);
+            double slew = pair == 0
+                ? timing.SlewSeconds
+                : normalSidesOnly ? timing.FlipSeconds : Math.Min(timing.SlewSeconds, 30.0);
             double firstMid = elapsed + slew + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
             double secondMid = firstMid + timing.BetweenSidesSeconds;
             double centre = (firstMid + secondMid) / 2.0;
@@ -160,12 +180,13 @@ public static class TargetPlanner
             double raAtCentre = Spherical.WrapHours24(input.LocalSiderealTimeHours + Sidereal(centre));
             PierSideLabel secondSide = ConeMath.Other(firstSide);
 
-            steps.Add(Step(input, pair, firstSide, "slew", raAtCentre, declination, firstMid));
+            steps.Add(Step(input, pair, firstSide, previous == null || previous == firstSide ? "slew" : "flip", raAtCentre, declination, firstMid));
             steps.Add(Step(input, pair, secondSide, "flip", raAtCentre, declination, secondMid));
 
-            maxAbsHa = Math.Max(maxAbsHa, Sidereal(timing.BetweenSidesSeconds / 2.0) * 15.0);
+            maxAbsHa = Math.Max(maxAbsHa, halfWindow);
             elapsed += slew + timing.FlipSeconds + 2.0 * timing.SampleSeconds;
-            firstSide = secondSide;
+            previous = secondSide;
+            firstSide = normalSidesOnly ? PierSideLabel.West : secondSide;
         }
 
         foreach (PlannedStep step in steps)
@@ -179,6 +200,7 @@ public static class TargetPlanner
             DeclinationSuggested = suggested,
             Steps = steps,
             MaxAbsHourAngleDegrees = maxAbsHa,
+            NormalSidesOnly = normalSidesOnly,
             EstimatedSeconds = elapsed,
             Violations = violations.GroupBy(v => (v.Code, v.Source)).Select(g => g.First()).ToList()
         };
