@@ -140,7 +140,7 @@ public sealed record ProfileFacts(
     string ProfileName,
     double Latitude,
     double Longitude,
-    Func<double, double> HorizonAltitudeAt,
+    [property: Newtonsoft.Json.JsonIgnore] Func<double, double> HorizonAltitudeAt,
     double MaxMinutesAfterMeridian,
     double SettleSeconds,
     double PlateSolveExposureSeconds,
