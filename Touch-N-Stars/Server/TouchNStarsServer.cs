@@ -54,6 +54,7 @@ namespace TouchNStars.Server {
                 .WithController<TargetSearchController>() // NGC search and target pictures
                 .WithController<FramingController>()     // Framing Assistant control
                 .WithController<MetricsController>()     // System metrics
+                .WithController<LuckyCaptureController>() // Native planetary capture via public broker
                 .WithController<UtilityController>()    // Logs, version, api-port
                 .WithController<BahtinovController>()    // Bahtinov mask analysis
                 .WithController<INDIController>()        // INDI driver management
