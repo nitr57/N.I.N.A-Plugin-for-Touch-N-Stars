@@ -351,6 +351,22 @@ public class ConeErrorApiTests
     }
 
     [Fact]
+    public async Task WithTheSunCheckOffDaylightOnlyWarns()
+    {
+        using var rig = new AutoRig();
+        rig.Clock.Advance(TimeSpan.FromHours(14));
+        using var host = new ConeErrorApiHost(rig);
+
+        (int status, _) = await Send(host, HttpMethod.Put, "settings", new { ignoreSunCheck = true });
+        (_, JObject pre) = await Preconditions(host, rig.Clock.UtcNow);
+
+        Assert.Equal(200, status);
+        Assert.True((bool)pre["response"]!["ready"]!, pre.ToString());
+        Assert.Contains("darkness check is off", pre["response"]!["warnings"]!.ToString());
+        Assert.True(rig.Store.LoadSettings().IgnoreSunCheck);
+    }
+
+    [Fact]
     public async Task SettingsUpdatesOnlyChangeTheFieldsSent()
     {
         using var rig = new AutoRig();

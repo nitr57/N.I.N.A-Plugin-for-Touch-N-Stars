@@ -223,7 +223,14 @@ public sealed class ConeErrorService
 
         if (time.SunAltitudeDegrees > MaxSunAltitudeDegrees)
         {
-            blockers.Add($"The Sun is {time.SunAltitudeDegrees:F0}° high. The measurement points near the meridian and needs a dark sky; start it after the end of civil twilight.");
+            if (Store.LoadSettings().IgnoreSunCheck)
+            {
+                warnings.Add($"The Sun is {time.SunAltitudeDegrees:F0}° high and the darkness check is off. The mount will point near the meridian; keep the telescope covered or use simulators.");
+            }
+            else
+            {
+                blockers.Add($"The Sun is {time.SunAltitudeDegrees:F0}° high. The measurement points near the meridian and needs a dark sky; start it after the end of civil twilight.");
+            }
         }
 
         warnings.Add("Stop PHD2 guiding if it runs; it cannot be detected here.");

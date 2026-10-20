@@ -22,6 +22,9 @@ public sealed class ConeErrorSettings
     /// <summary>Mounts whose pier side labels the user has confirmed against the counterweight.</summary>
     public List<string> VerifiedPierLabels { get; set; } = new();
 
+    /// <summary>Testing in daylight (e.g. with simulators): the Sun check only warns instead of blocking.</summary>
+    public bool IgnoreSunCheck { get; set; }
+
     /// <summary>Clamps values a client may have sent out of range.</summary>
     public ConeErrorSettings Sanitized()
     {
@@ -31,7 +34,8 @@ public sealed class ConeErrorSettings
             DovetailMm = DovetailMm is > 0 and < 2000 ? DovetailMm : null,
             Repetitions = Math.Clamp(Repetitions, 2, 10),
             ExposureSeconds = ExposureSeconds is > 0 and <= 120 ? ExposureSeconds : null,
-            VerifiedPierLabels = (VerifiedPierLabels ?? new List<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList()
+            VerifiedPierLabels = (VerifiedPierLabels ?? new List<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList(),
+            IgnoreSunCheck = IgnoreSunCheck
         };
     }
 }
