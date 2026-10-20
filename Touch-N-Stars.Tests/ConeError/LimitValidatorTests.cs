@@ -119,10 +119,24 @@ public class LimitValidatorTests
         EndpointCheck east = LimitValidator.ValidateEndpoint(limits, PierSideLabel.East, -0.1, 0.0, Latitude, NightSun);
         EndpointCheck west = LimitValidator.ValidateEndpoint(limits, PierSideLabel.West, 0.1, 0.0, Latitude, NightSun);
 
-        Assert.Equal("OnStepX", Assert.Single(east.Violations).Source);
-        Assert.Equal(1.0, east.PastMeridianLimitDegrees);
+        Assert.StartsWith("OnStepX", Assert.Single(east.Violations).Source);
+        Assert.Equal(1.0 - LimitSet.MountMeridianLimitMarginDegrees, east.PastMeridianLimitDegrees);
         Assert.True(west.Ok);
         Assert.Equal(5.0, west.PastMeridianLimitDegrees);
+    }
+
+    [Theory]
+    [InlineData(1.0, 0.5)]
+    [InlineData(0.3, 0.0)]
+    [InlineData(0.0, 0.0)]
+    [InlineData(-0.5, -0.5)]
+    public void PlansStayInsideAMountMeridianLimitButNeverBelowZeroByTheMargin(double mountLimit, double expected)
+    {
+        // OnStepX stopped a goto 0.93° past the meridian against its 1.0° limit
+        var limits = new LimitSet { PinsPastMeridianDegrees = 5.0, MountPastMeridianEastDegrees = mountLimit };
+
+        Assert.Equal(expected, limits.EffectivePastMeridianDegrees(PierSideLabel.East), 1e-9);
+        Assert.Equal(5.0, limits.EffectivePastMeridianDegrees(PierSideLabel.West));
     }
 
     [Fact]

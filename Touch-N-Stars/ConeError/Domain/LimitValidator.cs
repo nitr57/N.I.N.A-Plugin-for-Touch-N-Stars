@@ -40,16 +40,31 @@ public sealed class LimitSet
     /// <summary>Where the mount values come from, e.g. "OnStepX", "INDI OnStep", or null when the mount reports none.</summary>
     public string MountSource { get; init; }
 
+    /// <summary>
+    /// Plans stay this far inside a mount-reported meridian limit, degrees. OnStepX enforces its limit
+    /// on its own axes: a goto 0.93° past the meridian against a 1.0° limit was stopped (UMi, 2026-10-20).
+    /// </summary>
+    public const double MountMeridianLimitMarginDegrees = 0.5;
+
     public double EffectivePastMeridianDegrees(PierSideLabel side)
     {
-        double? mount = side == PierSideLabel.East ? MountPastMeridianEastDegrees : MountPastMeridianWestDegrees;
+        double? mount = MountPastMeridian(side);
         return mount.HasValue ? Math.Min(mount.Value, PinsPastMeridianDegrees) : PinsPastMeridianDegrees;
     }
 
     public string PastMeridianSource(PierSideLabel side)
     {
+        double? mount = MountPastMeridian(side);
+        return mount.HasValue && mount.Value < PinsPastMeridianDegrees
+            ? $"{MountSource ?? "mount"} (kept {MountMeridianLimitMarginDegrees:F1}° inside)"
+            : "PINS";
+    }
+
+    /// <summary>The mount's limit less the margin, but never below 0° unless the mount's own limit is.</summary>
+    private double? MountPastMeridian(PierSideLabel side)
+    {
         double? mount = side == PierSideLabel.East ? MountPastMeridianEastDegrees : MountPastMeridianWestDegrees;
-        return mount.HasValue && mount.Value < PinsPastMeridianDegrees ? MountSource ?? "mount" : "PINS";
+        return mount.HasValue ? Math.Max(mount.Value - MountMeridianLimitMarginDegrees, Math.Min(mount.Value, 0.0)) : null;
     }
 
     /// <summary>The lowest allowed altitude at an azimuth and which limit sets it.</summary>

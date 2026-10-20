@@ -174,11 +174,11 @@ public class AutoMeasurementSessionTests
     [Fact]
     public async Task AGotoThatCouldArriveAtOncePastTheLimitIsSkipped()
     {
-        // Pair 1 East first, counterweight up: within 0.6° at the planned exposure after a 2 min goto,
+        // Pair 1 East first, counterweight up: within 0.6° (1.1° less the margin) at the planned exposure after a 2 min goto,
         // but a goto that keeps the side can arrive at once, with the target still further east. Later
         // pairs plan at most 30 s for that goto and stay within the limit.
         using var rig = new AutoRig(tiltArcmin: 3.0);
-        rig.Limits = new LimitSet { MinAltitudeDegrees = 20.0, PinsPastMeridianDegrees = 2.5, MountPastMeridianEastDegrees = 0.6, MountPastMeridianWestDegrees = 2.5, SunExclusionDegrees = 30.0 };
+        rig.Limits = new LimitSet { MinAltitudeDegrees = 20.0, PinsPastMeridianDegrees = 2.5, MountPastMeridianEastDegrees = 1.1, MountPastMeridianWestDegrees = 3.0, SunExclusionDegrees = 30.0 };
         rig.Mount.MeridianLimitDegrees = 0.6;
 
         SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 3));
