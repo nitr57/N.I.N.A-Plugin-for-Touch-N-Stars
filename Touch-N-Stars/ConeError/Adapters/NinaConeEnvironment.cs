@@ -33,13 +33,17 @@ public sealed class NinaConeEnvironment : IConeEnvironment
 
         Mount = new NinaConeMount(mediators.Telescope);
         Imager = new NinaConeImager(mediators.Imaging, mediators.Camera, mediators.Profile, mediators.PlateSolverFactory);
+        Driver = new NinaMountDriverInspector(mediators.Telescope);
         Observatory = new NinaObservatory(mediators);
+        Sun = new MeeusSunProvider(() => mediators.Profile.ActiveProfile.AstrometrySettings.Longitude);
     }
 
     public IConeMount Mount { get; }
     public IConeImager Imager { get; }
+    public IMountDriverInspector Driver { get; }
     public IObservatory Observatory { get; }
     public IClock Clock => SystemClock.Instance;
+    public ISunProvider Sun { get; }
 
     public static PierSideLabel? Label(PierSide side) => side switch
     {
@@ -64,7 +68,7 @@ public sealed class NinaConeMount : IConeMount
         TelescopeInfo info = telescope.GetInfo();
         if (info == null || !info.Connected)
         {
-            return new MountSnapshot(false, false, false, false, null, 0, 0, 0, info?.Name, DateTime.UtcNow);
+            return new MountSnapshot(false, false, false, false, null, 0, 0, 0, 0, 0, info?.Name, DateTime.UtcNow);
         }
 
         var device = telescope.GetDevice() as ITelescope;
@@ -78,8 +82,11 @@ public sealed class NinaConeMount : IConeMount
             device?.SiderealTime ?? info.SiderealTime,
             position?.RA ?? info.RightAscension,
             position?.Dec ?? info.Declination,
+            info.SiteLatitude,
+            info.SiteLongitude,
             info.Name,
-            DateTime.UtcNow);
+            DateTime.UtcNow,
+            device?.AtHome ?? info.AtHome);
     }
 
     public async Task SlewAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
@@ -103,34 +110,6 @@ public sealed class NinaConeMount : IConeMount
         if (!ok)
         {
             throw new ConeErrorException("SlewFailed", "The mount refused the slew or did not finish it.");
-        }
-    }
-
-    /// <summary>
-    /// NINA's meridian flip, the same call a sequence makes: ASCOM/Alpaca set SideOfPier when the
-    /// mount allows it, INDI and OnStepX use their own flip; every driver slews to the target.
-    /// </summary>
-    public async Task FlipAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
-    {
-        var target = new Coordinates(Angle.ByHours(rightAscensionHours), Angle.ByDegree(declinationDegrees), Epoch.JNOW);
-        bool ok;
-        try
-        {
-            ok = await telescope.MeridianFlip(target, token);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            throw new ConeErrorException("FlipFailed", $"The meridian flip failed: {ex.Message}");
-        }
-
-        token.ThrowIfCancellationRequested();
-        if (!ok)
-        {
-            throw new ConeErrorException("FlipFailed", "The mount did not complete the meridian flip.");
         }
     }
 
@@ -243,7 +222,6 @@ public sealed class NinaObservatory : IObservatory
             p.AstrometrySettings.Latitude,
             p.AstrometrySettings.Longitude,
             horizonAt,
-            p.MeridianFlipSettings.MinutesAfterMeridian,
             p.MeridianFlipSettings.MaxMinutesAfterMeridian,
             p.TelescopeSettings.SettleTime,
             pss.ExposureTime,

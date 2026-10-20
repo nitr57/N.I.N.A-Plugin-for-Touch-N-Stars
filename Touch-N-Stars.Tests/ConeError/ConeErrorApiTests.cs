@@ -4,36 +4,50 @@ using System.Text;
 using EmbedIO;
 using EmbedIO.WebApi;
 using Newtonsoft.Json.Linq;
+using TouchNStars.ConeError.Domain;
 using TouchNStars.ConeError.Session;
 using TouchNStars.Server.Controllers;
 using Xunit;
 
 namespace TouchNStars.Tests.ConeError;
 
+internal sealed class FakeDriverInspector : IMountDriverInspector
+{
+    public IPierSideControl PierSide { get; set; } = new FakePierSide();
+    public MountLimits Limits { get; set; } = MountLimits.None;
+    public PointingModelInfo Model { get; set; } = new(PointingModelState.None, 0, "all OnStep model terms are 0");
+
+    public MountDriverInfo Inspect() => new("fake", PierSide, Limits, Model);
+}
+
 internal sealed class FakeObservatory : IObservatory
 {
     public ObservatoryState State { get; set; } = new(true, false, false, false);
     public string? SolverProblem { get; set; }
 
-    public ProfileFacts Profile() => AutoRig.Profile with { SolverProblem = SolverProblem! };
+    public ProfileFacts Profile() => new("test", "Test", 50.0, 10.0, null, 10.0, 0.0, 5.0, 400.0, "ASTAP", SolverProblem!);
 
     ObservatoryState IObservatory.State() => State;
 }
 
 internal sealed class FakeEnvironment : IConeEnvironment
 {
-    public FakeEnvironment(FakeMount mount, FakeImager imager, FakeClock clock)
+    public FakeEnvironment(FakeMount mount, FakeImager imager, FakeClock clock, FakeSun sun, FakeDriverInspector driver)
     {
         Mount = mount;
         Imager = imager;
         Clock = clock;
+        Sun = sun;
+        Driver = driver;
     }
 
     public IConeMount Mount { get; }
     public IConeImager Imager { get; }
+    public IMountDriverInspector Driver { get; }
     public FakeObservatory FakeObservatory { get; } = new();
     public IObservatory Observatory => FakeObservatory;
     public IClock Clock { get; }
+    public ISunProvider Sun { get; }
 }
 
 /// <summary>The cone error controller on a real EmbedIO server over the forward-model rig.</summary>
@@ -46,8 +60,9 @@ internal sealed class ConeErrorApiHost : IDisposable
     public ConeErrorApiHost(AutoRig rig)
     {
         Rig = rig;
-        Environment = new FakeEnvironment(rig.Mount, rig.Imager, rig.Clock);
-        Service = new ConeErrorService(() => Environment, rig.Store);
+        Driver = new FakeDriverInspector { PierSide = rig.PierSide };
+        Environment = new FakeEnvironment(rig.Mount, rig.Imager, rig.Clock, rig.Sun, Driver);
+        Service = new ConeErrorService(() => Environment, rig.Store, backgroundLoops: false);
         int port = FreePort();
         server = new WebServer(o => o.WithUrlPrefix($"http://127.0.0.1:{port}/").WithMode(HttpListenerMode.EmbedIO))
             .WithWebApi("/api", m => m.WithController(() => new ConeErrorController(Service)));
@@ -59,6 +74,7 @@ internal sealed class ConeErrorApiHost : IDisposable
     public Uri BaseAddress { get; }
 
     public AutoRig Rig { get; }
+    public FakeDriverInspector Driver { get; }
     public FakeEnvironment Environment { get; }
     public ConeErrorService Service { get; }
 
@@ -124,8 +140,6 @@ internal sealed class ConeErrorApiHost : IDisposable
 
 public class ConeErrorApiTests
 {
-    private const string MountKey = "test|Fake mount";
-
     private static async Task<string> Plan(ConeErrorApiHost host, int repetitions = 3)
     {
         (int status, JObject json) = await host.Post("auto/plan", new { dovetailMm = 200.0, repetitions });
@@ -134,31 +148,24 @@ public class ConeErrorApiTests
         return (string)json["response"]!["planId"]!;
     }
 
-    private static Task<(int Status, JObject Json)> Start(ConeErrorApiHost host, string planId)
-        => host.Post("auto/start", new { planId, noPointingModel = true });
-
-    private static Task<(int Status, JObject Json)> Preconditions(ConeErrorApiHost host, DateTime clientUtc)
-        => host.Get("preconditions?clientTimeUtc=" + Uri.EscapeDataString(clientUtc.ToString("o")));
-
     [Fact]
     public async Task PlanStartPollAndResultEndToEnd()
     {
         using var rig = new AutoRig(tiltArcmin: 6.0);
         using var host = new ConeErrorApiHost(rig);
 
-        (int preStatus, JObject pre) = await Preconditions(host, rig.Clock.UtcNow);
+        (int preStatus, JObject pre) = await host.Get("preconditions?clientTimeUtc=" + Uri.EscapeDataString(rig.Clock.UtcNow.ToString("o")));
         Assert.Equal(200, preStatus);
-        Assert.True((bool)pre["response"]!["ready"]!, pre.ToString());
+        Assert.True((bool)pre["response"]!["autoReady"]!, pre.ToString());
         Assert.Equal(0.0, (double)pre["response"]!["time"]!["skewSeconds"]!, 1.0);
 
         string planId = await Plan(host);
-        (int startStatus, _) = await Start(host, planId);
+        (int startStatus, _) = await host.Post("auto/start", new { planId });
         Assert.Equal(200, startStatus);
 
-        // the mount is not verified yet: the one-time counterweight check comes on the first west arrival
+        // the mount is not verified yet: the one-time counterweight check comes after the first east arrival
         JObject waiting = await host.WaitForPhase("WaitingForAnswer");
         Assert.Equal("pierLabels", (string)waiting["question"]!["kind"]!);
-        Assert.Equal("West", (string)waiting["currentSide"]!);
         (int answer, _) = await host.Post("answer", new { id = (int)waiting["question"]!["id"]!, yes = true });
         Assert.Equal(200, answer);
 
@@ -170,40 +177,25 @@ public class ConeErrorApiTests
 
         (_, JObject results) = await host.Get("results");
         Assert.Single((JArray)results["response"]!);
-        Assert.Contains(MountKey, rig.Store.LoadSettings().VerifiedPierLabels);
+        Assert.Contains("test|Fake mount", rig.Store.LoadSettings().VerifiedPierLabels);
     }
 
     [Fact]
-    public async Task ThePlanUsesTheProfileFlipTimeAndAsksForUnverifiedMounts()
-    {
-        using var rig = new AutoRig();
-        using var host = new ConeErrorApiHost(rig);
-
-        (_, JObject json) = await host.Post("auto/plan", new { dovetailMm = 200.0, repetitions = 4 });
-        JToken response = json["response"]!;
-
-        Assert.Equal(5.0, (double)response["plan"]!["flipAfterMinutes"]!);
-        Assert.Equal(4, ((JArray)response["plan"]!["pairs"]!).Count);
-        Assert.True((bool)response["askPierLabels"]!);
-        Assert.Equal(60.0, (double)response["expiresInSeconds"]!);
-    }
-
-    [Fact]
-    public async Task AbortOverHttpStopsTheMountMidFlip()
+    public async Task AbortOverHttpStopsTheMountImmediately()
     {
         using var rig = new AutoRig();
         var flip = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        rig.Mount.OnMove = async (kind, _, token) =>
+        rig.Mount.OnSlew = async (side, token) =>
         {
-            if (kind == "flip")
+            if (side == PierSideLabel.West)
             {
                 flip.TrySetResult();
                 await Task.Delay(Timeout.Infinite, token);
             }
         };
-        rig.Store.SaveSettings(new ConeErrorSettings { VerifiedPierLabels = { MountKey } });
+        rig.Store.SaveSettings(new ConeErrorSettings { VerifiedPierLabels = { "test|Fake mount" } });
         using var host = new ConeErrorApiHost(rig);
-        await Start(host, await Plan(host));
+        await host.Post("auto/start", new { planId = await Plan(host) });
         await flip.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         (int status, _) = await host.Post("abort");
@@ -212,36 +204,23 @@ public class ConeErrorApiTests
         Assert.Equal(200, status);
         Assert.True(rig.Mount.StopCount >= 1);
         Assert.Equal("Aborted", (string)done["error"]!["code"]!);
+        Assert.Equal("Best", rig.PierSide.Setting);
     }
 
     [Fact]
     public async Task APlanCanBeStartedOnlyOnce()
     {
         using var rig = new AutoRig();
-        rig.Mount.OnMove = (_, _, token) => Task.Delay(Timeout.Infinite, token);
+        rig.Mount.OnSlew = (_, token) => Task.Delay(Timeout.Infinite, token);
         using var host = new ConeErrorApiHost(rig);
         string planId = await Plan(host);
 
-        (int first, _) = await Start(host, planId);
-        (int second, JObject json) = await Start(host, planId);
+        (int first, _) = await host.Post("auto/start", new { planId });
+        (int second, JObject json) = await host.Post("auto/start", new { planId });
 
         Assert.Equal(200, first);
         Assert.Equal(409, second);
         Assert.Equal("PlanUnknown", (string)json["code"]!);
-    }
-
-    [Fact]
-    public async Task OnlyOneMeasurementRunsAtATime()
-    {
-        using var rig = new AutoRig();
-        rig.Mount.OnMove = (_, _, token) => Task.Delay(Timeout.Infinite, token);
-        using var host = new ConeErrorApiHost(rig);
-        await Start(host, await Plan(host));
-
-        (int second, JObject json) = await Start(host, await Plan(host));
-
-        Assert.Equal(409, second);
-        Assert.Equal("Busy", (string)json["code"]!);
     }
 
     [Fact]
@@ -252,25 +231,11 @@ public class ConeErrorApiTests
         string planId = await Plan(host);
         rig.Clock.Advance(TimeSpan.FromSeconds(61));
 
-        (int status, JObject json) = await Start(host, planId);
+        (int status, JObject json) = await host.Post("auto/start", new { planId });
 
         Assert.Equal(409, status);
         Assert.Equal("PlanExpired", (string)json["code"]!);
-        Assert.Empty(rig.Mount.Moves);
-    }
-
-    [Fact]
-    public async Task TheStartNeedsTheNoPointingModelConfirmation()
-    {
-        using var rig = new AutoRig();
-        using var host = new ConeErrorApiHost(rig);
-
-        (int refused, JObject json) = await host.Post("auto/start", new { planId = await Plan(host) });
-        (int accepted, _) = await Start(host, await Plan(host));
-
-        Assert.Equal(409, refused);
-        Assert.Equal("PointingModelNotConfirmed", (string)json["code"]!);
-        Assert.Equal(200, accepted);
+        Assert.Empty(rig.Mount.Slews);
     }
 
     [Fact]
@@ -286,6 +251,37 @@ public class ConeErrorApiTests
     }
 
     [Fact]
+    public async Task AMountThatCannotForceThePierSideBlocksWithItsReason()
+    {
+        using var rig = new AutoRig();
+        using var host = new ConeErrorApiHost(rig);
+        host.Driver.PierSide = new FakePierSide { Supported = false };
+
+        (_, JObject pre) = await host.Get("preconditions");
+        (int status, JObject json) = await host.Post("auto/plan", new { dovetailMm = 200.0 });
+
+        Assert.False((bool)pre["response"]!["autoReady"]!);
+        Assert.Contains("cannot be told", pre["response"]!["autoBlockers"]!.ToString());
+        Assert.Equal(409, status);
+        Assert.Equal("PreconditionsNotMet", (string)json["code"]!);
+    }
+
+    [Fact]
+    public async Task AnActivePointingModelMustBeAcknowledged()
+    {
+        using var rig = new AutoRig();
+        using var host = new ConeErrorApiHost(rig);
+        host.Driver.Model = new PointingModelInfo(PointingModelState.Active, 185, "cone term 185″");
+
+        (int refused, JObject json) = await host.Post("auto/start", new { planId = await Plan(host) });
+        (int accepted, _) = await host.Post("auto/start", new { planId = await Plan(host), acknowledgePointingModel = true });
+
+        Assert.Equal(409, refused);
+        Assert.Equal("PointingModelNotAcknowledged", (string)json["code"]!);
+        Assert.Equal(200, accepted);
+    }
+
+    [Fact]
     public async Task ARunningSequenceBlocks()
     {
         using var rig = new AutoRig();
@@ -295,75 +291,93 @@ public class ConeErrorApiTests
         (int status, JObject json) = await host.Post("auto/plan", new { dovetailMm = 200.0 });
 
         Assert.Equal(409, status);
-        Assert.Equal("PreconditionsNotMet", (string)json["code"]!);
         Assert.Contains("sequence", (string)json["error"]!);
     }
 
     [Fact]
-    public async Task ADisconnectedMountBlocks()
+    public async Task AnUnsetPiClockBlocks()
     {
         using var rig = new AutoRig();
-        rig.Mount.Connected = false;
         using var host = new ConeErrorApiHost(rig);
 
-        (_, JObject pre) = await Preconditions(host, rig.Clock.UtcNow);
+        (_, JObject pre) = await host.Get("preconditions?clientTimeUtc=" + Uri.EscapeDataString(rig.Clock.UtcNow.AddHours(3).ToString("o")));
 
-        Assert.False((bool)pre["response"]!["ready"]!);
-        Assert.Contains("Connect the mount", pre["response"]!["blockers"]!.ToString());
+        Assert.False((bool)pre["response"]!["manualReady"]!);
+        Assert.Contains("minutes off", pre["response"]!["manualBlockers"]!.ToString());
     }
 
     [Fact]
-    public async Task AWrongPiClockBlocks()
+    public async Task DaytimeCheckOverHttpMovesAndRestoresTracking()
     {
         using var rig = new AutoRig();
+        rig.Mount.Place(0.02, -38.0);
         using var host = new ConeErrorApiHost(rig);
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.Store.SaveSettings(new ConeErrorSettings { ManualMinAltitudeDegrees = 0.0 });
 
-        (_, JObject pre) = await Preconditions(host, rig.Clock.UtcNow.AddHours(3));
+        (int begin, JObject begun) = await host.Post("manual/begin");
+        Assert.Equal(200, begin);
+        Assert.False(rig.Mount.Tracking);
+        await host.Post("manual/capture");
+        (int planStatus, JObject plan) = await host.Post("manual/plan-move", new { side = "West" });
+        Assert.Equal(200, planStatus);
+        Assert.True((bool)plan["response"]!["ok"]!, plan.ToString());
 
-        Assert.False((bool)pre["response"]!["ready"]!);
-        Assert.Contains("minutes off", pre["response"]!["blockers"]!.ToString());
+        (int move, _) = await host.Post("manual/move", new { planId = (string)plan["response"]!["planId"]! });
+        Assert.Equal(200, move);
+        JObject ready = await host.WaitForPhase("Ready");
+        for (int i = 0; i < 100 && rig.Mount.Side != PierSideLabel.West; i++)
+        {
+            await Task.Delay(20);
+        }
+
+        (int end, _) = await host.Post("manual/end");
+
+        Assert.Equal("manual", (string)begun["response"]!["mode"]!);
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+        Assert.Equal(200, end);
+        Assert.True(rig.Mount.Tracking);
     }
 
     [Fact]
-    public async Task PlanningChecksThePhoneClockOnTheServer()
+    public async Task TheSunPathOverrideIsPassedThroughPerPlan()
     {
         using var rig = new AutoRig();
+        rig.Mount.Place(0.02, -38.0);
         using var host = new ConeErrorApiHost(rig);
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.Store.SaveSettings(new ConeErrorSettings { ManualMinAltitudeDegrees = 0.0 });
+        await host.Post("manual/begin");
+        await host.Post("manual/capture");
+        // the tube's swing passes the Sun, the landmark itself is far from it
+        rig.Sun.Fixed = new HaDec(3.0, 20.0);
 
-        (int status, JObject json) = await host.Post("auto/plan", new { dovetailMm = 200.0, clientTimeUtc = rig.Clock.UtcNow.AddHours(1).ToString("o") });
+        (_, JObject refused) = await host.Post("manual/plan-move", new { side = "West" });
+        (_, JObject overridden) = await host.Post("manual/plan-move", new { side = "West", overrideSunPath = true });
 
-        Assert.Equal(409, status);
-        Assert.Contains("minutes off", (string)json["error"]!);
+        Assert.False((bool)refused["response"]!["ok"]!);
+        Assert.True((bool)refused["response"]!["sunPathOverridable"]!);
+        Assert.True((bool)overridden["response"]!["ok"]!);
+        Assert.True((bool)overridden["response"]!["sunPathOverridden"]!);
+        await host.Post("manual/end");
     }
 
     [Fact]
-    public async Task DaylightBlocks()
+    public async Task RestoreAppliesALeftoverJournalWithoutMoving()
     {
         using var rig = new AutoRig();
-        rig.Clock.Advance(TimeSpan.FromHours(14));
+        rig.Store.SaveJournal(new RestoreJournal { Mode = "auto", PreferredPierSide = "West" });
         using var host = new ConeErrorApiHost(rig);
 
-        (_, JObject pre) = await Preconditions(host, rig.Clock.UtcNow);
+        (_, JObject pre) = await host.Get("preconditions");
+        Assert.True((bool)pre["response"]!["restorePending"]!);
 
-        Assert.False((bool)pre["response"]!["ready"]!);
-        Assert.True((double)pre["response"]!["time"]!["sunAltitudeDegrees"]! > 0.0);
-        Assert.Contains("The Sun is", pre["response"]!["blockers"]!.ToString());
-    }
-
-    [Fact]
-    public async Task WithTheSunCheckOffDaylightOnlyWarns()
-    {
-        using var rig = new AutoRig();
-        rig.Clock.Advance(TimeSpan.FromHours(14));
-        using var host = new ConeErrorApiHost(rig);
-
-        (int status, _) = await Send(host, HttpMethod.Put, "settings", new { ignoreSunCheck = true });
-        (_, JObject pre) = await Preconditions(host, rig.Clock.UtcNow);
+        (int status, _) = await host.Post("restore");
 
         Assert.Equal(200, status);
-        Assert.True((bool)pre["response"]!["ready"]!, pre.ToString());
-        Assert.Contains("darkness check is off", pre["response"]!["warnings"]!.ToString());
-        Assert.True(rig.Store.LoadSettings().IgnoreSunCheck);
+        Assert.Equal("West", rig.PierSide.Setting);
+        Assert.Null(rig.Store.LoadJournal());
+        Assert.Empty(rig.Mount.Slews);
     }
 
     [Fact]
@@ -371,12 +385,12 @@ public class ConeErrorApiTests
     {
         using var rig = new AutoRig();
         using var host = new ConeErrorApiHost(rig);
-        rig.Store.SaveSettings(new ConeErrorSettings { MinAltitudeDegrees = 30.0, DovetailMm = 180.0, VerifiedPierLabels = { "k" } });
+        rig.Store.SaveSettings(new ConeErrorSettings { SunExclusionDegrees = 45.0, DovetailMm = 180.0, VerifiedPierLabels = { "k" } });
 
         (int status, JObject json) = await Send(host, HttpMethod.Put, "settings", new { repetitions = 7 });
 
         Assert.Equal(200, status);
-        Assert.Equal(30.0, (double)json["response"]!["minAltitudeDegrees"]!);
+        Assert.Equal(45.0, (double)json["response"]!["sunExclusionDegrees"]!);
         Assert.Equal(7, (int)json["response"]!["repetitions"]!);
         Assert.Equal(180.0, rig.Store.LoadSettings().DovetailMm);
         Assert.Contains("k", rig.Store.LoadSettings().VerifiedPierLabels);
@@ -389,7 +403,7 @@ public class ConeErrorApiTests
         using var host = new ConeErrorApiHost(rig);
         rig.Store.SaveSettings(new ConeErrorSettings { VerifiedPierLabels = { "k" } });
 
-        await Send(host, HttpMethod.Put, "settings", new { verifiedPierLabels = new[] { MountKey } });
+        await Send(host, HttpMethod.Put, "settings", new { verifiedPierLabels = new[] { "test|Fake mount" } });
 
         Assert.Equal(new[] { "k" }, rig.Store.LoadSettings().VerifiedPierLabels);
     }
@@ -407,18 +421,104 @@ public class ConeErrorApiTests
     }
 
     [Fact]
-    public async Task AbortStopsTheMountAlsoAfterAMeasurementHasFinished()
+    public async Task AnAbortWhileTheDaytimeCheckStartsEndsIt()
     {
         using var rig = new AutoRig();
-        rig.Store.SaveSettings(new ConeErrorSettings { VerifiedPierLabels = { MountKey } });
+        rig.Mount.Place(0.02, -38.0);
         using var host = new ConeErrorApiHost(rig);
-        await Start(host, await Plan(host, repetitions: 2));
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.PierSide.OnRead = () => host.Service.Abort();
+
+        (int status, JObject json) = await host.Post("manual/begin");
+        rig.PierSide.OnRead = null;
+        (_, JObject after) = await host.Get("status");
+
+        Assert.Equal(409, status);
+        Assert.Equal("Aborted", (string)json["code"]!);
+        Assert.True(rig.Mount.Tracking);
+        Assert.False((bool)after["response"]!["active"]!);
+    }
+
+    [Fact]
+    public async Task AbortStopsTheMountAlsoAfterASessionHasFinished()
+    {
+        using var rig = new AutoRig();
+        rig.Store.SaveSettings(new ConeErrorSettings { VerifiedPierLabels = { "test|Fake mount" } });
+        using var host = new ConeErrorApiHost(rig);
+        await host.Post("auto/start", new { planId = await Plan(host, repetitions: 2) });
         await host.WaitForPhase("Complete");
         int before = rig.Mount.StopCount;
 
         await host.Post("abort");
 
         Assert.Equal(before + 1, rig.Mount.StopCount);
+    }
+
+    [Fact]
+    public async Task AFailedDaytimeStartLeavesNoSessionBehind()
+    {
+        using var rig = new AutoRig();
+        rig.Mount.Place(0.02, -38.0);
+        using var host = new ConeErrorApiHost(rig);
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.PierSide.FailRead = true;
+
+        (int failed, _) = await host.Post("manual/begin");
+        rig.PierSide.FailRead = false;
+        (int retried, _) = await host.Post("manual/begin");
+
+        Assert.Equal(500, failed);
+        Assert.Equal(200, retried);
+        await host.Post("manual/end");
+    }
+
+    [Fact]
+    public async Task PlanningChecksThePhoneClockOnTheServer()
+    {
+        using var rig = new AutoRig();
+        using var host = new ConeErrorApiHost(rig);
+
+        (int status, JObject json) = await host.Post("auto/plan", new { dovetailMm = 200.0, clientTimeUtc = rig.Clock.UtcNow.AddHours(1).ToString("o") });
+
+        Assert.Equal(409, status);
+        Assert.Contains("minutes off", (string)json["error"]!);
+    }
+
+    [Fact]
+    public async Task TheDaytimeCounterweightCheckGoesThroughTheApi()
+    {
+        using var rig = new AutoRig();
+        rig.Mount.Place(0.02, -38.0);
+        using var host = new ConeErrorApiHost(rig);
+        host.Environment.FakeObservatory.State = new ObservatoryState(false, false, false, false);
+        rig.Store.SaveSettings(new ConeErrorSettings { ManualMinAltitudeDegrees = 0.0 });
+        await host.Post("manual/begin");
+
+        (int status, JObject json) = await host.Post("manual/pier-labels", new { counterweightWest = true });
+
+        Assert.Equal(200, status);
+        Assert.True((bool)json["response"]!["manual"]!["pierLabelsVerified"]!);
+        Assert.Contains("test|Fake mount", rig.Store.LoadSettings().VerifiedPierLabels);
+        await host.Post("manual/end");
+    }
+
+    [Fact]
+    public async Task PlansCarryTheirLifetimeInSeconds()
+    {
+        using var rig = new AutoRig();
+        using var host = new ConeErrorApiHost(rig);
+
+        (_, JObject plan) = await host.Post("auto/plan", new { dovetailMm = 200.0, repetitions = 2 });
+
+        Assert.Equal(60.0, (double)plan["response"]!["expiresInSeconds"]!);
+    }
+
+    private static async Task<(int Status, JObject Json)> Send(ConeErrorApiHost host, HttpMethod method, string path, object body)
+    {
+        using var client = new HttpClient { BaseAddress = host.BaseAddress };
+        using var request = new HttpRequestMessage(method, path) { Content = new StringContent(JObject.FromObject(body).ToString(), Encoding.UTF8, "application/json") };
+        using HttpResponseMessage response = await client.SendAsync(request);
+        return ((int)response.StatusCode, JObject.Parse(await response.Content.ReadAsStringAsync()));
     }
 
     [Fact]
@@ -432,13 +532,5 @@ public class ConeErrorApiTests
         Assert.Equal(200, status);
         Assert.Equal("none", (string)json["response"]!["mode"]!);
         Assert.Equal("Idle", (string)json["response"]!["phase"]!);
-    }
-
-    private static async Task<(int Status, JObject Json)> Send(ConeErrorApiHost host, HttpMethod method, string path, object body)
-    {
-        using var client = new HttpClient { BaseAddress = host.BaseAddress };
-        using var request = new HttpRequestMessage(method, path) { Content = new StringContent(JObject.FromObject(body).ToString(), Encoding.UTF8, "application/json") };
-        using HttpResponseMessage response = await client.SendAsync(request);
-        return ((int)response.StatusCode, JObject.Parse(await response.Content.ReadAsStringAsync()));
     }
 }

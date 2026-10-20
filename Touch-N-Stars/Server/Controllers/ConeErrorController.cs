@@ -10,6 +10,7 @@ using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
 using NINA.Core.Utility;
+using TouchNStars.ConeError.Domain;
 using TouchNStars.ConeError.Session;
 using TouchNStars.Server.Services;
 
@@ -91,16 +92,20 @@ public class ConeErrorController : WebApiController
     [Route(HttpVerbs.Get, "/cone-error/results")]
     public Task GetResults() => Run(() => Task.FromResult<object>(Service.Results()));
 
+    /// <summary>POST /api/cone-error/restore - applies a leftover restore journal (settings only, never a move).</summary>
+    [Route(HttpVerbs.Post, "/cone-error/restore")]
+    public Task Restore() => Run(async () => await Service.RestoreAsync());
+
     /// <summary>POST /api/cone-error/auto/plan {dovetailMm, repetitions, declination?, exposureSeconds?} - the slews to confirm.</summary>
     [Route(HttpVerbs.Post, "/cone-error/auto/plan")]
     public Task PlanAuto() => Run(async () => Service.PlanAuto(await Body<AutoPlanRequest>() ?? new AutoPlanRequest()));
 
-    /// <summary>POST /api/cone-error/auto/start {planId, noPointingModel} - the mount moves.</summary>
+    /// <summary>POST /api/cone-error/auto/start {planId, acknowledgePointingModel} - the mount moves.</summary>
     [Route(HttpVerbs.Post, "/cone-error/auto/start")]
     public Task StartAuto() => Run(async () =>
     {
         JObject body = await BodyObject();
-        return Service.StartAuto((string)body["planId"], (bool?)body["noPointingModel"] ?? false);
+        return Service.StartAuto((string)body["planId"], (bool?)body["acknowledgePointingModel"] ?? false);
     });
 
     /// <summary>POST /api/cone-error/answer {id, yes} - answers the session's question (the pier side check).</summary>
@@ -115,6 +120,70 @@ public class ConeErrorController : WebApiController
 
         return Service.Status();
     });
+
+    /// <summary>POST /api/cone-error/manual/begin {clientTimeUtc} - turns tracking off for the daytime check.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/begin")]
+    public Task BeginManual() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        return Service.BeginManual((DateTime?)body["clientTimeUtc"]);
+    });
+
+    /// <summary>POST /api/cone-error/manual/pier-labels {counterweightWest} - the one-time counterweight check on the east side.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/pier-labels")]
+    public Task ManualPierLabels() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        if (body["counterweightWest"] == null)
+        {
+            throw new ConeErrorException("BadRequest", "counterweightWest is required.");
+        }
+
+        return Service.ManualPierLabels((bool)body["counterweightWest"]);
+    });
+
+    [Route(HttpVerbs.Post, "/cone-error/manual/capture")]
+    public Task Capture() => Run(() => Task.FromResult<object>(Service.Capture()));
+
+    /// <summary>
+    /// POST /api/cone-error/manual/plan-move {side: "East"|"West", overrideSunPath} - the checks of the move to
+    /// confirm; overrideSunPath overrides a refusal for the Sun near the path alone, for this one move.
+    /// </summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/plan-move")]
+    public Task PlanMove() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        if (!Enum.TryParse((string)body["side"], ignoreCase: true, out PierSideLabel side))
+        {
+            throw new ConeErrorException("BadRequest", "side must be East or West.");
+        }
+
+        return Service.PlanManualMove(side, (bool?)body["overrideSunPath"] ?? false);
+    });
+
+    /// <summary>POST /api/cone-error/manual/move {planId} - starts a confirmed move; progress through /status.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/move")]
+    public Task Move() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        return Service.StartManualMove((string)body["planId"]);
+    });
+
+    /// <summary>POST /api/cone-error/manual/stop - stops a running move; the daytime check stays active.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/stop")]
+    public Task StopMove() => Run(() => Task.FromResult<object>(Service.StopManualMove()));
+
+    /// <summary>POST /api/cone-error/manual/recenter-done {axisOffsetMm, landmarkDistanceMeters} - the daytime estimate.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/recenter-done")]
+    public Task RecenterDone() => Run(async () =>
+    {
+        JObject body = await BodyObject();
+        return Service.RecenterDone((double?)body["axisOffsetMm"], (double?)body["landmarkDistanceMeters"]);
+    });
+
+    /// <summary>POST /api/cone-error/manual/end - ends the daytime check and restores tracking.</summary>
+    [Route(HttpVerbs.Post, "/cone-error/manual/end")]
+    public Task EndManual() => Run(async () => await Service.EndManualAsync());
 
     private async Task<T> Body<T>() where T : class
     {

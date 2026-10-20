@@ -1,0 +1,886 @@
+using TouchNStars.ConeError.Domain;
+using TouchNStars.ConeError.Session;
+using Xunit;
+
+namespace TouchNStars.Tests.ConeError;
+
+/// <summary>The daytime check rig: 50° N, 10° E, the tube on a landmark 2° above the southern horizon.</summary>
+public sealed class ManualRig : IDisposable
+{
+    public static readonly DateTime Evening = new(2026, 10, 14, 19, 0, 0, DateTimeKind.Utc);
+
+    public ManualRig(
+        DateTime? start = null,
+        bool tracking = true,
+        bool pierSideSupported = true,
+        double tiltArcmin = 4.0,
+        double settleSeconds = 0.0,
+        bool pierLabelsVerified = true)
+    {
+        Directory = Path.Combine(Path.GetTempPath(), "cone-error-tests-" + Guid.NewGuid().ToString("N"));
+        Store = new ConeErrorStore(Directory);
+        Clock = new FakeClock(start ?? Evening);
+        Sun = new FakeSun(10.0);
+        World = new ConeForwardModel { LatitudeDegrees = 50.0, TiltAwayFromSaddleArcmin = tiltArcmin, AxisOffsetMm = 250.0 };
+        PierSide = new FakePierSide("West") { Supported = pierSideSupported };
+        Mount = new FakeMount(Clock, 50.0, 10.0, PierSideLabel.East, 0.02, -38.0, tracking) { PierSide = PierSide, SettleSeconds = settleSeconds };
+        Session = new ManualFlipSession(
+            Mount,
+            PierSide,
+            Clock,
+            Sun,
+            Store,
+            new ManualFlipOptions
+            {
+                Limits = new LimitSet { MinAltitudeDegrees = 0.0, PinsPastMeridianDegrees = 2.5, SunExclusionDegrees = 30.0 },
+                LatitudeDegrees = 50.0,
+                DovetailMm = 200.0,
+                MountKey = "test|Fake mount",
+                Profile = new ProfileFacts("test", "Test", 50.0, 10.0, null, 10.0, 0.0, 5.0, 400.0, "ASTAP", null),
+                SettleSeconds = settleSeconds,
+                PierLabelsVerified = pierLabelsVerified
+            },
+            backgroundLoop: false);
+    }
+
+    public string Directory { get; }
+    public ConeErrorStore Store { get; }
+    public FakeClock Clock { get; }
+    public FakeSun Sun { get; }
+    public ConeForwardModel World { get; }
+    public FakePierSide PierSide { get; }
+    public FakeMount Mount { get; }
+    public ManualFlipSession Session { get; }
+
+    public async Task MoveTo(PierSideLabel side)
+    {
+        ManualMovePlan plan = Session.PlanMove(side);
+        Assert.True(plan.Ok, plan.Refusal ?? LimitValidator.Describe(plan.Check.Violations));
+        await Session.MoveAsync(plan.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            System.IO.Directory.Delete(Directory, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
+    }
+}
+
+public class ManualFlipSessionTests
+{
+    [Fact]
+    public async Task TrackingIsOffDuringTheModeAndRestoredOnExit()
+    {
+        using var rig = new ManualRig(tracking: true);
+
+        rig.Session.Begin();
+        Assert.False(rig.Mount.Tracking);
+        Assert.True(rig.Store.LoadJournal().Tracking);
+
+        await rig.Session.EndAsync();
+
+        Assert.True(rig.Mount.Tracking);
+        Assert.Equal("West", rig.PierSide.Setting);
+        Assert.Null(rig.Store.LoadJournal());
+        Assert.Equal(SessionPhase.Complete, rig.Session.GetStatus().Phase);
+    }
+
+    [Fact]
+    public async Task TrackingOffBeforeTheModeStaysOff()
+    {
+        using var rig = new ManualRig(tracking: false);
+
+        rig.Session.Begin();
+        await rig.Session.EndAsync();
+
+        Assert.False(rig.Mount.Tracking);
+        Assert.Equal(new[] { false }, rig.Mount.TrackingCalls);
+    }
+
+    [Fact]
+    public async Task AbortStopsTheMountAndRestoresTracking()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        await rig.Session.AbortAsync();
+
+        Assert.True(rig.Mount.Tracking);
+        Assert.True(rig.Mount.StopCount >= 1);
+        Assert.Equal(SessionPhase.Aborted, rig.Session.GetStatus().Phase);
+        Assert.Throws<ConeErrorException>(() => rig.Session.Capture());
+    }
+
+    [Fact]
+    public async Task AbortDuringAMoveRestoresTracking()
+    {
+        using var rig = new ManualRig(tracking: true);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        Task move = rig.Session.MoveAsync(plan.PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await rig.Session.AbortAsync();
+        await move.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(rig.Mount.Tracking);
+        Assert.True(rig.Mount.StopCount >= 1);
+        Assert.Equal("West", rig.PierSide.Setting);
+    }
+
+    [Fact]
+    public async Task AMoveThatFailsStillRestoresTrackingOnExit()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Mount.SlewException = new InvalidOperationException("goto refused: below horizon");
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync(plan.PlanId));
+        Assert.Equal("MoveFailed", rig.Session.GetStatus().Error.Code);
+        await rig.Session.EndAsync();
+
+        Assert.True(rig.Mount.Tracking);
+    }
+
+    [Fact]
+    public async Task MoveLandsOnTheOtherSideAtTheCapturedHourAngleWithTrackingOff()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        ManualFlipStatus captured = rig.Session.Capture();
+        Assert.True(captured.EastCheck.Ok);
+        Assert.True(captured.WestCheck.Ok);
+
+        await rig.MoveTo(PierSideLabel.West);
+
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+        Assert.False(rig.Mount.Tracking);
+        Assert.InRange(Spherical.SeparationDegrees(rig.Mount.HourAngle, rig.Mount.Declination, 0.02, -38.0) * 60.0, 0.0, ManualFlipSession.ArrivalToleranceArcmin);
+        // the flip tracks for 90 s on the way, so a short correction follows
+        Assert.True(rig.Mount.Slews.Count >= 2);
+        Assert.Equal(SessionPhase.Ready, rig.Session.GetStatus().Phase);
+    }
+
+    [Fact]
+    public async Task MovesBackAndForthAsOftenAsWanted()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        await rig.MoveTo(PierSideLabel.West);
+        await rig.MoveTo(PierSideLabel.East);
+        await rig.MoveTo(PierSideLabel.West);
+
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+    }
+
+    [Fact]
+    public void TheCurrentSideCannotBePlanned()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.East);
+
+        Assert.False(plan.Ok);
+        Assert.Contains("already", plan.Refusal);
+    }
+
+    [Fact]
+    public void PlanningNeedsACapturedPosition()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+
+        Assert.Equal("NotCaptured", Assert.Throws<ConeErrorException>(() => rig.Session.PlanMove(PierSideLabel.West)).Code);
+    }
+
+    [Fact]
+    public async Task AMountThatCannotForceThePierSideIsExplainedAndNeverMoved()
+    {
+        using var rig = new ManualRig(pierSideSupported: false);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        Assert.False(plan.Ok);
+        Assert.Contains("cannot be told", plan.Refusal);
+        Assert.Equal("PlanRefused", (await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync(plan.PlanId))).Code);
+        Assert.Empty(rig.Mount.Slews);
+    }
+
+    [Fact]
+    public void ALandmarkReachableOnOnlyOneSideIsRefused()
+    {
+        using var rig = new ManualRig();
+        rig.Mount.Place(0.5, -38.0);
+        rig.Session.Begin();
+
+        ManualFlipStatus captured = rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        Assert.True(captured.EastCheck.Ok);
+        Assert.False(captured.WestCheck.Ok);
+        Assert.False(plan.Ok);
+        Assert.Contains(plan.Check.Violations, v => v.Code == LimitViolationCode.PastMeridianLimit);
+        Assert.Empty(rig.Mount.Slews);
+    }
+
+    [Fact]
+    public async Task UnknownAndExpiredPlansAreRefused()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        Assert.Equal("PlanUnknown", (await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync("nope"))).Code);
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+        rig.Clock.Advance(TimeSpan.FromSeconds(61));
+        Assert.Equal("PlanExpired", (await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync(plan.PlanId))).Code);
+        Assert.Empty(rig.Mount.Slews);
+    }
+
+    [Fact]
+    public void SunNearTheFlipPathRefusesAndTellsWhenItWillBeAllowed()
+    {
+        using var rig = new ManualRig(start: new DateTime(2026, 6, 21, 15, 0, 0, DateTimeKind.Utc));
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        Assert.False(plan.Ok);
+        Assert.Contains(plan.Check.Violations, v => v.Code == LimitViolationCode.SunTooCloseOnPath);
+        Assert.NotNull(plan.NextAllowedUtc);
+        Assert.InRange(plan.NextAllowedUtc.Value, new DateTime(2026, 6, 21, 18, 0, 0, DateTimeKind.Utc), new DateTime(2026, 6, 21, 20, 0, 0, DateTimeKind.Utc));
+    }
+
+    private static readonly DateTime JuneAfternoon = new(2026, 6, 21, 15, 0, 0, DateTimeKind.Utc);
+
+    [Fact]
+    public async Task TheSunPathCheckCanBeOverriddenForOneMove()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan refused = rig.Session.PlanMove(PierSideLabel.West);
+        ManualMovePlan overridden = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+        await rig.Session.MoveAsync(overridden.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(refused.Ok);
+        Assert.True(refused.SunPathOverridable);
+        Assert.False(refused.SunPathOverridden);
+        Assert.True(overridden.Ok);
+        Assert.True(overridden.SunPathOverridden);
+        Assert.Contains(overridden.Warnings, w => w.StartsWith("Sun check overridden"));
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+    }
+
+    [Fact]
+    public void TheEndpointCheckCanNeverBeOverridden()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+        rig.Sun.Fixed = new HaDec(0.3, -30.0);
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        Assert.False(plan.Ok);
+        Assert.False(plan.SunPathOverridable);
+        Assert.False(plan.SunPathOverridden);
+        Assert.Contains(plan.Check.Violations, v => v.Code == LimitViolationCode.SunTooClose);
+    }
+
+    [Fact]
+    public void TheOverrideNeverSkipsTheLimits()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Mount.Place(0.5, -38.0);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        Assert.False(plan.Ok);
+        Assert.False(plan.SunPathOverridable);
+        Assert.Contains(plan.Check.Violations, v => v.Code == LimitViolationCode.PastMeridianLimit);
+    }
+
+    [Fact]
+    public async Task TheOverrideHoldsForOneMoveOnly()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan overridden = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+        await rig.Session.MoveAsync(overridden.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        ManualMovePlan back = rig.Session.PlanMove(PierSideLabel.East);
+
+        Assert.False(back.Ok);
+        Assert.True(back.SunPathOverridable);
+        Assert.True(rig.Session.Watchdog.StopOnSun);
+    }
+
+    [Fact]
+    public async Task DuringAnOverriddenMoveTheWatchdogAlertsButDoesNotStopTheSwing()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Mount.OnSlew = (_, _) =>
+        {
+            // the tube swings past the Sun on its way; the app keeps polling meanwhile
+            rig.Session.Heartbeat();
+            rig.Sun.Fixed = new HaDec(rig.Mount.HourAngle, rig.Mount.Declination + 5.0);
+            rig.Session.CheckBackground();
+            Assert.True(rig.Session.GetStatus().Sun.Critical);
+            rig.Sun.Fixed = null;
+            return Task.CompletedTask;
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        await rig.Session.MoveAsync(plan.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, rig.Mount.StopCount);
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+        Assert.Null(rig.Session.GetStatus().Error);
+    }
+
+    [Fact]
+    public async Task WithoutAnOverrideTheWatchdogStopsAMoveThatComesNearTheSun()
+    {
+        using var rig = new ManualRig();
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            rig.Sun.Fixed = new HaDec(rig.Mount.HourAngle, rig.Mount.Declination + 5.0);
+            rig.Session.CheckBackground();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+        Assert.True(plan.Ok);
+
+        await rig.Session.MoveAsync(plan.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(rig.Mount.StopCount >= 1);
+        Assert.Equal("SunTooClose", rig.Session.GetStatus().Error.Code);
+        Assert.Equal(PierSideLabel.East, rig.Mount.Side);
+    }
+
+    [Fact]
+    public async Task AFailedMoveReturnsToReadySoTheModeCanBeEnded()
+    {
+        using var rig = new ManualRig();
+        rig.Mount.SlewException = new InvalidOperationException("goto refused");
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync(plan.PlanId));
+
+        Assert.Equal(SessionPhase.Ready, rig.Session.GetStatus().Phase);
+        rig.Mount.SlewException = null;
+        Assert.True(rig.Session.PlanMove(PierSideLabel.West).Ok);
+    }
+
+    [Fact]
+    public async Task AMoveRefusedForTheSideReturnsToReady()
+    {
+        using var rig = new ManualRig();
+        rig.Mount.IgnorePierSide = true;
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+
+        ConeErrorException ex = await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync(plan.PlanId));
+
+        Assert.Equal("PierSideRefused", ex.Code);
+        Assert.Equal(SessionPhase.Ready, rig.Session.GetStatus().Phase);
+    }
+
+    [Fact]
+    public async Task CaptureDuringAMoveIsRefused()
+    {
+        using var rig = new ManualRig();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        Task move = rig.Session.MoveAsync(rig.Session.PlanMove(PierSideLabel.West).PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal("Busy", Assert.Throws<ConeErrorException>(() => rig.Session.Capture()).Code);
+
+        rig.Session.StopMove();
+        await move.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task EndingDuringAMoveWaitsForTheMoveAndRestoresThePierSide()
+    {
+        using var rig = new ManualRig(tracking: true);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        Task move = rig.Session.MoveAsync(rig.Session.PlanMove(PierSideLabel.West).PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await rig.Session.EndAsync().WaitAsync(TimeSpan.FromSeconds(20));
+
+        Assert.True(move.IsCompleted);
+        Assert.Equal("West", rig.PierSide.Setting);
+        Assert.True(rig.Mount.Tracking);
+        Assert.True(rig.Session.Finished);
+        Assert.Null(rig.Store.LoadJournal());
+        Assert.Equal("NotActive", (await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync("any"))).Code);
+    }
+
+    [Fact]
+    public async Task EndingACheckStartedWithTrackingOffLeavesNoJournal()
+    {
+        using var rig = new ManualRig(tracking: false);
+
+        rig.Session.Begin();
+        await rig.Session.EndAsync();
+
+        Assert.False(rig.Session.GetStatus().RestorePending);
+        Assert.Null(rig.Store.LoadJournal());
+    }
+
+    [Fact]
+    public async Task TheDeadmanDoesNotStopAnOverriddenSwing()
+    {
+        using var rig = new ManualRig(start: JuneAfternoon);
+        rig.Mount.OnSlew = (_, _) =>
+        {
+            rig.Clock.Advance(TimeSpan.FromSeconds(30));
+            rig.Session.CheckBackground();
+            return Task.CompletedTask;
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West, overrideSunPath: true);
+
+        await rig.Session.MoveAsync(plan.PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, rig.Mount.StopCount);
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+    }
+
+    [Fact]
+    public void AMoveOrSyncFromElsewhereInvalidatesTheCapturedPosition()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        // re-centring with the jog pad: small, expected
+        rig.Mount.Place(0.02 + 0.5 / 60.0, -38.1);
+        rig.Session.CheckBackground();
+        Assert.NotNull(rig.Session.GetStatus().Manual.CapturedHourAngle);
+
+        // a goto from TNS framing: far away
+        rig.Mount.Place(2.0, 10.0);
+        rig.Session.CheckBackground();
+
+        SessionStatus status = rig.Session.GetStatus();
+        Assert.Null(status.Manual.CapturedHourAngle);
+        Assert.Equal("MovedElsewhere", status.Error.Code);
+        Assert.Equal("NotCaptured", Assert.Throws<ConeErrorException>(() => rig.Session.PlanMove(PierSideLabel.West)).Code);
+    }
+
+    [Theory]
+    [InlineData(5.0)]
+    [InlineData(10.0)]
+    public async Task CorrectionsConvergeAlthoughNinaTracksDuringTheSettleTime(double settle)
+    {
+        using var rig = new ManualRig(settleSeconds: settle);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        await rig.MoveTo(PierSideLabel.West);
+
+        double off = Spherical.SeparationDegrees(rig.Mount.HourAngle, rig.Mount.Declination, 0.02, -38.0) * 60.0;
+        Assert.InRange(off, 0.0, ManualFlipSession.ArrivalToleranceArcmin);
+    }
+
+    [Fact]
+    public async Task TheDaytimeEstimateNeedsTheCounterweightCheck()
+    {
+        using var rig = new ManualRig(pierLabelsVerified: false);
+        bool remembered = false;
+        rig.Session.PierLabelsConfirmed += () => remembered = true;
+        rig.Session.Begin();
+        rig.Session.Capture();
+        await rig.MoveTo(PierSideLabel.West);
+
+        ManualEstimate refused = rig.Session.RecenterDone(250.0, 10000.0);
+        Assert.Equal("PierLabelsUnverified", refused.RefusalCode);
+        Assert.Equal("NeedEastSide", Assert.Throws<ConeErrorException>(() => rig.Session.ConfirmPierLabels(true)).Code);
+
+        await rig.MoveTo(PierSideLabel.East);
+        rig.Session.ConfirmPierLabels(true);
+        ManualEstimate estimate = rig.Session.RecenterDone(250.0, 10000.0);
+
+        Assert.True(remembered);
+        Assert.Null(estimate.RefusalCode);
+        Assert.NotNull(estimate.ConeArcmin);
+    }
+
+    [Fact]
+    public async Task AnswerNoToTheCounterweightCheckRefusesEveryEstimate()
+    {
+        using var rig = new ManualRig(pierLabelsVerified: false);
+        rig.Session.Begin();
+        rig.Session.Capture();
+        rig.Session.ConfirmPierLabels(false);
+        await rig.MoveTo(PierSideLabel.West);
+
+        Assert.Equal("PierLabelsInverted", rig.Session.RecenterDone(250.0, 10000.0).RefusalCode);
+    }
+
+    [Fact]
+    public async Task AStoppedMoveKeepsTheCapturedLandmarkSoTheUserCanMoveAgain()
+    {
+        using var rig = new ManualRig();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            // the mount gets some way into the swing before STOP
+            rig.Mount.Place(2.5, 35.0);
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        Task move = rig.Session.MoveAsync(rig.Session.PlanMove(PierSideLabel.West).PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        rig.Session.StopMove();
+        await move.WaitAsync(TimeSpan.FromSeconds(10));
+        rig.Session.CheckBackground();
+
+        SessionStatus status = rig.Session.GetStatus();
+        Assert.NotNull(status.Manual.CapturedHourAngle);
+        Assert.NotEqual("MovedElsewhere", status.Error?.Code);
+        rig.Mount.OnSlew = null;
+        await rig.MoveTo(PierSideLabel.West);
+        Assert.Equal(PierSideLabel.West, rig.Mount.Side);
+    }
+
+    [Fact]
+    public async Task AStopThatCoastsKeepsTheCaptureAndLaterMovesAreStillDetected()
+    {
+        using var rig = new ManualRig();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            rig.Mount.Place(2.5, 35.0);
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        Task move = rig.Session.MoveAsync(rig.Session.PlanMove(PierSideLabel.West).PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        rig.Session.StopMove();
+        await move.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // OnStepX's emergency stop coasts up to 2° per axis: the next checks still see it moving
+        rig.Session.CheckBackground();
+        rig.Mount.Place(2.5 + 2.0 / 15.0, 37.0);
+        rig.Session.CheckBackground();
+        rig.Mount.Place(2.5 + 2.6 / 15.0, 37.4);
+        rig.Session.CheckBackground();
+        rig.Session.CheckBackground();
+        Assert.NotNull(rig.Session.GetStatus().Manual.CapturedHourAngle);
+        Assert.Null(rig.Session.GetStatus().Error);
+
+        // at rest now; a goto from elsewhere is still caught
+        rig.Mount.Place(-3.0, 10.0);
+        rig.Session.CheckBackground();
+        Assert.Equal("MovedElsewhere", rig.Session.GetStatus().Error.Code);
+    }
+
+    [Fact]
+    public void TrackingIsAskedOnAgainWhenTheMountDoesNotReportItOff()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Mount.RefuseTrackingOff = true;
+
+        Assert.Throws<ConeErrorException>(() => rig.Session.Begin());
+
+        Assert.Equal(new[] { false, true }, rig.Mount.TrackingCalls);
+    }
+
+    [Fact]
+    public void TheStatusCarriesTheCurrentHourAngleForTheCounterweightCheck()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+
+        Assert.Equal(0.02, rig.Session.GetStatus().Manual.CurrentHourAngle!.Value, 1e-6);
+    }
+
+    [Fact]
+    public async Task ASunStopKeepsItsMessage()
+    {
+        using var rig = new ManualRig();
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            rig.Mount.Place(2.5, 35.0);
+            rig.Sun.Fixed = new HaDec(2.5, 30.0);
+            rig.Session.CheckBackground();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        await rig.Session.MoveAsync(rig.Session.PlanMove(PierSideLabel.West).PlanId).WaitAsync(TimeSpan.FromSeconds(10));
+
+        rig.Session.CheckBackground();
+
+        Assert.Equal("SunTooClose", rig.Session.GetStatus().Error.Code);
+    }
+
+    [Fact]
+    public void TheCounterweightCheckIsRefusedFarFromTheMeridian()
+    {
+        using var rig = new ManualRig(pierLabelsVerified: false);
+        rig.Mount.Place(8.0, 60.0);
+        rig.Session.Begin();
+
+        Assert.Equal("NeedNearMeridian", Assert.Throws<ConeErrorException>(() => rig.Session.ConfirmPierLabels(true)).Code);
+        Assert.False(rig.Session.GetStatus().Manual.PierLabelsVerified);
+    }
+
+    [Fact]
+    public void TheCounterweightCheckIsAnsweredOncePerSession()
+    {
+        using var rig = new ManualRig(pierLabelsVerified: false);
+        rig.Session.Begin();
+        rig.Session.ConfirmPierLabels(false);
+
+        Assert.Equal("AlreadyAnswered", Assert.Throws<ConeErrorException>(() => rig.Session.ConfirmPierLabels(true)).Code);
+        Assert.True(rig.Session.GetStatus().Manual.PierLabelsInverted);
+        Assert.True(rig.Session.GetStatus().Manual.PierLabelsAnswered);
+    }
+
+    [Fact]
+    public void TheDaytimeCheckDoesNotStartWhenTrackingCannotBeTurnedOff()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Mount.RefuseTrackingOff = true;
+
+        Assert.Equal("TrackingNotOff", Assert.Throws<ConeErrorException>(() => rig.Session.Begin()).Code);
+        Assert.Null(rig.Store.LoadJournal());
+        Assert.True(rig.Mount.Tracking);
+    }
+
+    [Fact]
+    public async Task ADisconnectedMountIsNeverReportedAsRestored()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Session.Begin();
+        rig.Mount.Connected = false;
+
+        await rig.Session.EndAsync();
+
+        Assert.True(rig.Session.GetStatus().RestorePending);
+        Assert.NotNull(rig.Store.LoadJournal());
+    }
+
+    [Fact]
+    public async Task APlanThatBecameUnsafeIsRefusedAtExecution()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+        Assert.True(plan.Ok);
+
+        rig.Sun.Fixed = new HaDec(0.3, -30.0);
+
+        Assert.Equal("PlanRefused", (await Assert.ThrowsAsync<ConeErrorException>(() => rig.Session.MoveAsync(plan.PlanId))).Code);
+        Assert.Empty(rig.Mount.Slews);
+    }
+
+    [Fact]
+    public async Task DeadmanStopsAMoveWhenTheAppStopsPolling()
+    {
+        using var rig = new ManualRig();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Mount.OnSlew = async (_, token) =>
+        {
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        rig.Session.Begin();
+        rig.Session.Capture();
+        ManualMovePlan plan = rig.Session.PlanMove(PierSideLabel.West);
+        Task move = rig.Session.MoveAsync(plan.PlanId);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        rig.Clock.Advance(TimeSpan.FromSeconds(10));
+        rig.Session.CheckBackground();
+        Assert.Equal(0, rig.Mount.StopCount);
+
+        rig.Clock.Advance(TimeSpan.FromSeconds(15));
+        rig.Session.CheckBackground();
+        await move.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(rig.Mount.StopCount >= 1);
+        Assert.Equal("ConnectionLost", rig.Session.GetStatus().Error.Code);
+        Assert.False(rig.Mount.Tracking);
+    }
+
+    [Fact]
+    public void HeartbeatsKeepTheDeadmanQuiet()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+
+        for (int i = 0; i < 10; i++)
+        {
+            rig.Clock.Advance(TimeSpan.FromSeconds(5));
+            rig.Session.Heartbeat();
+            rig.Session.CheckBackground();
+        }
+
+        Assert.Equal(0, rig.Mount.StopCount);
+        Assert.Null(rig.Session.GetStatus().Error);
+    }
+
+    [Fact]
+    public void SunApproachingAStaticPointingAlertsButNeverMovesTheMount()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        // 33° away (and above the horizon): a warning; then 20° away: critical
+        rig.Sun.Fixed = new HaDec(0.02, -5.0);
+        rig.Session.CheckBackground();
+        SunWatchStatus approaching = rig.Session.GetStatus().Sun;
+
+        rig.Sun.Fixed = new HaDec(0.02, -18.0);
+        rig.Session.CheckBackground();
+        SunWatchStatus near = rig.Session.GetStatus().Sun;
+
+        Assert.True(approaching.Warning);
+        Assert.False(approaching.Critical);
+        Assert.True(near.Critical);
+        Assert.Empty(rig.Mount.Slews);
+        Assert.Equal(0, rig.Mount.StopCount);
+    }
+
+    [Fact]
+    public async Task IdleTimeoutEndsTheModeAndRestoresTracking()
+    {
+        using var rig = new ManualRig(tracking: true);
+        rig.Session.Begin();
+
+        rig.Clock.Advance(TimeSpan.FromMinutes(31));
+        rig.Session.CheckBackground();
+        await Task.Delay(50);
+
+        Assert.True(rig.Session.Finished);
+        Assert.True(rig.Mount.Tracking);
+    }
+
+    [Theory]
+    [InlineData(4.0)]
+    [InlineData(-6.0)]
+    public async Task ReCentredLandmarkGivesTheDaytimeEstimateWithTheParallaxCorrection(double tilt)
+    {
+        using var rig = new ManualRig(tiltArcmin: tilt);
+        Vector3 landmark = ConeForwardModel.Direction(0.02, -38.0);
+        const double distance = 10000.0;
+        (double haEast, double decEast) = rig.World.CentreOnLandmark(PierSideLabel.East, landmark, distance);
+        (double haWest, double decWest) = rig.World.CentreOnLandmark(PierSideLabel.West, landmark, distance);
+        rig.Mount.Place(haEast, decEast);
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        await rig.MoveTo(PierSideLabel.West);
+        rig.Mount.Place(haWest, decWest);
+        ManualEstimate estimate = rig.Session.RecenterDone(250.0, distance);
+
+        Assert.Null(estimate.Refusal);
+        Assert.Equal(-tilt, estimate.ConeArcmin!.Value, 0.02);
+        Assert.Equal(rig.World.ExpectedShimEnd().ToString(), estimate.ShimEnd);
+        Assert.Equal("manual", estimate.Result.Mode);
+        Assert.Single(rig.Store.LoadResults());
+    }
+
+    [Fact]
+    public async Task ALandmarkTooCloseIsRefusedForTheEstimate()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+        await rig.MoveTo(PierSideLabel.West);
+
+        ManualEstimate estimate = rig.Session.RecenterDone(250.0, 1000.0);
+
+        Assert.NotNull(estimate.Refusal);
+        Assert.Contains("too close", estimate.Refusal);
+        Assert.Null(estimate.ConeArcmin);
+        Assert.Empty(rig.Store.LoadResults());
+    }
+
+    [Fact]
+    public async Task TheEstimateNeedsTheParallaxInputs()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+        await rig.MoveTo(PierSideLabel.West);
+
+        ManualEstimate estimate = rig.Session.RecenterDone(null, null);
+
+        Assert.NotNull(estimate.Refusal);
+        Assert.Null(estimate.ConeArcmin);
+    }
+
+    [Fact]
+    public void TheEstimateNeedsBothSides()
+    {
+        using var rig = new ManualRig();
+        rig.Session.Begin();
+        rig.Session.Capture();
+
+        Assert.Equal("NeedBothSides", Assert.Throws<ConeErrorException>(() => rig.Session.RecenterDone(250.0, 10000.0)).Code);
+    }
+}

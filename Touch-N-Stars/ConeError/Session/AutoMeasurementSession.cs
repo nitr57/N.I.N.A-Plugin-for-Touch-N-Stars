@@ -8,7 +8,7 @@ using TouchNStars.ConeError.Domain;
 
 namespace TouchNStars.ConeError.Session;
 
-/// <summary>What the user confirmed for a run.</summary>
+/// <summary>What the user confirmed for an automated run.</summary>
 public sealed class AutoRunOptions
 {
     public int Repetitions { get; init; }
@@ -16,29 +16,34 @@ public sealed class AutoRunOptions
     public double ExposureSeconds { get; init; }
     public double? DovetailMm { get; init; }
     public PairTiming Timing { get; init; }
+    public LimitSet Limits { get; init; }
     public double LatitudeDegrees { get; init; }
-    public double MinAltitudeDegrees { get; init; }
 
-    /// <summary>The flip is made when the target is this far past the meridian, minutes of time.</summary>
-    public double FlipAfterMinutes { get; init; }
+    /// <summary>The confirmed envelope: the largest |hour angle| of the plan, degrees.</summary>
+    public double MaxAbsHourAngleDegrees { get; init; }
 
     /// <summary>Ask once whether the counterweight is where the reported pier side says.</summary>
     public bool AskPierLabels { get; init; }
+
+    /// <summary>Measure every pair west first, east second (the plan's <see cref="AutoPlan.NormalSidesOnly"/>).</summary>
+    public bool NormalSidesOnly { get; init; }
 
     public string MountKey { get; init; }
     public ProfileFacts Profile { get; init; }
 }
 
 /// <summary>
-/// The measurement, done the way a sequence does a meridian flip. For each repetition a target just
-/// east of the meridian is sampled on the west pier side, tracked until it is past the meridian,
-/// flipped with NINA's meridian flip (each driver does that its own way) and sampled again on the
-/// east side. ΔRA = RA_solved − RA_mount per side, the cone per pair, then the statistics and the
-/// shim advice. Never syncs and never forces a pier side; the reported side is checked after every
-/// move. Abort stops the mount at once; tracking is put back as it was.
+/// The automated measurement: for each repetition a target near the meridian, measured on both pier
+/// sides (the side order alternates), ΔRA = RA_solved − RA_mount per side, the cone per pair, then the
+/// statistics and the shim advice. Never syncs. Before every slew the move is re-validated against the
+/// confirmed envelope, the limits and the Sun; any deviation fails the pair or the run instead of
+/// widening the plan. Abort stops the mount at once; the preferred pier side is restored in any case.
 /// </summary>
 public sealed class AutoMeasurementSession
 {
+    /// <summary>Slack on the confirmed |hour angle| envelope for timing differences, degrees.</summary>
+    public const double EnvelopeSlackDegrees = 1.0;
+
     /// <summary>The mount may drift this much during an exposure before the sample is discarded.</summary>
     public const double MaxMotionDuringExposureArcsec = 30.0;
 
@@ -47,14 +52,15 @@ public sealed class AutoMeasurementSession
 
     public static readonly TimeSpan QuestionTimeout = TimeSpan.FromMinutes(10);
 
-    /// <summary>The wait for the meridian is done in steps of at most this, so that the status stays current.</summary>
-    public static readonly TimeSpan WaitStep = TimeSpan.FromSeconds(2);
-
     private readonly IConeMount mount;
+    private readonly IPierSideControl pierSide;
     private readonly IConeImager imager;
     private readonly IClock clock;
+    private readonly ISunProvider sun;
     private readonly ConeErrorStore store;
     private readonly AutoRunOptions options;
+    private readonly SafetyWatchdog watchdog;
+    private readonly bool watchdogLoop;
     private readonly CancellationTokenSource cts = new();
     private readonly object sync = new();
     private readonly List<ConePairRecord> pairs = new();
@@ -66,33 +72,49 @@ public sealed class AutoMeasurementSession
     private ConeResultRecord previous;
     private PierSideLabel? currentSide;
     private int pairIndex;
-    private double? secondsUntilFlip;
     private SessionQuestion question;
     private TaskCompletionSource<bool> answer;
     private int questionIds;
+    private bool restorePending;
     private bool pierLabelsChecked;
     private bool completed;
     private string abortCode;
     private string abortMessage;
 
-    public AutoMeasurementSession(IConeMount mount, IConeImager imager, IClock clock, ConeErrorStore store, AutoRunOptions options)
+    public AutoMeasurementSession(
+        IConeMount mount,
+        IPierSideControl pierSide,
+        IConeImager imager,
+        IClock clock,
+        ISunProvider sun,
+        ConeErrorStore store,
+        AutoRunOptions options,
+        bool watchdogLoop = true)
     {
+        this.watchdogLoop = watchdogLoop;
         this.mount = mount;
+        this.pierSide = pierSide;
         this.imager = imager;
         this.clock = clock;
+        this.sun = sun;
         this.store = store;
         this.options = options;
+        watchdog = new SafetyWatchdog(mount, sun, clock, () => options.Limits.SunExclusionDegrees, () => options.LatitudeDegrees, () => options.Limits.SunSetAltitudeDegrees);
+        watchdog.SunTooClose += sep => AbortWith("SunTooClose", $"The telescope came within {sep:F1}° of the Sun; the measurement was stopped.");
+        watchdog.UnexpectedMotion += reason => AbortWith("UnexpectedMotion", reason + " The measurement was stopped; restart it without syncing or moving the mount.");
         StartedUtc = clock.UtcNow;
     }
 
     public DateTime StartedUtc { get; }
+
+    /// <summary>The watchdog, so that tests can run its checks without the 1 s loop.</summary>
+    internal SafetyWatchdog Watchdog => watchdog;
 
     public Task Completion { get; private set; } = Task.CompletedTask;
 
     /// <summary>Raised when the user confirmed the pier labels, so that the service can remember the mount.</summary>
     public event Action PierLabelsConfirmed;
 
-    /// <summary>True once the run has ended and tracking was put back.</summary>
     public bool Finished
     {
         get
@@ -109,14 +131,14 @@ public sealed class AutoMeasurementSession
         Completion = Task.Run(RunAsync);
     }
 
-    /// <summary>Stops the mount and the exposure now and ends the run.</summary>
+    /// <summary>Stops the mount and the exposure now and cancels the run; restore happens on the run's way out.</summary>
     public void Abort() => AbortWith("Aborted", "Aborted by the user.");
 
     private void AbortWith(string code, string reason)
     {
         lock (sync)
         {
-            if (completed)
+            if (phase is SessionPhase.Complete or SessionPhase.Failed or SessionPhase.Aborted)
             {
                 return;
             }
@@ -125,7 +147,8 @@ public sealed class AutoMeasurementSession
             abortMessage ??= reason;
         }
 
-        // stop first; cancel before the question is answered, so that nothing that wakes up reads a live token
+        // stop the mount first; then cancel, before the question is answered, so that nothing that
+        // wakes up reads a live token
         SafeStop();
         try
         {
@@ -192,12 +215,13 @@ public sealed class AutoMeasurementSession
                 Repetitions = options.Repetitions,
                 CurrentSide = currentSide?.ToString(),
                 DeclinationDegrees = options.DeclinationDegrees,
-                SecondsUntilFlip = secondsUntilFlip,
                 Pairs = pairs.Select(Copy).ToList(),
                 Question = question,
+                Sun = watchdog.Sun,
                 Error = error,
                 Result = result,
-                Previous = previous
+                Previous = previous,
+                RestorePending = restorePending
             };
         }
     }
@@ -208,18 +232,30 @@ public sealed class AutoMeasurementSession
         {
             phase = p;
             message = text;
-            secondsUntilFlip = null;
         }
     }
 
     private async Task RunAsync()
     {
         CancellationToken token = cts.Token;
-        bool? trackingBefore = null;
+        Task watch = watchdogLoop ? watchdog.RunAsync(token) : Task.CompletedTask;
+        bool changedPierSide = false;
         try
         {
+            string original = pierSide.ReadOriginal();
+            store.SaveJournal(new RestoreJournal
+            {
+                CreatedUtc = clock.UtcNow,
+                MountName = options.MountKey,
+                Mode = "auto",
+                PreferredPierSide = original
+            });
+            changedPierSide = true;
+
             MountSnapshot start = mount.Snapshot();
-            trackingBefore = start?.Tracking;
+            // At home OnStepX ignores the preferred pier side and takes the side from the sign of the
+            // hour angle (Goto.cpp setTarget); the first target is east of the meridian, so West.
+            currentSide = start == null ? PierSideLabel.East : start.AtHome ? PierSideLabel.West : start.Side ?? PierSideLabel.East;
             for (int p = 0; p < options.Repetitions; p++)
             {
                 token.ThrowIfCancellationRequested();
@@ -253,7 +289,12 @@ public sealed class AutoMeasurementSession
         finally
         {
             cts.Cancel();
-            RestoreTracking(trackingBefore);
+            await IgnoreAsync(watch);
+            if (changedPierSide)
+            {
+                await RestoreAsync();
+            }
+
             lock (sync)
             {
                 completed = true;
@@ -261,38 +302,48 @@ public sealed class AutoMeasurementSession
         }
     }
 
-    /// <summary>Every goto and flip turns tracking on; put it back off if it was off before the run.</summary>
-    private void RestoreTracking(bool? before)
+    private async Task RestoreAsync()
     {
-        if (before != false)
-        {
-            return;
-        }
-
         try
         {
-            if (!mount.SetTracking(false))
-            {
-                Logger.Warning("ConeError: the mount did not turn tracking off again after the measurement");
-            }
+            await pierSide.RestoreAsync();
+            store.ClearJournal();
         }
         catch (Exception ex)
         {
-            Logger.Warning($"ConeError: turning tracking off after the measurement failed: {ex.Message}");
+            Logger.Error($"ConeError: restoring the preferred pier side failed: {ex.Message}");
+            lock (sync)
+            {
+                restorePending = true;
+            }
+        }
+    }
+
+    private static async Task IgnoreAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (Exception)
+        {
+            // the watchdog ends with the session
         }
     }
 
     private async Task MeasurePairAsync(int p, CancellationToken token)
     {
         PairTiming timing = options.Timing;
-        double dec = options.DeclinationDegrees;
+        PierSideLabel first = options.NormalSidesOnly ? PierSideLabel.West : currentSide ?? PierSideLabel.East;
+        PierSideLabel second = ConeMath.Other(first);
 
-        // a target that reaches the west sample time just before the meridian
         MountSnapshot snap = mount.Snapshot();
-        double slew = p == 0 ? timing.SlewSeconds : timing.FlipSeconds;
-        double westMidIn = slew + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
-        double ra = Spherical.WrapHours24(
-            snap.LocalSiderealTimeHours + TargetPlanner.Sidereal(westMidIn) + TargetPlanner.WestSampleMinutesBeforeMeridian / 60.0);
+        double slew = p == 0
+            ? timing.SlewSeconds
+            : first != currentSide ? timing.FlipSeconds : Math.Min(timing.SlewSeconds, 30.0);
+        double centre = slew + timing.SettleSeconds + timing.ExposureSeconds / 2.0 + timing.BetweenSidesSeconds / 2.0;
+        double ra = Spherical.WrapHours24(snap.LocalSiderealTimeHours + TargetPlanner.Sidereal(centre));
+        double dec = options.DeclinationDegrees;
 
         var record = new ConePairRecord { Index = p, RightAscensionHours = ra, DeclinationDegrees = dec };
         lock (sync)
@@ -300,55 +351,31 @@ public sealed class AutoMeasurementSession
             pairs.Add(record);
         }
 
-        (double altitude, _) = Spherical.AltAz(0.0, dec, options.LatitudeDegrees);
-        if (altitude < options.MinAltitudeDegrees)
+        SideSample east = null;
+        SideSample west = null;
+        foreach (PierSideLabel side in new[] { first, second })
         {
-            throw new ConeErrorException("BelowMinimumAltitude", $"The target culminates at {altitude:F1}°, below the minimum altitude of {options.MinAltitudeDegrees:F0}°.");
-        }
-
-        // west side: the normal side for a target east of the meridian
-        SetPhase(SessionPhase.Slewing, $"Pair {p + 1}: slewing to the target east of the meridian");
-        await mount.SlewAsync(ra, dec, token);
-        if (Side() != PierSideLabel.West)
-        {
-            SetPhase(SessionPhase.Flipping, $"Pair {p + 1}: flipping to the west pier side");
-            await mount.FlipAsync(ra, dec, token);
-        }
-
-        RequireSide(PierSideLabel.West, "The mount does not go to the west pier side for a target just east of the meridian, where the counterweight is down. Check its preferred pier side setting.");
-
-        if (options.AskPierLabels && !pierLabelsChecked)
-        {
-            await AskPierLabelsAsync(token);
-            pierLabelsChecked = true;
-        }
-
-        SideSample west = await SampleAsync(p, PierSideLabel.West, ra, dec, token);
-        if (!west.Ok)
-        {
-            lock (sync)
+            double expectedIn = (side == first ? slew : timing.FlipSeconds) + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
+            token.ThrowIfCancellationRequested();
+            SideSample sample = await MeasureSideAsync(p, side, ra, dec, expectedIn, token);
+            if (!sample.Ok)
             {
-                record.Problem = $"West side: {west.Problem}";
+                lock (sync)
+                {
+                    record.Problem = $"{side} side: {sample.Problem}";
+                }
+
+                return;
             }
 
-            return;
-        }
-
-        // keep tracking until the target is past the meridian, then flip as a sequence would
-        await WaitForFlipTimeAsync(p, ra, token);
-        SetPhase(SessionPhase.Flipping, $"Pair {p + 1}: meridian flip to the east pier side");
-        await mount.FlipAsync(ra, dec, token);
-        RequireSide(PierSideLabel.East, "The mount did not flip to the east pier side. It needs to support NINA's meridian flip.");
-
-        SideSample east = await SampleAsync(p, PierSideLabel.East, ra, dec, token);
-        if (!east.Ok)
-        {
-            lock (sync)
+            if (side == PierSideLabel.East)
             {
-                record.Problem = $"East side: {east.Problem}";
+                east = sample;
             }
-
-            return;
+            else
+            {
+                west = sample;
+            }
         }
 
         double cone = ConeMath.PairConeArcmin(west.DeltaRaHours, east.DeltaRaHours, dec);
@@ -361,67 +388,85 @@ public sealed class AutoMeasurementSession
         }
     }
 
-    private PierSideLabel? Side()
-    {
-        PierSideLabel? side = mount.Snapshot()?.Side;
-        lock (sync)
-        {
-            currentSide = side;
-        }
-
-        return side;
-    }
-
-    private void RequireSide(PierSideLabel side, string problem)
-    {
-        PierSideLabel? reported = Side();
-        if (reported != side)
-        {
-            throw new ConeErrorException(
-                "PierSideNotReached",
-                $"{problem} (The mount reports {reported?.ToString().ToLowerInvariant() ?? "an unknown side"}.)");
-        }
-    }
-
-    private async Task WaitForFlipTimeAsync(int p, double ra, CancellationToken token)
-    {
-        double flipHourAngle = options.FlipAfterMinutes / 60.0;
-        while (true)
-        {
-            token.ThrowIfCancellationRequested();
-            double ha = Spherical.HourAngle(mount.Snapshot().LocalSiderealTimeHours, ra);
-            double remaining = (flipHourAngle - ha) * 3600.0 / Spherical.SiderealPerSolar;
-            if (remaining <= 0.0)
-            {
-                return;
-            }
-
-            lock (sync)
-            {
-                phase = SessionPhase.WaitingForMeridian;
-                message = $"Pair {p + 1}: waiting for the target to cross the meridian";
-                secondsUntilFlip = remaining;
-            }
-
-            await clock.Delay(TimeSpan.FromSeconds(Math.Min(remaining, WaitStep.TotalSeconds)), token);
-        }
-    }
-
     private sealed record SideSample(bool Ok, double DeltaRaHours, double DeltaDecDegrees, string Problem)
     {
         public static SideSample Failed(string problem) => new(false, double.NaN, double.NaN, problem);
     }
 
-    private async Task<SideSample> SampleAsync(int p, PierSideLabel side, double ra, double dec, CancellationToken token)
+    private async Task<SideSample> MeasureSideAsync(int p, PierSideLabel side, double ra, double dec, double expectedInSeconds, CancellationToken token)
     {
-        string where = $"Pair {p + 1}, {side.ToString().ToLowerInvariant()} side";
-        SetPhase(SessionPhase.Settling, $"{where}: settling");
+        token.ThrowIfCancellationRequested();
+        DateTime now = clock.UtcNow;
+        MountSnapshot snap = mount.Snapshot();
+        double lst = snap.LocalSiderealTimeHours + TargetPlanner.Sidereal(expectedInSeconds);
+        double ha = Spherical.HourAngle(lst, ra);
+
+        if (Math.Abs(ha * 15.0) > options.MaxAbsHourAngleDegrees + EnvelopeSlackDegrees)
+        {
+            return SideSample.Failed($"the target would be {Math.Abs(ha * 15.0):F1}° from the meridian, outside the confirmed plan; pair skipped.");
+        }
+
+        PierSideLabel fromSide = snap.Side ?? side;
+        HaDec[] suns = { sun.SunAt(now), sun.SunAt(now.AddSeconds(expectedInSeconds + options.Timing.SampleSeconds)) };
+        EndpointCheck check = LimitValidator.ValidateMove(
+            options.Limits,
+            fromSide,
+            new HaDec(snap.HourAngleHours, snap.DeclinationDegrees),
+            side,
+            new HaDec(ha, dec),
+            options.LatitudeDegrees,
+            suns,
+            strictPath: false);
+        if (!check.Ok)
+        {
+            if (check.Violations.Any(v => v.Code is LimitViolationCode.SunTooClose or LimitViolationCode.SunTooCloseOnPath))
+            {
+                throw new ConeErrorException("SunTooClose", LimitValidator.Describe(check.Violations));
+            }
+
+            return SideSample.Failed(LimitValidator.Describe(check.Violations) + " Pair skipped.");
+        }
+
+        SetPhase(SessionPhase.Slewing, $"Pair {p + 1}: {(side == currentSide ? "slewing" : "flipping")} to the {side.ToString().ToLowerInvariant()} pier side");
+        await pierSide.PrepareAsync(side, token);
+        token.ThrowIfCancellationRequested();
+        watchdog.BeginOwnMotion();
+        try
+        {
+            await mount.SlewAsync(ra, dec, token);
+        }
+        finally
+        {
+            watchdog.EndOwnMotion();
+        }
+
+        token.ThrowIfCancellationRequested();
+        MountSnapshot arrived = mount.Snapshot();
+        if (arrived.Side != side)
+        {
+            throw new ConeErrorException(
+                "PierSideRefused",
+                $"The mount was asked for the {side.ToString().ToLowerInvariant()} pier side but reports {arrived.Side?.ToString().ToLowerInvariant() ?? "an unknown side"}. It cannot be forced to the other side here, so the measurement stopped without further moves.");
+        }
+
+        lock (sync)
+        {
+            currentSide = side;
+        }
+
+        if (options.AskPierLabels && !pierLabelsChecked && side == PierSideLabel.East)
+        {
+            await AskPierLabelsAsync(token);
+            pierLabelsChecked = true;
+        }
+
+        SetPhase(SessionPhase.Settling, $"Pair {p + 1}, {side.ToString().ToLowerInvariant()} side: settling");
         await clock.Delay(TimeSpan.FromSeconds(options.Timing.SettleSeconds), token);
 
         string problem = null;
         for (int attempt = 0; attempt < 2; attempt++)
         {
-            SetPhase(SessionPhase.Exposing, $"{where}: exposing and solving{(attempt > 0 ? " (second try)" : "")}");
+            SetPhase(SessionPhase.Exposing, $"Pair {p + 1}, {side.ToString().ToLowerInvariant()} side: exposing and solving{(attempt > 0 ? " (second try)" : "")}");
             MountSnapshot before = mount.Snapshot();
             SolveOutcome solved = await imager.CaptureAndSolveAsync(options.ExposureSeconds, ra, dec, token);
             MountSnapshot after = mount.Snapshot();
@@ -466,7 +511,7 @@ public sealed class AutoMeasurementSession
             {
                 Id = ++questionIds,
                 Kind = "pierLabels",
-                Text = "The mount reports the WEST pier side and points just east of the meridian. Is the counterweight bar on the EAST side of the mount right now (the tube on the west side)?"
+                Text = "The mount reports the EAST pier side and points near the meridian. Is the counterweight bar on the WEST side of the mount right now (the tube on the east side)?"
             };
             answer = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             pending = answer;
@@ -571,7 +616,6 @@ public sealed class AutoMeasurementSession
             previous = before;
             phase = SessionPhase.Complete;
             message = "Measurement complete";
-            secondsUntilFlip = null;
         }
     }
 
@@ -585,7 +629,6 @@ public sealed class AutoMeasurementSession
             message = text;
             error = new SessionError { Code = code, Message = text };
             question = null;
-            secondsUntilFlip = null;
         }
     }
 

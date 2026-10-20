@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using NINA.Core.Utility;
 using TouchNStars.ConeError.Domain;
 
@@ -45,25 +46,32 @@ public sealed class TimeCheck
 
     /// <summary>Mount sidereal time minus the Pi's (from its clock and the profile longitude), minutes.</summary>
     public double? LstSkewMinutes { get; init; }
-
-    /// <summary>The Sun's altitude now at the profile site, degrees.</summary>
-    public double SunAltitudeDegrees { get; init; }
 }
 
 public sealed class Preconditions
 {
     public MountSnapshot Mount { get; init; }
+    public string DriverKind { get; init; }
+    public bool PierSideSupported { get; init; }
+    public string PierSideDescription { get; init; }
+    public string PierSideReason { get; init; }
+    public MountLimits MountLimits { get; init; }
+    public PointingModelInfo PointingModel { get; init; }
     public ProfileFacts Profile { get; init; }
     public ObservatoryState Observatory { get; init; }
     public TimeCheck Time { get; init; }
-    public IReadOnlyList<string> Blockers { get; init; }
+    public bool RestorePending { get; init; }
+    public RestoreJournal Journal { get; init; }
+    public IReadOnlyList<string> AutoBlockers { get; init; }
+    public IReadOnlyList<string> ManualBlockers { get; init; }
     public IReadOnlyList<string> Warnings { get; init; }
-    public bool Ready => Blockers.Count == 0;
+    public bool AutoReady => AutoBlockers.Count == 0;
+    public bool ManualReady => ManualBlockers.Count == 0;
 }
 
 /// <summary>
-/// Entry point of the cone error wizard for the API: preconditions, plans, the one running
-/// measurement, the persisted settings and results.
+/// Entry point of the cone error wizard for the API: preconditions, plans, the one running session
+/// (automated or daytime), the persisted settings, results and restore journal.
 /// </summary>
 public sealed class ConeErrorService
 {
@@ -77,9 +85,6 @@ public sealed class ConeErrorService
     public const double LstSkewWarnMinutes = 1.0;
     public const double LstSkewBlockMinutes = 8.0;
 
-    /// <summary>The measurement runs at night: the Sun must be below this altitude (end of civil twilight), degrees.</summary>
-    public const double MaxSunAltitudeDegrees = -6.0;
-
     /// <summary>Planning assumptions on top of the profile settle time, seconds.</summary>
     public const double SlewSeconds = 120.0;
     public const double FlipSeconds = 90.0;
@@ -89,14 +94,19 @@ public sealed class ConeErrorService
     private static ConeErrorService instance;
 
     private readonly Func<IConeEnvironment> environment;
+    private readonly bool backgroundLoops;
     private readonly object sync = new();
     private readonly Dictionary<string, (AutoPlanRequest Request, AutoPlanResponse Response)> autoPlans = new();
-    private AutoMeasurementSession session;
+    private AutoMeasurementSession auto;
+    private ManualFlipSession manual;
+    private bool starting;
+    private bool abortWhileStarting;
 
-    public ConeErrorService(Func<IConeEnvironment> environment, ConeErrorStore store)
+    public ConeErrorService(Func<IConeEnvironment> environment, ConeErrorStore store, bool backgroundLoops = true)
     {
         this.environment = environment;
         Store = store;
+        this.backgroundLoops = backgroundLoops;
     }
 
     /// <summary>The service the API uses, bound to NINA through <see cref="Adapters.NinaConeEnvironment"/>.</summary>
@@ -116,6 +126,13 @@ public sealed class ConeErrorService
     public ConeErrorStore Store { get; }
 
     public ConeErrorSettings GetSettings() => Store.LoadSettings();
+
+    public ConeErrorSettings SaveSettings(ConeErrorSettings settings)
+    {
+        ConeErrorSettings current = Store.LoadSettings();
+        settings.VerifiedPierLabels = current.VerifiedPierLabels;
+        return Store.SaveSettings(settings);
+    }
 
     /// <summary>Applies only the fields a client sent (JSON object) on top of the stored settings.</summary>
     public ConeErrorSettings PatchSettings(string json)
@@ -141,96 +158,119 @@ public sealed class ConeErrorService
 
     public IReadOnlyList<ConeResultRecord> Results() => Store.LoadResults().OrderByDescending(r => r.TimestampUtc).ToList();
 
-    private bool IsRunning() => session != null && !session.Finished;
-
     #region Preconditions
 
     public Preconditions GetPreconditions(DateTime? clientUtc)
     {
         IConeEnvironment env = environment();
         MountSnapshot mount = SafeSnapshot(env.Mount);
+        MountDriverInfo driver = env.Driver.Inspect();
         ProfileFacts profile = env.Observatory.Profile();
         ObservatoryState state = env.Observatory.State();
         TimeCheck time = CheckTime(env.Clock.UtcNow, clientUtc, mount, profile);
+        RestoreJournal journal = Store.LoadJournal();
+        bool sessionActive = IsSessionActive();
 
-        var blockers = new List<string>();
+        var common = new List<string>();
+        var auto = new List<string>();
+        var manualBlockers = new List<string>();
         var warnings = new List<string>();
 
         if (mount == null || !mount.Connected)
         {
-            blockers.Add("Connect the mount.");
+            common.Add("Connect the mount.");
         }
         else if (mount.AtPark)
         {
-            blockers.Add("Unpark the mount.");
+            common.Add("Unpark the mount.");
         }
 
-        if (!state.CameraConnected)
+        if (!driver.PierSide.Supported)
         {
-            blockers.Add("Connect the camera.");
-        }
-        else if (state.CameraExposing)
-        {
-            blockers.Add("The camera is exposing; stop the exposure or loop first.");
-        }
-
-        if (profile.SolverProblem != null)
-        {
-            blockers.Add(profile.SolverProblem);
-        }
-
-        if (!(profile.FocalLength > 0.0))
-        {
-            blockers.Add("Set the telescope focal length in the profile; the plate solver needs it.");
+            common.Add(driver.PierSide.UnsupportedReason);
         }
 
         if (profile.Latitude == 0.0 && profile.Longitude == 0.0)
         {
-            blockers.Add("Set the site location in the profile (latitude and longitude are 0).");
+            common.Add("Set the site location in the profile (latitude and longitude are 0).");
         }
 
         if (state.SequenceRunning)
         {
-            blockers.Add("A sequence is running; stop it first.");
+            common.Add("A sequence is running; stop it first.");
         }
 
         if (state.InternalGuiderGuiding)
         {
-            blockers.Add("The internal guider is guiding; stop guiding first.");
+            common.Add("The internal guider is guiding; stop guiding first.");
+        }
+
+        if (journal != null && !sessionActive)
+        {
+            common.Add("A previous cone error session did not finish; restore the mount settings first.");
         }
 
         if (time.LooksUnset)
         {
-            blockers.Add($"The Pi's clock looks unset ({time.SystemUtc:yyyy-MM-dd HH:mm} UTC). Set the time first.");
+            common.Add($"The Pi's clock looks unset ({time.SystemUtc:yyyy-MM-dd HH:mm} UTC). Set the time; the sun check depends on it.");
         }
         else if (time.SkewSeconds is { } skew && Math.Abs(skew) > TimeSkewBlockSeconds)
         {
-            blockers.Add($"The Pi's clock is {Math.Abs(skew) / 60.0:F0} minutes off this device's clock. Set the time first.");
+            common.Add($"The Pi's clock is {Math.Abs(skew) / 60.0:F0} minutes off this device's clock. Set the time first.");
         }
         else if (time.SkewSeconds is { } small && Math.Abs(small) > TimeSkewWarnSeconds)
         {
             warnings.Add($"The Pi's clock is {Math.Abs(small) / 60.0:F1} minutes off this device's clock.");
         }
+        else if (time.SkewSeconds == null)
+        {
+            warnings.Add("The Pi's clock could not be compared with this device's clock.");
+        }
 
         if (time.LstSkewMinutes is { } lstSkew && Math.Abs(lstSkew) > LstSkewBlockMinutes)
         {
-            blockers.Add($"The mount's sidereal time is {Math.Abs(lstSkew):F0} minutes off the Pi's: the mount's time or site is wrong.");
+            common.Add($"The mount's sidereal time is {Math.Abs(lstSkew):F0} minutes off the Pi's: the mount's time or site is wrong.");
         }
         else if (time.LstSkewMinutes is { } lstSmall && Math.Abs(lstSmall) > LstSkewWarnMinutes)
         {
             warnings.Add($"The mount's sidereal time is {Math.Abs(lstSmall):F1} minutes off the Pi's; check the mount's time and site.");
         }
 
-        if (time.SunAltitudeDegrees > MaxSunAltitudeDegrees)
+        auto.AddRange(common);
+        manualBlockers.AddRange(common);
+
+        if (mount is { Connected: true, AtPark: false, Tracking: false })
         {
-            if (Store.LoadSettings().IgnoreSunCheck)
-            {
-                warnings.Add($"The Sun is {time.SunAltitudeDegrees:F0}° high and the darkness check is off. The mount will point near the meridian; keep the telescope covered or use simulators.");
-            }
-            else
-            {
-                blockers.Add($"The Sun is {time.SunAltitudeDegrees:F0}° high. The measurement points near the meridian and needs a dark sky; start it after the end of civil twilight.");
-            }
+            auto.Add("Turn tracking on.");
+        }
+
+        if (!state.CameraConnected)
+        {
+            auto.Add("Connect the camera.");
+        }
+        else if (state.CameraExposing)
+        {
+            auto.Add("The camera is exposing; stop the exposure or loop first.");
+        }
+
+        if (profile.SolverProblem != null)
+        {
+            auto.Add(profile.SolverProblem);
+        }
+
+        if (!(profile.FocalLength > 0.0))
+        {
+            auto.Add("Set the telescope focal length in the profile; the plate solver needs it.");
+        }
+
+        switch (driver.PointingModel.State)
+        {
+            case PointingModelState.Active:
+                warnings.Add($"The mount has an active pointing model ({driver.PointingModel.Detail}). It compensates cone error, so the measurement shows only what is left. Clear the model to measure the real cone error.");
+                break;
+            case PointingModelState.Unknown:
+                warnings.Add("Whether the mount runs a pointing model cannot be read. An active model hides cone error; make sure none is active.");
+                break;
         }
 
         warnings.Add("Stop PHD2 guiding if it runs; it cannot be detected here.");
@@ -238,10 +278,19 @@ public sealed class ConeErrorService
         return new Preconditions
         {
             Mount = mount,
+            DriverKind = driver.Kind,
+            PierSideSupported = driver.PierSide.Supported,
+            PierSideDescription = driver.PierSide.Description,
+            PierSideReason = driver.PierSide.UnsupportedReason,
+            MountLimits = driver.Limits,
+            PointingModel = driver.PointingModel,
             Profile = profile,
             Observatory = state,
             Time = time,
-            Blockers = blockers,
+            RestorePending = journal != null && !sessionActive,
+            Journal = journal,
+            AutoBlockers = auto.Distinct().ToList(),
+            ManualBlockers = manualBlockers.Distinct().ToList(),
             Warnings = warnings
         };
     }
@@ -249,7 +298,9 @@ public sealed class ConeErrorService
     public static TimeCheck CheckTime(DateTime systemUtc, DateTime? clientUtc, MountSnapshot mount, ProfileFacts profile)
     {
         double piLst = SunEphemeris.LocalSiderealTimeHours(systemUtc, profile.Longitude);
-        (double sunHa, double sunDec) = SunEphemeris.HourAngleDeclination(systemUtc, profile.Longitude);
+        double? lstSkew = mount is { Connected: true }
+            ? Spherical.WrapHours12(mount.LocalSiderealTimeHours - piLst) * 60.0
+            : null;
         return new TimeCheck
         {
             SystemUtc = systemUtc,
@@ -258,8 +309,7 @@ public sealed class ConeErrorService
             LooksUnset = systemUtc.Year < 2025,
             MountLstHours = mount?.LocalSiderealTimeHours,
             PiLstHours = piLst,
-            LstSkewMinutes = mount is { Connected: true } ? Spherical.WrapHours12(mount.LocalSiderealTimeHours - piLst) * 60.0 : null,
-            SunAltitudeDegrees = Spherical.AltAz(sunHa, sunDec, profile.Latitude).Altitude
+            LstSkewMinutes = lstSkew
         };
     }
 
@@ -278,16 +328,17 @@ public sealed class ConeErrorService
 
     #endregion
 
-    #region Measurement
+    #region Automated measurement
 
     private static string MountKey(ProfileFacts profile, MountSnapshot mount) => $"{profile.ProfileId}|{mount?.Name}";
 
     public AutoPlanResponse PlanAuto(AutoPlanRequest request)
     {
+        IConeEnvironment env = environment();
         Preconditions pre = GetPreconditions(request.ClientTimeUtc);
-        if (!pre.Ready)
+        if (pre.AutoBlockers.Count > 0)
         {
-            throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.Blockers));
+            throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.AutoBlockers));
         }
 
         if (request.DovetailMm is not > 0)
@@ -295,7 +346,9 @@ public sealed class ConeErrorService
             throw new ConeErrorException("DovetailRequired", "Enter the distance between the two mounting points on the dovetail (mm).");
         }
 
-        AutoPlanResponse response = BuildAutoPlan(environment(), request, Store.LoadSettings(), pre);
+        ConeErrorSettings settings = Store.LoadSettings();
+        AutoPlanResponse response = BuildAutoPlan(env, request, settings, pre);
+
         lock (sync)
         {
             autoPlans.Clear();
@@ -305,9 +358,10 @@ public sealed class ConeErrorService
         return response;
     }
 
-    private static AutoPlanResponse BuildAutoPlan(IConeEnvironment env, AutoPlanRequest request, ConeErrorSettings settings, Preconditions pre)
+    private AutoPlanResponse BuildAutoPlan(IConeEnvironment env, AutoPlanRequest request, ConeErrorSettings settings, Preconditions pre)
     {
         ProfileFacts profile = pre.Profile;
+        MountSnapshot mount = pre.Mount;
         double exposure = request.ExposureSeconds is > 0 and <= 120 ? request.ExposureSeconds.Value : settings.ExposureSeconds ?? profile.PlateSolveExposureSeconds;
         var timing = new PairTiming(
             SlewSeconds + profile.SettleSeconds,
@@ -315,23 +369,25 @@ public sealed class ConeErrorService
             ExtraSettleSeconds,
             exposure,
             SolveSeconds);
+        LimitSet limits = Limits(settings, profile, pre.MountLimits, settings.AutoMinAltitudeDegrees);
         DateTime now = env.Clock.UtcNow;
         int repetitions = request.Repetitions ?? settings.Repetitions;
 
         AutoPlan plan = TargetPlanner.Plan(new PlannerInput
         {
             NowUtc = now,
-            LocalSiderealTimeHours = pre.Mount.LocalSiderealTimeHours,
+            LocalSiderealTimeHours = mount.LocalSiderealTimeHours,
             LatitudeDegrees = profile.Latitude,
+            // at home OnStepX picks the side from the sign of the hour angle: West for the first target
+            CurrentSide = mount.AtHome ? PierSideLabel.West : mount.Side,
             Repetitions = repetitions,
             Declination = request.Declination,
             Timing = timing,
-            MinAltitudeDegrees = settings.MinAltitudeDegrees,
-            HorizonAltitudeAt = profile.HorizonAltitudeAt,
-            FlipAfterMinutes = profile.MinutesAfterMeridian,
-            MaxMinutesAfterMeridian = profile.MaxMinutesAfterMeridian
+            Limits = limits,
+            SunAt = env.Sun.SunAt
         });
 
+        string key = MountKey(profile, mount);
         return new AutoPlanResponse
         {
             PlanId = Guid.NewGuid().ToString("N"),
@@ -342,13 +398,28 @@ public sealed class ConeErrorService
             ExposureSeconds = exposure,
             DovetailMm = request.DovetailMm ?? 0.0,
             Repetitions = repetitions,
-            AskPierLabels = !settings.VerifiedPierLabels.Contains(MountKey(profile, pre.Mount)),
+            AskPierLabels = !settings.VerifiedPierLabels.Contains(key),
             Warnings = pre.Warnings
         };
     }
 
-    /// <summary>Starts a confirmed plan; the user must confirm that no pointing model is active in the mount.</summary>
-    public SessionStatus StartAuto(string planId, bool noPointingModel)
+    public static LimitSet Limits(ConeErrorSettings settings, ProfileFacts profile, MountLimits mount, double minAltitude) => new()
+    {
+        MinAltitudeDegrees = minAltitude,
+        HorizonAltitudeAt = profile.HorizonAltitudeAt,
+        PinsPastMeridianDegrees = profile.MaxMinutesAfterMeridian * 0.25,
+        MountHorizonDegrees = mount?.HorizonDegrees,
+        MountOverheadDegrees = mount?.OverheadDegrees,
+        MountPastMeridianEastDegrees = mount?.PastMeridianEastDegrees,
+        MountPastMeridianWestDegrees = mount?.PastMeridianWestDegrees,
+        MountSource = mount?.Source,
+        SunExclusionDegrees = Math.Max(settings.SunExclusionDegrees, ConeErrorSettings.MinSunExclusionDegrees),
+        // a pointing below the horizon (a dipped horizon from a height) can see a Sun below it too
+        SunSetAltitudeDegrees = Math.Min(LimitValidator.SunSetAltitudeDegrees, minAltitude - 2.0)
+    };
+
+    /// <summary>Starts a confirmed plan after planning it again with the current time (the sky has moved since).</summary>
+    public SessionStatus StartAuto(string planId, bool acknowledgePointingModel)
     {
         IConeEnvironment env = environment();
         (AutoPlanRequest Request, AutoPlanResponse Response) planned;
@@ -365,59 +436,80 @@ public sealed class ConeErrorService
                 throw new ConeErrorException("PlanExpired", "The confirmation expired; plan again.");
             }
 
-            if (IsRunning())
+            if (IsSessionActive())
             {
-                throw new ConeErrorException("Busy", "A measurement is already running.");
+                throw new ConeErrorException("Busy", "A cone error session is already running.");
             }
-        }
-
-        if (!noPointingModel)
-        {
-            throw new ConeErrorException("PointingModelNotConfirmed", "Confirm that no pointing model is active in the mount; it would hide the cone error.");
         }
 
         Preconditions pre = GetPreconditions(null);
-        if (!pre.Ready)
+        if (pre.AutoBlockers.Count > 0)
         {
-            throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.Blockers));
+            throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.AutoBlockers));
+        }
+
+        MountDriverInfo driver = env.Driver.Inspect();
+        if (driver.PointingModel.State != PointingModelState.None && !acknowledgePointingModel)
+        {
+            throw new ConeErrorException("PointingModelNotAcknowledged", "Confirm the pointing model warning first.");
         }
 
         ConeErrorSettings settings = Store.LoadSettings();
-        AutoPlanResponse plan = planned.Response;
+        AutoPlanRequest request = planned.Request;
+        request.Declination = planned.Response.Plan.DeclinationDegrees;
+        AutoPlanResponse fresh = BuildAutoPlan(env, request, settings, pre);
+        if (!fresh.Plan.Ok)
+        {
+            throw new ConeErrorException("PlanRefused", fresh.Plan.Refusal ?? LimitValidator.Describe(fresh.Plan.Violations));
+        }
+
+        // the confirmed envelope is never widened silently
+        if (fresh.Plan.MaxAbsHourAngleDegrees > planned.Response.Plan.MaxAbsHourAngleDegrees + 1e-6
+            || fresh.Plan.NormalSidesOnly != planned.Response.Plan.NormalSidesOnly
+            || fresh.Repetitions != planned.Response.Repetitions)
+        {
+            throw new ConeErrorException("PlanChanged", "The plan changed since it was confirmed; plan again.");
+        }
+
         string key = MountKey(pre.Profile, pre.Mount);
-        var run = new AutoMeasurementSession(
+        var session = new AutoMeasurementSession(
             env.Mount,
+            driver.PierSide,
             env.Imager,
             env.Clock,
+            env.Sun,
             Store,
             new AutoRunOptions
             {
-                Repetitions = plan.Repetitions,
-                DeclinationDegrees = plan.Plan.DeclinationDegrees,
-                ExposureSeconds = plan.ExposureSeconds,
-                DovetailMm = plan.DovetailMm,
-                Timing = plan.Timing,
+                Repetitions = fresh.Repetitions,
+                DeclinationDegrees = fresh.Plan.DeclinationDegrees,
+                ExposureSeconds = fresh.ExposureSeconds,
+                DovetailMm = fresh.DovetailMm,
+                Timing = fresh.Timing,
+                Limits = Limits(settings, pre.Profile, driver.Limits, settings.AutoMinAltitudeDegrees),
                 LatitudeDegrees = pre.Profile.Latitude,
-                MinAltitudeDegrees = settings.MinAltitudeDegrees,
-                FlipAfterMinutes = plan.Plan.FlipAfterMinutes,
-                AskPierLabels = !settings.VerifiedPierLabels.Contains(key),
+                MaxAbsHourAngleDegrees = planned.Response.Plan.MaxAbsHourAngleDegrees,
+                AskPierLabels = fresh.AskPierLabels,
+                NormalSidesOnly = fresh.Plan.NormalSidesOnly,
                 MountKey = key,
                 Profile = pre.Profile
-            });
-        run.PierLabelsConfirmed += () => RememberPierLabels(key);
+            },
+            backgroundLoops);
+        session.PierLabelsConfirmed += () => RememberPierLabels(key);
 
         lock (sync)
         {
-            if (IsRunning())
+            if (IsSessionActive())
             {
-                throw new ConeErrorException("Busy", "A measurement is already running.");
+                throw new ConeErrorException("Busy", "A cone error session is already running.");
             }
 
-            session = run;
+            auto = session;
+            manual = null;
         }
 
-        run.Start();
-        return run.GetStatus();
+        session.Start();
+        return session.GetStatus();
     }
 
     private void RememberPierLabels(string key)
@@ -432,41 +524,79 @@ public sealed class ConeErrorService
 
     public bool Answer(int id, bool yes)
     {
-        AutoMeasurementSession run;
+        AutoMeasurementSession session;
         lock (sync)
         {
-            run = session;
+            session = auto;
         }
 
-        return run != null && run.Answer(id, yes);
+        return session != null && session.Answer(id, yes);
     }
+
+    #endregion
+
+    #region Status and abort
+
+    private bool IsSessionActive() => starting || (auto != null && !auto.Finished) || (manual != null && !manual.Finished);
 
     public SessionStatus Status()
     {
-        AutoMeasurementSession run;
+        AutoMeasurementSession a;
+        ManualFlipSession m;
         lock (sync)
         {
-            run = session;
+            a = auto;
+            m = manual;
         }
 
-        return run?.GetStatus() ?? new SessionStatus();
+        if (m != null)
+        {
+            m.Heartbeat();
+            return m.GetStatus();
+        }
+
+        if (a != null)
+        {
+            return a.GetStatus();
+        }
+
+        return new SessionStatus { RestorePending = Store.LoadJournal() != null };
     }
 
-    /// <summary>Stops the mount at once and ends the measurement; with nothing running it still stops the mount.</summary>
+    /// <summary>Stops the mount at once and ends whatever runs (restores on the way out).</summary>
     public SessionStatus Abort()
     {
-        AutoMeasurementSession run;
+        AutoMeasurementSession a;
+        ManualFlipSession m;
         lock (sync)
         {
-            run = session;
+            a = auto;
+            m = manual;
         }
 
-        if (run != null && !run.Finished)
+        if (a != null && !a.Finished)
         {
-            run.Abort();
+            a.Abort();
         }
-        else
+
+        if (m != null && !m.Finished)
         {
+            Task end = m.AbortAsync();
+            end.ContinueWith(t => Logger.Error($"ConeError: ending the daytime check failed: {t.Exception}"), TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        lock (sync)
+        {
+            if (starting)
+            {
+                // the daytime check is just beginning: it is ended as soon as it has begun
+                abortWhileStarting = true;
+            }
+        }
+
+        if ((a == null || a.Finished) && (m == null || m.Finished))
+        {
+            // nothing of ours runs, but the user asked the mount to stop
             try
             {
                 environment().Mount.Stop();
@@ -480,24 +610,227 @@ public sealed class ConeErrorService
         return Status();
     }
 
-    /// <summary>Plugin teardown: stop a running measurement.</summary>
+    /// <summary>Applies a leftover restore journal: settings only (preferred pier side, tracking), never a move.</summary>
+    public async Task<SessionStatus> RestoreAsync()
+    {
+        if (IsSessionActive())
+        {
+            throw new ConeErrorException("Busy", "A cone error session is running.");
+        }
+
+        RestoreJournal journal = Store.LoadJournal();
+        if (journal == null)
+        {
+            return Status();
+        }
+
+        IConeEnvironment env = environment();
+        MountSnapshot mount = SafeSnapshot(env.Mount);
+        if (mount == null || !mount.Connected)
+        {
+            throw new ConeErrorException("MountNotConnected", "Connect the mount to restore its settings.");
+        }
+
+        MountDriverInfo driver = env.Driver.Inspect();
+        if (journal.PreferredPierSide != null)
+        {
+            await driver.PierSide.RestoreToAsync(journal.PreferredPierSide);
+        }
+
+        if (journal.Tracking.HasValue && !env.Mount.SetTracking(journal.Tracking.Value))
+        {
+            throw new ConeErrorException("RestoreFailed", "The mount refused to restore tracking.");
+        }
+
+        Store.ClearJournal();
+        return Status();
+    }
+
+    /// <summary>Plugin teardown: stop and restore whatever runs.</summary>
     public void Shutdown()
     {
         try
         {
-            AutoMeasurementSession run;
+            AutoMeasurementSession a;
+            ManualFlipSession m;
             lock (sync)
             {
-                run = session;
+                a = auto;
+                m = manual;
             }
 
-            run?.Abort();
-            run?.Completion.Wait(TimeSpan.FromSeconds(30));
+            // one budget, long enough for a running move to end (up to 15 s) and the INDI confirmation (up to 10 s)
+            a?.Abort();
+            var pending = new List<Task>();
+            if (a != null)
+            {
+                pending.Add(a.Completion);
+            }
+
+            if (m != null)
+            {
+                pending.Add(m.AbortAsync());
+            }
+
+            Task.WaitAll(pending.ToArray(), TimeSpan.FromSeconds(30));
         }
         catch (Exception ex)
         {
             Logger.Warning($"ConeError: shutdown failed: {ex.Message}");
         }
+    }
+
+    #endregion
+
+    #region Daytime check
+
+    public SessionStatus BeginManual(DateTime? clientUtc = null)
+    {
+        IConeEnvironment env = environment();
+        Preconditions pre = GetPreconditions(clientUtc);
+        if (pre.ManualBlockers.Count > 0)
+        {
+            throw new ConeErrorException("PreconditionsNotMet", string.Join(" ", pre.ManualBlockers));
+        }
+
+        ConeErrorSettings settings = Store.LoadSettings();
+        MountDriverInfo driver = env.Driver.Inspect();
+        var session = new ManualFlipSession(
+            env.Mount,
+            driver.PierSide,
+            env.Clock,
+            env.Sun,
+            Store,
+            new ManualFlipOptions
+            {
+                Limits = Limits(settings, pre.Profile, driver.Limits, settings.ManualMinAltitudeDegrees),
+                LatitudeDegrees = pre.Profile.Latitude,
+                StrictPath = settings.StrictPath,
+                DovetailMm = settings.DovetailMm,
+                MountKey = MountKey(pre.Profile, pre.Mount),
+                Profile = pre.Profile,
+                SettleSeconds = pre.Profile.SettleSeconds,
+                PierLabelsVerified = settings.VerifiedPierLabels.Contains(MountKey(pre.Profile, pre.Mount))
+            },
+            backgroundLoops);
+        string key = MountKey(pre.Profile, pre.Mount);
+        session.PierLabelsConfirmed += () => RememberPierLabels(key);
+
+        lock (sync)
+        {
+            if (IsSessionActive())
+            {
+                throw new ConeErrorException("Busy", "A cone error session is already running.");
+            }
+
+            starting = true;
+            abortWhileStarting = false;
+        }
+
+        bool aborted;
+        try
+        {
+            // only a session that has begun is kept; a failed start leaves nothing behind
+            session.Begin();
+            lock (sync)
+            {
+                manual = session;
+                auto = null;
+            }
+        }
+        finally
+        {
+            lock (sync)
+            {
+                starting = false;
+                aborted = abortWhileStarting;
+                abortWhileStarting = false;
+            }
+        }
+
+        if (aborted)
+        {
+            session.AbortAsync().Wait(TimeSpan.FromSeconds(30));
+            throw new ConeErrorException("Aborted", "Aborted while the daytime check was starting; tracking was restored.");
+        }
+
+        return session.GetStatus();
+    }
+
+    /// <summary>The one-time counterweight check of the daytime check (on the east pier side).</summary>
+    public SessionStatus ManualPierLabels(bool counterweightWest)
+    {
+        ManualFlipSession m = ActiveManual();
+        m.ConfirmPierLabels(counterweightWest);
+        return m.GetStatus();
+    }
+
+    private ManualFlipSession ActiveManual()
+    {
+        lock (sync)
+        {
+            if (manual == null || manual.Finished)
+            {
+                throw new ConeErrorException("NotActive", "Start the daytime check first.");
+            }
+
+            return manual;
+        }
+    }
+
+    public SessionStatus Capture()
+    {
+        ManualFlipSession m = ActiveManual();
+        m.Capture();
+        return m.GetStatus();
+    }
+
+    public ManualMovePlan PlanManualMove(PierSideLabel side, bool overrideSunPath = false) => ActiveManual().PlanMove(side, overrideSunPath);
+
+    /// <summary>Starts a confirmed move; plan problems are thrown here, the move itself reports through the status.</summary>
+    public SessionStatus StartManualMove(string planId)
+    {
+        ManualFlipSession m = ActiveManual();
+        Task move = m.MoveAsync(planId);
+        if (move.IsFaulted)
+        {
+            Exception inner = move.Exception?.GetBaseException();
+            if (inner is ConeErrorException cone)
+            {
+                throw cone;
+            }
+
+            throw new ConeErrorException("MoveFailed", inner?.Message ?? "The move failed.");
+        }
+
+        move.ContinueWith(t => Logger.Warning($"ConeError: daytime move ended with: {t.Exception?.GetBaseException().Message}"), TaskContinuationOptions.OnlyOnFaulted);
+        return m.GetStatus();
+    }
+
+    public SessionStatus StopManualMove()
+    {
+        ManualFlipSession m = ActiveManual();
+        m.StopMove();
+        return m.GetStatus();
+    }
+
+    public ManualEstimate RecenterDone(double? axisOffsetMm, double? landmarkDistanceMeters)
+    {
+        if (axisOffsetMm is > 0)
+        {
+            ConeErrorSettings settings = Store.LoadSettings();
+            settings.AxisOffsetMm = axisOffsetMm;
+            Store.SaveSettings(settings);
+        }
+
+        return ActiveManual().RecenterDone(axisOffsetMm, landmarkDistanceMeters);
+    }
+
+    public async Task<SessionStatus> EndManualAsync()
+    {
+        ManualFlipSession m = ActiveManual();
+        await m.EndAsync();
+        return m.GetStatus();
     }
 
     #endregion

@@ -7,41 +7,35 @@ public class TargetPlannerTests
 {
     private static readonly DateTime Now = new(2026, 10, 14, 22, 0, 0, DateTimeKind.Utc);
     private static readonly PairTiming Timing = new(SlewSeconds: 120, FlipSeconds: 90, SettleSeconds: 5, ExposureSeconds: 5, SolveSeconds: 20);
-    private const double Lst = 22.5;
 
     private static PlannerInput Input(
         double latitude = 50.0,
         int repetitions = 5,
         double? dec = null,
+        PierSideLabel? side = PierSideLabel.East,
         double minAltitude = 20.0,
-        double flipAfter = 5.0,
-        double maxAfter = 10.0,
-        Func<double, double>? horizon = null) => new()
+        double pastMeridian = 2.5) => new()
     {
         NowUtc = Now,
-        LocalSiderealTimeHours = Lst,
+        LocalSiderealTimeHours = 22.5,
         LatitudeDegrees = latitude,
+        CurrentSide = side,
         Repetitions = repetitions,
         Declination = dec,
         Timing = Timing,
-        MinAltitudeDegrees = minAltitude,
-        HorizonAltitudeAt = horizon,
-        FlipAfterMinutes = flipAfter,
-        MaxMinutesAfterMeridian = maxAfter
+        Limits = new LimitSet { MinAltitudeDegrees = minAltitude, PinsPastMeridianDegrees = pastMeridian, SunExclusionDegrees = 30.0 },
+        SunAt = _ => new HaDec(12.0, -10.0)
     };
-
-    private static double HourAngleAt(DateTime utc, double ra) => Spherical.HourAngle(Lst + TargetPlanner.Sidereal((utc - Now).TotalSeconds), ra);
 
     [Fact]
     public void SuggestsDeclinationZeroAtMidNorthernLatitudes()
     {
         AutoPlan plan = TargetPlanner.Plan(Input());
 
-        Assert.True(plan.Ok, string.Join(" ", plan.Problems));
+        Assert.True(plan.Ok, plan.Refusal ?? LimitValidator.Describe(plan.Violations));
         Assert.Equal(0.0, plan.DeclinationDegrees);
         Assert.True(plan.DeclinationSuggested);
-        Assert.Equal(5, plan.Pairs.Count);
-        Assert.Equal(40.0, plan.Pairs[0].Altitude, 1e-6);
+        Assert.Equal(10, plan.Steps.Count);
     }
 
     [Fact]
@@ -66,10 +60,10 @@ public class TargetPlannerTests
     [Fact]
     public void RefusesWhenEvenThirtyDegreesIsBelowTheMinimum()
     {
-        AutoPlan plan = TargetPlanner.Plan(Input(latitude: 85.0, minAltitude: 40.0));
+        AutoPlan plan = TargetPlanner.Plan(Input(latitude: 80.0, minAltitude: 45.0));
 
         Assert.False(plan.Ok);
-        Assert.Contains("below the minimum altitude", plan.Problems[0]);
+        Assert.Contains(plan.Violations, v => v.Code == LimitViolationCode.BelowHorizon);
     }
 
     [Fact]
@@ -78,17 +72,7 @@ public class TargetPlannerTests
         AutoPlan plan = TargetPlanner.Plan(Input(dec: 35.0));
 
         Assert.False(plan.Ok);
-        Assert.Contains("±30°", plan.Problems[0]);
-    }
-
-    [Fact]
-    public void ARequestedDeclinationIsUsedAsIs()
-    {
-        AutoPlan plan = TargetPlanner.Plan(Input(dec: 12.0));
-
-        Assert.True(plan.Ok);
-        Assert.Equal(12.0, plan.DeclinationDegrees);
-        Assert.False(plan.DeclinationSuggested);
+        Assert.NotNull(plan.Refusal);
     }
 
     [Theory]
@@ -96,61 +80,79 @@ public class TargetPlannerTests
     [InlineData(11)]
     public void RefusesRepetitionsOutOfRange(int repetitions)
     {
-        Assert.False(TargetPlanner.Plan(Input(repetitions: repetitions)).Ok);
+        Assert.NotNull(TargetPlanner.Plan(Input(repetitions: repetitions)).Refusal);
     }
 
     [Fact]
-    public void RefusesWhenTheFlipComesAfterTheProfileMaximum()
+    public void EachPairIsSymmetricAboutTheMeridianAndAlternatesTheSideOrder()
     {
-        AutoPlan plan = TargetPlanner.Plan(Input(flipAfter: 15.0, maxAfter: 10.0));
+        AutoPlan plan = TargetPlanner.Plan(Input(side: PierSideLabel.West));
 
-        Assert.False(plan.Ok);
-        Assert.Contains("minutes after meridian", plan.Problems[0]);
-    }
-
-    [Fact]
-    public void AFlipRightAtTheMeridianIsMovedOneMinutePastIt()
-    {
-        AutoPlan plan = TargetPlanner.Plan(Input(flipAfter: 0.0));
-
-        Assert.True(plan.Ok);
-        Assert.Equal(TargetPlanner.MinFlipAfterMinutes, plan.FlipAfterMinutes);
-    }
-
-    [Fact]
-    public void TheWestSampleIsJustBeforeTheMeridianAndTheEastSampleAfterTheFlipTime()
-    {
-        AutoPlan plan = TargetPlanner.Plan(Input(flipAfter: 5.0));
-
-        Assert.All(plan.Pairs, p =>
+        for (int pair = 0; pair < 5; pair++)
         {
-            Assert.Equal(-TargetPlanner.WestSampleMinutesBeforeMeridian / 60.0, HourAngleAt(p.WestExposureUtc, p.RightAscensionHours), 1e-9);
-            Assert.Equal(5.0 / 60.0, HourAngleAt(p.FlipUtc, p.RightAscensionHours), 1e-9);
-            Assert.Equal(p.EastHourAngle, HourAngleAt(p.EastExposureUtc, p.RightAscensionHours), 1e-9);
-            Assert.True(p.EastHourAngle > 5.0 / 60.0);
-            Assert.True(p.FlipUtc < p.EastExposureUtc);
-        });
-    }
+            PlannedStep first = plan.Steps[2 * pair];
+            PlannedStep second = plan.Steps[2 * pair + 1];
 
-    [Fact]
-    public void PairsFollowEachOtherInTime()
-    {
-        AutoPlan plan = TargetPlanner.Plan(Input());
-
-        for (int i = 1; i < plan.Pairs.Count; i++)
-        {
-            Assert.True(plan.Pairs[i].WestExposureUtc > plan.Pairs[i - 1].EastExposureUtc);
-            Assert.True(plan.Pairs[i].RightAscensionHours != plan.Pairs[i - 1].RightAscensionHours);
+            Assert.Equal(first.RightAscensionHours, second.RightAscensionHours);
+            Assert.Equal(-first.Check.HourAngle, second.Check.HourAngle, 1e-9);
+            Assert.NotEqual(first.Side, second.Side);
+            Assert.Equal("slew", first.Kind);
+            Assert.Equal("flip", second.Kind);
+            Assert.Equal(pair % 2 == 0 ? PierSideLabel.West : PierSideLabel.East, first.Side);
         }
     }
 
     [Fact]
-    public void ACustomHorizonAboveTheTargetRefusesThePlan()
+    public void EveryPlannedSampleIsWithinTheMeridianLimitOnItsSide()
     {
-        AutoPlan plan = TargetPlanner.Plan(Input(dec: 0.0, horizon: az => az > 170.0 && az < 190.0 ? 45.0 : 0.0));
+        AutoPlan plan = TargetPlanner.Plan(Input());
 
-        Assert.False(plan.Ok);
-        Assert.Contains("custom horizon", plan.Problems[0]);
+        Assert.All(plan.Steps, s => Assert.True(s.Check.PastMeridianDegrees <= 2.5));
+        Assert.True(plan.MaxAbsHourAngleDegrees < 2.5);
+    }
+
+    [Theory]
+    [InlineData(0.1)]
+    [InlineData(0.0)]
+    public void WithASmallMeridianLimitEveryPairIsMeasuredOnTheNormalSides(double pastMeridian)
+    {
+        // A mount that allows (almost) nothing past the meridian cannot alternate the side order;
+        // West first (HA < 0), East second (HA > 0) keeps both samples counterweight-down.
+        AutoPlan plan = TargetPlanner.Plan(Input(pastMeridian: pastMeridian, side: PierSideLabel.East));
+
+        Assert.True(plan.Ok, plan.Refusal ?? LimitValidator.Describe(plan.Violations));
+        Assert.True(plan.NormalSidesOnly);
+        Assert.All(plan.Steps, s => Assert.True(s.Check.PastMeridianDegrees <= 0.0));
+        Assert.All(plan.Steps.Where((_, i) => i % 2 == 0), s => Assert.Equal(PierSideLabel.West, s.Side));
+        Assert.Equal("flip", plan.Steps[0].Kind);
+    }
+
+    [Fact]
+    public void ARoomyMeridianLimitKeepsTheAlternatingOrder()
+    {
+        Assert.False(TargetPlanner.Plan(Input(pastMeridian: 2.5)).NormalSidesOnly);
+    }
+
+    [Fact]
+    public void SunNearTheTargetRefusesThePlan()
+    {
+        PlannerInput input = Input();
+        input = new PlannerInput
+        {
+            NowUtc = input.NowUtc,
+            LocalSiderealTimeHours = input.LocalSiderealTimeHours,
+            LatitudeDegrees = input.LatitudeDegrees,
+            CurrentSide = input.CurrentSide,
+            Repetitions = input.Repetitions,
+            Declination = 0.0,
+            Timing = input.Timing,
+            Limits = input.Limits,
+            SunAt = _ => new HaDec(0.5, 5.0)
+        };
+
+        AutoPlan plan = TargetPlanner.Plan(input);
+
+        Assert.Contains(plan.Violations, v => v.Code == LimitViolationCode.SunTooClose);
     }
 
     [Fact]
@@ -158,18 +160,8 @@ public class TargetPlannerTests
     {
         AutoPlan plan = TargetPlanner.Plan(Input(repetitions: 3));
 
-        double first = TargetPlanner.PairTimes(Timing, Timing.SlewSeconds, 5.0).End;
-        double next = TargetPlanner.PairTimes(Timing, Timing.FlipSeconds, 5.0).End;
-        Assert.Equal(first + 2 * next, plan.EstimatedSeconds, 1e-6);
-    }
-
-    [Fact]
-    public void ASlowSolveDelaysTheFlipInsteadOfFlippingBeforeTheWestSampleIsDone()
-    {
-        var slow = Timing with { SolveSeconds = 600 };
-
-        TargetPlanner.Times t = TargetPlanner.PairTimes(slow, slow.SlewSeconds, 1.0);
-
-        Assert.Equal(t.WestMid + slow.ExposureSeconds / 2.0 + slow.SolveSeconds, t.Flip, 1e-9);
+        // First pair with the full slew, the next two with a short one.
+        double expected = (120 + 90 + 60) + 2 * (30 + 90 + 60);
+        Assert.Equal(expected, plan.EstimatedSeconds, 1e-9);
     }
 }
