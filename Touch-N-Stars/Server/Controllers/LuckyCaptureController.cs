@@ -56,6 +56,63 @@ public class LuckyCaptureController : WebApiController {
     public Task SetControl(string id) => Post("controls/set/" + id);
     [Route(HttpVerbs.Post, "/v1/luckycapture/snapshot")]
     public Task Snapshot() => Post("snapshot");
+    [Route(HttpVerbs.Get, "/v1/luckycapture/focus/status")]
+    public Task FocusStatus() => Forward("focus/status");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/focus/metrics")]
+    public Task FocusMetrics() => Forward("focus/metrics");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/focus/settings")]
+    public Task FocusSettings() => Forward("focus/settings");
+
+    [Route(HttpVerbs.Put, "/v1/luckycapture/focus/settings")]
+    public Task SetFocusSettings() => Post("focus/settings/set");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/arm")]
+    public Task ArmFocuser() => Post("focus/arm");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/heartbeat")]
+    public Task FocusHeartbeat() => Post("focus/heartbeat");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/move-relative")]
+    public Task FocusRelative() => Post("focus/move-relative");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/move-absolute")]
+    public Task FocusAbsolute() => Post("focus/move-absolute");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/stop")]
+    public Task StopFocus() => Post("focus/stop");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/autofocus/start")]
+    public Task StartPlanetaryFocus() => Post("focus/autofocus/start");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/focus/autofocus/status")]
+    public Task PlanetaryFocusStatus() => Forward("focus/autofocus/status");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/focus/autofocus/cancel")]
+    public Task CancelPlanetaryFocus() => Post("focus/autofocus/cancel");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/simulation/capabilities")]
+    public Task SimulationCapabilities() => Forward("simulation/capabilities");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/simulation/sources")]
+    public Task SimulationSources() => Forward("simulation/sources");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/simulation/settings")]
+    public Task SimulationSettings() => Forward("simulation/settings");
+
+    [Route(HttpVerbs.Put, "/v1/luckycapture/simulation/settings")]
+    public Task SetSimulationSettings() => Post("simulation/settings/set");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/simulation/select")]
+    public Task SelectSimulation() => Post("simulation/select");
+
+    [Route(HttpVerbs.Get, "/v1/luckycapture/simulation/status")]
+    public Task SimulationStatus() => Forward("simulation/status");
+
+    [Route(HttpVerbs.Post, "/v1/luckycapture/simulation/replay/control")]
+    public Task ReplayControl() => Post("simulation/replay/control");
+
     [Route(HttpVerbs.Get, "/v1/luckycapture/events")]
     public async Task Events() {
         HttpContext.Response.ContentType = "text/event-stream";
