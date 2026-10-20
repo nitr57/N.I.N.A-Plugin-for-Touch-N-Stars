@@ -7,6 +7,7 @@ public class SystemMetrics
 {
     public double? CpuUsagePercent { get; set; }
     public MemoryMetrics Memory { get; set; }
+    public MemoryMetrics Swap { get; set; }
     public List<DiskMetrics> Disks { get; set; } = new();
     public DateTime TimestampUtc { get; set; } = DateTime.UtcNow;
 }

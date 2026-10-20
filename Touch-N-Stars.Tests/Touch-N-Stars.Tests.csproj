@@ -1,11 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
-    <TargetFramework Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">net10.0</TargetFramework>
+    <TargetFramework Condition="'$(PinsRoot)' != '' or $([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">net10.0</TargetFramework>
     <AssemblyName>TouchNStars.Tests</AssemblyName>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <!-- Source-built PINS uses its System.Windows compatibility assembly. A local
+         runtime prevents the shared framework facade from winning test-host binding. -->
+    <SelfContained Condition="'$(PinsRoot)' != ''">true</SelfContained>
+    <RuntimeIdentifier Condition="'$(PinsRoot)' != '' and '$(RuntimeIdentifier)' == ''">$([System.Runtime.InteropServices.RuntimeInformation]::RuntimeIdentifier)</RuntimeIdentifier>
   </PropertyGroup>
 
   <ItemGroup>

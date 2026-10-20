@@ -15,10 +15,12 @@ public class SystemMetricsService
 
     public async Task<SystemMetrics> GetMetricsAsync()
     {
+        var linuxMemory = OperatingSystem.IsLinux() ? ReadLinuxMemory() : null;
         var metrics = new SystemMetrics
         {
             CpuUsagePercent = await GetCpuUsageAsync().ConfigureAwait(false),
-            Memory = GetMemoryMetrics(),
+            Memory = OperatingSystem.IsLinux() ? linuxMemory?.Memory : GetMemoryMetrics(),
+            Swap = linuxMemory?.Swap,
             Disks = GetDiskMetrics(),
             TimestampUtc = DateTime.UtcNow
         };
@@ -126,26 +128,6 @@ public class SystemMetricsService
                     return BuildMemoryMetrics(total, available);
                 }
             }
-            else if (OperatingSystem.IsLinux())
-            {
-                Dictionary<string, long> values = File
-                    .ReadLines("/proc/meminfo")
-                    .Select(ParseMemInfoLine)
-                    .Where(kv => kv.HasValue)
-                    .Select(kv => kv.Value)
-                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
-
-                if (values.TryGetValue("MemTotal", out long total))
-                {
-                    long available = values.TryGetValue("MemAvailable", out long memAvailable)
-                        ? memAvailable
-                        : (values.TryGetValue("MemFree", out long memFree) ? memFree : 0)
-                          + (values.TryGetValue("Buffers", out long buffers) ? buffers : 0)
-                          + (values.TryGetValue("Cached", out long cached) ? cached : 0);
-
-                    return BuildMemoryMetrics(total, available);
-                }
-            }
         }
         catch (Exception ex)
         {
@@ -153,6 +135,41 @@ public class SystemMetricsService
         }
 
         return null;
+    }
+
+    private static SystemMetrics ReadLinuxMemory()
+    {
+        try
+        {
+            return ParseLinuxMemory(File.ReadLines("/proc/meminfo"));
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"System metrics Linux memory sample failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    internal static SystemMetrics ParseLinuxMemory(IEnumerable<string> lines)
+    {
+        var values = lines.Select(ParseMemInfoLine)
+            .Where(kv => kv.HasValue).Select(kv => kv.Value)
+            .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+        var result = new SystemMetrics();
+        if (values.TryGetValue("MemTotal", out long total))
+        {
+            long available = values.TryGetValue("MemAvailable", out long memAvailable)
+                ? memAvailable
+                : values.GetValueOrDefault("MemFree") + values.GetValueOrDefault("Buffers")
+                  + values.GetValueOrDefault("Cached");
+            result.Memory = BuildMemoryMetrics(total, available);
+        }
+        if (values.TryGetValue("SwapTotal", out long swapTotal)
+            && values.TryGetValue("SwapFree", out long swapFree))
+        {
+            result.Swap = BuildMemoryMetrics(swapTotal, swapFree);
+        }
+        return result;
     }
 
     private static MemoryMetrics BuildMemoryMetrics(long total, long available)
@@ -238,7 +255,7 @@ public class SystemMetricsService
             return null;
         }
 
-        if (!long.TryParse(numericToken, out long valueKb))
+        if (!long.TryParse(numericToken, out long valueKb) || valueKb < 0 || valueKb > long.MaxValue / 1024)
         {
             return null;
         }

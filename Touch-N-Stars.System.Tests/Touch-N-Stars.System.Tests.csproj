@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TouchNStars.System.Tests</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <!-- Test the OS boundary without requiring the full NINA host or its build/deploy hooks. -->
+  <ItemGroup>
+    <Compile Include="../Touch-N-Stars/Server/Services/SystemMetricsService.cs" Link="SystemMetricsService.cs" />
+    <Compile Include="../Touch-N-Stars/Server/Models/SystemMetrics.cs" Link="SystemMetrics.cs" />
+    <Compile Include="../Touch-N-Stars/Server/AvahiServicePublisher.cs" Link="AvahiServicePublisher.cs" />
+    <Compile Include="../Touch-N-Stars/Server/MdnsBroadcaster.cs" Link="MdnsBroadcaster.cs" />
+    <PackageReference Include="Makaretu.Dns.Multicast.New" Version="0.38.0" />
+    <PackageReference Include="Makaretu.Dns.New" Version="3.1.2" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
