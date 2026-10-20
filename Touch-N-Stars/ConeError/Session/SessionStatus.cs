@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using TouchNStars.ConeError.Domain;
 
 namespace TouchNStars.ConeError.Session;
 
@@ -12,14 +11,14 @@ public enum SessionPhase
     WaitingForAnswer,
     Settling,
     Exposing,
-    Ready,
-    Moving,
+    WaitingForMeridian,
+    Flipping,
     Complete,
     Failed,
     Aborted
 }
 
-/// <summary>A question the running session waits for (e.g. the one-time pier label check).</summary>
+/// <summary>A question the running session waits for (the one-time pier label check).</summary>
 public sealed class SessionQuestion
 {
     public int Id { get; init; }
@@ -33,43 +32,9 @@ public sealed class SessionError
     public string Message { get; init; }
 }
 
-/// <summary>The Sun relative to the current pointing, from the watchdog.</summary>
-public sealed class SunWatchStatus
-{
-    public double SeparationDegrees { get; init; }
-    public double RadiusDegrees { get; init; }
-
-    /// <summary>Within radius + 5°: the Sun is getting close.</summary>
-    public bool Warning { get; init; }
-
-    /// <summary>Within the radius: cover the telescope.</summary>
-    public bool Critical { get; init; }
-}
-
-/// <summary>The captured position and the moves of the daytime check.</summary>
-public sealed class ManualFlipStatus
-{
-    public double? CapturedHourAngle { get; init; }
-    public double? CapturedDeclination { get; init; }
-    public string CapturedSide { get; init; }
-    public double? CapturedAltitude { get; init; }
-    public double? CapturedAzimuth { get; init; }
-    public string CurrentSide { get; init; }
-    public double? CurrentHourAngle { get; init; }
-    public bool TrackingWasOn { get; init; }
-    public EndpointCheck EastCheck { get; init; }
-    public EndpointCheck WestCheck { get; init; }
-    public double? CentredHourAngleEast { get; init; }
-    public double? CentredHourAngleWest { get; init; }
-    public string LastMove { get; init; }
-    public bool PierLabelsVerified { get; init; }
-    public bool PierLabelsAnswered { get; init; }
-    public bool PierLabelsInverted { get; init; }
-}
-
 public sealed class SessionStatus
 {
-    /// <summary>"none", "auto" or "manual".</summary>
+    /// <summary>"none" or "auto".</summary>
     public string Mode { get; init; } = "none";
 
     public SessionPhase Phase { get; init; } = SessionPhase.Idle;
@@ -81,14 +46,13 @@ public sealed class SessionStatus
     public int Repetitions { get; init; }
     public string CurrentSide { get; init; }
     public double? DeclinationDegrees { get; init; }
+
+    /// <summary>While waiting for the target to cross the meridian: seconds until the flip.</summary>
+    public double? SecondsUntilFlip { get; init; }
+
     public IReadOnlyList<ConePairRecord> Pairs { get; init; } = Array.Empty<ConePairRecord>();
     public SessionQuestion Question { get; init; }
-
-    public ManualFlipStatus Manual { get; init; }
-
-    public SunWatchStatus Sun { get; init; }
     public SessionError Error { get; init; }
     public ConeResultRecord Result { get; init; }
     public ConeResultRecord Previous { get; init; }
-    public bool RestorePending { get; init; }
 }

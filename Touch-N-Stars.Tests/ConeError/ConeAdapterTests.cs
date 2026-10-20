@@ -1,6 +1,5 @@
 using NINA.Astrometry;
 using NINA.Equipment.Interfaces.Mediator;
-using NINA.INDI.Protocol;
 using TouchNStars.ConeError.Adapters;
 using TouchNStars.ConeError.Session;
 using Xunit;
@@ -10,10 +9,11 @@ namespace TouchNStars.Tests.ConeError;
 public class ConeAdapterTests
 {
     [Fact]
-    public async Task TheNinaMountAdapterSlewsStopsAndTracksButNeverSyncs()
+    public async Task TheNinaMountAdapterSlewsFlipsStopsAndTracksButNeverSyncs()
     {
         var calls = new List<string>();
         Coordinates? slewTarget = null;
+        Coordinates? flipTarget = null;
         ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, args) =>
         {
             calls.Add(method.Name);
@@ -22,11 +22,17 @@ public class ConeAdapterTests
                 slewTarget = (Coordinates)args![0]!;
             }
 
+            if (method.Name == nameof(ITelescopeMediator.MeridianFlip))
+            {
+                flipTarget = (Coordinates)args![0]!;
+            }
+
             return null;
         });
         var mount = new NinaConeMount(telescope);
 
         await mount.SlewAsync(12.5, 3.0, CancellationToken.None);
+        await mount.FlipAsync(12.5, 3.0, CancellationToken.None);
         mount.Stop();
         mount.SetTracking(false);
         mount.Snapshot();
@@ -36,6 +42,8 @@ public class ConeAdapterTests
         Assert.Equal(Epoch.JNOW, slewTarget!.Epoch);
         Assert.Equal(12.5, slewTarget.RA, 1e-9);
         Assert.Equal(3.0, slewTarget.Dec, 1e-9);
+        Assert.Equal(Epoch.JNOW, flipTarget!.Epoch);
+        Assert.Equal(12.5, flipTarget.RA, 1e-9);
     }
 
     [Theory]
@@ -78,145 +86,37 @@ public class ConeAdapterTests
     }
 
     [Fact]
-    public void IndiOnStepLimitsAreConvertedFromMinutesOfTime()
-    {
-        var snapshot = new INDIDeviceSnapshot
-        {
-            Device = "LX200 OnStep",
-            Properties =
-            {
-                Property(NinaMountDriverInspector.IndiMinutesPastMeridian, "Ok", ("East", 20.0), ("West", -8.0)),
-                Property(NinaMountDriverInspector.IndiElevationLimit, "Ok", ("minAlt", -5.0), ("maxAlt", 85.0))
-            }
-        };
-
-        MountLimits limits = NinaMountDriverInspector.IndiOnStepLimits(snapshot);
-
-        Assert.Equal(5.0, limits.PastMeridianEastDegrees);
-        Assert.Equal(-2.0, limits.PastMeridianWestDegrees);
-        Assert.Equal(-5.0, limits.HorizonDegrees);
-        Assert.Equal(85.0, limits.OverheadDegrees);
-        Assert.Equal("INDI OnStep", limits.Source);
-    }
-
-    [Fact]
-    public void IndiLimitsPolledWithStateIdleAreUsed()
-    {
-        // lx200_OnStep refreshes these with apply() and leaves the state Idle
-        var snapshot = new INDIDeviceSnapshot
-        {
-            Properties =
-            {
-                Property(NinaMountDriverInspector.IndiMinutesPastMeridian, "Idle", ("East", 12.0), ("West", 8.0)),
-                Property(NinaMountDriverInspector.IndiElevationLimit, "Idle", ("minAlt", 0.0), ("maxAlt", 88.0))
-            }
-        };
-
-        MountLimits limits = NinaMountDriverInspector.IndiOnStepLimits(snapshot);
-
-        Assert.Equal(3.0, limits.PastMeridianEastDegrees);
-        Assert.Equal(2.0, limits.PastMeridianWestDegrees);
-        Assert.Equal(88.0, limits.OverheadDegrees);
-        Assert.Equal("INDI OnStep", limits.Source);
-    }
-
-    [Theory]
-    [InlineData("Alert")]
-    [InlineData("Busy")]
-    public void IndiLimitsInAlertOrBusyAreIgnoredAndNotClaimedAsTheSource(string state)
-    {
-        var snapshot = new INDIDeviceSnapshot
-        {
-            Properties = { Property(NinaMountDriverInspector.IndiMinutesPastMeridian, state, ("East", 20.0), ("West", 20.0)) }
-        };
-
-        MountLimits limits = NinaMountDriverInspector.IndiOnStepLimits(snapshot);
-
-        Assert.Null(limits.PastMeridianEastDegrees);
-        Assert.Null(limits.HorizonDegrees);
-        Assert.Null(limits.Source);
-    }
-
-    [Fact]
-    public void TheIndiPierSideChangeIsConfirmedOnlyByANewerDriverUpdate()
-    {
-        INDIPropertySnapshot Switch(string state, string timestamp, params string[] on)
-        {
-            var p = new INDIPropertySnapshot { Name = NinaMountDriverInspector.IndiPreferredPierSide, State = state, Timestamp = timestamp, Type = "switch" };
-            foreach (string e in new[] { "1", "2", "3" })
-            {
-                p.Elements.Add(new INDIElementSnapshot { Name = e, Value = on.Contains(e) });
-            }
-
-            return p;
-        }
-
-        // the local copy right after SetProperty: old timestamp, element already On
-        Assert.False(IndiOnStepPierSideControl.IsConfirmed(Switch("Ok", "t0", "2"), "t0", "2"));
-        // the stock driver's answer to OnStepX's '1': switch reset, Busy
-        Assert.False(IndiOnStepPierSideControl.IsConfirmed(Switch("Busy", "t1"), "t0", "2"));
-        // its next poll read :GX96# back
-        Assert.True(IndiOnStepPierSideControl.IsConfirmed(Switch("Ok", "t2", "2"), "t0", "2"));
-        // the mount kept the old value
-        Assert.False(IndiOnStepPierSideControl.IsConfirmed(Switch("Ok", "t2", "1"), "t0", "2"));
-    }
-
-    [Fact]
-    public void AnAmbiguousIndiSwitchIsResolvedByGx96OrTakenAsBest()
-    {
-        var property = new INDIPropertySnapshot { Name = NinaMountDriverInspector.IndiPreferredPierSide, State = "Ok" };
-        property.Elements.Add(new INDIElementSnapshot { Name = "1", Value = true });
-        property.Elements.Add(new INDIElementSnapshot { Name = "2", Value = true });
-        property.Elements.Add(new INDIElementSnapshot { Name = "3", Value = false });
-
-        Assert.Equal("East", IndiOnStepPierSideControl.Interpret(property, () => "E"));
-        Assert.Equal("Best", IndiOnStepPierSideControl.Interpret(property, () => throw new NotImplementedException("serial")));
-        property.Elements[1].Value = false;
-        Assert.Equal("West", IndiOnStepPierSideControl.Interpret(property));
-    }
-
-    [Theory]
-    [InlineData(new long[] { 0, 0, 0, 0, 0, 0, 0, 0, 0 }, PointingModelState.None)]
-    [InlineData(new long[] { 12, -40, 0, 0, 185, 0, 0, 0, 0 }, PointingModelState.Active)]
-    [InlineData(new long[] { 0, 0, 0, 0, 0, 0, 0, 3, 0 }, PointingModelState.Active)]
-    public void OnStepModelTermsAreClassified(long[] terms, PointingModelState expected)
-    {
-        PointingModelInfo info = OnStepModelProbe.Classify(terms);
-
-        Assert.Equal(expected, info.State);
-        Assert.Equal(terms[4], info.ConeTermArcsec);
-    }
-
-    [Fact]
-    public void ModelProbeOverASerialIndiConnectionIsUnknown()
+    public async Task AFlipTheMountDidNotCompleteIsAnError()
     {
         ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) =>
-            method.Name == nameof(ITelescopeMediator.SendCommandString) ? throw new NotImplementedException("only over TCP") : null);
+            method.Name == nameof(ITelescopeMediator.MeridianFlip) ? Task.FromResult(false) : null);
 
-        Assert.Equal(PointingModelState.Unknown, OnStepModelProbe.Probe(telescope).State);
+        ConeErrorException ex = await Assert.ThrowsAsync<ConeErrorException>(() => new NinaConeMount(telescope).FlipAsync(1.0, 2.0, CancellationToken.None));
+
+        Assert.Equal("FlipFailed", ex.Code);
     }
 
     [Fact]
-    public void ModelProbeReadsTheConeTerm()
+    public async Task AFlipThatThrowsIsAnErrorWithTheDriverMessage()
     {
-        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, args) =>
-            method.Name == nameof(ITelescopeMediator.SendCommandString) ? ((string)args![0]! == ":GX04#" ? "-210" : "0") : null);
+        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) =>
+            method.Name == nameof(ITelescopeMediator.MeridianFlip) ? Task.FromException<bool>(new InvalidOperationException("side of pier not settable")) : null);
 
-        PointingModelInfo info = OnStepModelProbe.Probe(telescope);
+        ConeErrorException ex = await Assert.ThrowsAsync<ConeErrorException>(() => new NinaConeMount(telescope).FlipAsync(1.0, 2.0, CancellationToken.None));
 
-        Assert.Equal(PointingModelState.Active, info.State);
-        Assert.Equal(-210, info.ConeTermArcsec);
+        Assert.Equal("FlipFailed", ex.Code);
+        Assert.Contains("side of pier not settable", ex.Message);
     }
 
-    private static INDIPropertySnapshot Property(string name, string state, params (string Name, double Value)[] elements)
+    [Fact]
+    public async Task ACancelledFlipStaysACancellation()
     {
-        var property = new INDIPropertySnapshot { Name = name, State = state, Type = "number" };
-        foreach ((string element, double value) in elements)
-        {
-            property.Elements.Add(new INDIElementSnapshot { Name = element, Value = value });
-        }
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        ITelescopeMediator telescope = InterfaceFake.Create<ITelescopeMediator>((method, _) =>
+            method.Name == nameof(ITelescopeMediator.MeridianFlip) ? Task.FromCanceled<bool>(cts.Token) : null);
 
-        return property;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new NinaConeMount(telescope).FlipAsync(1.0, 2.0, cts.Token));
     }
 }
 
@@ -240,13 +140,14 @@ public class ConeErrorStoreTests : IDisposable
     {
         var store = new ConeErrorStore(directory);
 
-        store.SaveSettings(new ConeErrorSettings { SunExclusionDegrees = 5.0, Repetitions = 40, DovetailMm = 210.0, StrictPath = true });
+        store.SaveSettings(new ConeErrorSettings { MinAltitudeDegrees = 95.0, Repetitions = 40, DovetailMm = 210.0, ExposureSeconds = 500.0, VerifiedPierLabels = { "a", "a", " " } });
         ConeErrorSettings loaded = store.LoadSettings();
 
-        Assert.Equal(ConeErrorSettings.MinSunExclusionDegrees, loaded.SunExclusionDegrees);
+        Assert.Equal(80.0, loaded.MinAltitudeDegrees);
         Assert.Equal(10, loaded.Repetitions);
         Assert.Equal(210.0, loaded.DovetailMm);
-        Assert.True(loaded.StrictPath);
+        Assert.Null(loaded.ExposureSeconds);
+        Assert.Equal(new[] { "a" }, loaded.VerifiedPierLabels);
     }
 
     [Fact]
@@ -254,8 +155,9 @@ public class ConeErrorStoreTests : IDisposable
     {
         ConeErrorSettings settings = new ConeErrorStore(directory).LoadSettings();
 
-        Assert.Equal(30.0, settings.SunExclusionDegrees);
-        Assert.Equal(5, settings.Repetitions);
+        Assert.Equal(20.0, settings.MinAltitudeDegrees);
+        Assert.Equal(3, settings.Repetitions);
+        Assert.Null(settings.DovetailMm);
     }
 
     [Fact]
@@ -274,19 +176,5 @@ public class ConeErrorStoreTests : IDisposable
         Assert.Equal(ConeErrorStore.MaxResults, store.LoadResults().Count);
         Assert.Equal("r54", store.PreviousResult(current).Id);
         Assert.DoesNotContain(store.LoadResults(), r => r.Id == "r0");
-    }
-
-    [Fact]
-    public void JournalRoundTripAndClear()
-    {
-        var store = new ConeErrorStore(directory);
-
-        store.SaveJournal(new RestoreJournal { Mode = "manual", PreferredPierSide = "West", Tracking = true });
-        RestoreJournal journal = store.LoadJournal();
-        store.ClearJournal();
-
-        Assert.Equal("West", journal.PreferredPierSide);
-        Assert.True(journal.Tracking);
-        Assert.Null(store.LoadJournal());
     }
 }

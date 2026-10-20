@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace TouchNStars.ConeError.Domain;
 
@@ -9,11 +8,6 @@ public sealed record PairTiming(double SlewSeconds, double FlipSeconds, double S
 {
     /// <summary>Time of one side's sample after arrival: settle, exposure, download and solve.</summary>
     public double SampleSeconds => SettleSeconds + ExposureSeconds + SolveSeconds;
-
-    /// <summary>Time between the exposure midpoints of the two sides of a pair.</summary>
-    public double BetweenSidesSeconds => SampleSeconds + FlipSeconds;
-
-    public double PairSeconds => SlewSeconds + FlipSeconds + 2.0 * SampleSeconds;
 }
 
 /// <summary>Input of <see cref="TargetPlanner.Plan"/>.</summary>
@@ -26,9 +20,6 @@ public sealed class PlannerInput
 
     public double LatitudeDegrees { get; init; }
 
-    /// <summary>The side the mount is on now; the first pair starts there to save a flip. Null: start east.</summary>
-    public PierSideLabel? CurrentSide { get; init; }
-
     public int Repetitions { get; init; }
 
     /// <summary>Requested declination, or null for a suggestion near 0°.</summary>
@@ -36,59 +27,51 @@ public sealed class PlannerInput
 
     public PairTiming Timing { get; init; }
 
-    public LimitSet Limits { get; init; }
+    public double MinAltitudeDegrees { get; init; }
 
-    /// <summary>The Sun's (hour angle, declination) at a UTC instant, in the frame of the mount's hour angles.</summary>
-    public Func<DateTime, HaDec> SunAt { get; init; }
+    /// <summary>The profile's custom horizon: altitude (degrees) at an azimuth (degrees), or null.</summary>
+    public Func<double, double> HorizonAltitudeAt { get; init; }
+
+    /// <summary>When the flip is made: the profile's minutes after the meridian.</summary>
+    public double FlipAfterMinutes { get; init; }
+
+    /// <summary>How far past the meridian the mount may track before it must flip: the profile's maximum.</summary>
+    public double MaxMinutesAfterMeridian { get; init; }
 }
 
-/// <summary>One planned sample: the side, the coordinates and the checks at the expected exposure time.</summary>
-public sealed class PlannedStep
+/// <summary>One planned pair: the same coordinates on the west side before the meridian and on the east side after it.</summary>
+public sealed class PlannedPair
 {
     public int Pair { get; init; }
-    public PierSideLabel Side { get; init; }
-
-    /// <summary>"slew" for the first side of a pair, "flip" for the second.</summary>
-    public string Kind { get; init; }
-
     public double RightAscensionHours { get; init; }
     public double DeclinationDegrees { get; init; }
-    public DateTime ExpectedExposureUtc { get; init; }
-    public EndpointCheck Check { get; init; }
+    public DateTime WestExposureUtc { get; init; }
+    public double WestHourAngle { get; init; }
+    public DateTime FlipUtc { get; init; }
+    public DateTime EastExposureUtc { get; init; }
+    public double EastHourAngle { get; init; }
+    public double Altitude { get; init; }
+    public double Azimuth { get; init; }
 }
 
 public sealed class AutoPlan
 {
     public double DeclinationDegrees { get; init; }
     public bool DeclinationSuggested { get; init; }
-    public IReadOnlyList<PlannedStep> Steps { get; init; } = Array.Empty<PlannedStep>();
-
-    /// <summary>The largest |hour angle| any sample is planned at, degrees; the confirmed envelope.</summary>
-    public double MaxAbsHourAngleDegrees { get; init; }
-
-    /// <summary>
-    /// Every pair is measured west side first, east side second, so that no sample is ever past the
-    /// meridian (counterweight up). Used when the meridian limits are too small for the alternating
-    /// order, at the cost of one more flip per pair.
-    /// </summary>
-    public bool NormalSidesOnly { get; init; }
-
+    public double FlipAfterMinutes { get; init; }
+    public IReadOnlyList<PlannedPair> Pairs { get; init; } = Array.Empty<PlannedPair>();
     public double EstimatedSeconds { get; init; }
-    public IReadOnlyList<LimitViolation> Violations { get; init; } = Array.Empty<LimitViolation>();
-    public string Refusal { get; init; }
+    public IReadOnlyList<string> Problems { get; init; } = Array.Empty<string>();
 
-    public bool Ok => Refusal == null && Violations.Count == 0;
+    public bool Ok => Problems.Count == 0;
 }
 
 /// <summary>
-/// Plans the automated measurement: a target near the meridian at a declination near 0° (at most
-/// 30°), measured on both pier sides per repetition. Each pair gets its own target, placed so that
-/// its two exposures sit symmetrically around the meridian (residual polar misalignment then cancels
-/// in the difference), and consecutive pairs alternate the side order so that each pair after the
-/// first needs one flip and one short slew. When the past-meridian limit of either side is smaller
-/// than half a pair's hour-angle window, the alternating order is impossible (one sample of every other
-/// pair would be counterweight-up on each side); then every pair is measured West first (HA &lt; 0) and
-/// East second (HA &gt; 0), both counterweight-down.
+/// Plans the measurement the way a sequence does a meridian flip: each pair is a target near the
+/// meridian at a declination near 0° (at most 30°), sampled on the west pier side just before the
+/// meridian, tracked until it is the profile's "minutes after meridian" past it, flipped with NINA's
+/// meridian flip and sampled again on the east side. Both samples see the same coordinates; nothing
+/// forces a pier side, so it works with any mount NINA can flip.
 /// </summary>
 public static class TargetPlanner
 {
@@ -96,11 +79,14 @@ public static class TargetPlanner
     public const int MinRepetitions = 2;
     public const int MaxRepetitions = 10;
 
+    /// <summary>The west sample is taken this long before the target reaches the meridian, minutes of time.</summary>
+    public const double WestSampleMinutesBeforeMeridian = 0.5;
+
+    /// <summary>The flip waits at least this long past the meridian, minutes of time, so that every driver sees the target past it.</summary>
+    public const double MinFlipAfterMinutes = 1.0;
+
     /// <summary>Extra altitude kept above the minimum when the declination is suggested.</summary>
     public const double SuggestionAltitudeMarginDegrees = 5.0;
-
-    /// <summary>Spare past-meridian allowance the alternating order needs on top of half a pair's window, degrees.</summary>
-    public const double AlternatingMarginDegrees = 0.25;
 
     public static AutoPlan Plan(PlannerInput input)
     {
@@ -114,6 +100,13 @@ public static class TargetPlanner
             return Refuse($"The number of repetitions must be between {MinRepetitions} and {MaxRepetitions}.");
         }
 
+        double flipAfter = Math.Max(input.FlipAfterMinutes, MinFlipAfterMinutes);
+        if (flipAfter > input.MaxMinutesAfterMeridian)
+        {
+            return Refuse(
+                $"The flip is made {flipAfter:F0} min after the meridian, but the profile lets the mount track only {input.MaxMinutesAfterMeridian:F0} min past it. Set 'minutes after meridian' to at most the maximum.");
+        }
+
         if (input.Declination.HasValue)
         {
             if (Math.Abs(input.Declination.Value) > MaxAbsDeclinationDegrees)
@@ -121,27 +114,26 @@ public static class TargetPlanner
                 return Refuse($"The declination must be within ±{MaxAbsDeclinationDegrees:F0}° so that the axis non-perpendicularity (tan δ) stays small.");
             }
 
-            return PlanAt(input, input.Declination.Value, suggested: false);
+            return PlanAt(input, input.Declination.Value, suggested: false, flipAfter);
         }
 
-        AutoPlan first = null;
+        AutoPlan last = null;
         foreach (double dec in CandidateDeclinations(input.LatitudeDegrees))
         {
             double meridianAltitude = 90.0 - Math.Abs(input.LatitudeDegrees - dec);
-            if (meridianAltitude < input.Limits.MinAltitudeDegrees + SuggestionAltitudeMarginDegrees && Math.Abs(dec) < MaxAbsDeclinationDegrees)
+            if (meridianAltitude < input.MinAltitudeDegrees + SuggestionAltitudeMarginDegrees && Math.Abs(dec) < MaxAbsDeclinationDegrees)
             {
                 continue;
             }
 
-            AutoPlan plan = PlanAt(input, dec, suggested: true);
-            first ??= plan;
-            if (plan.Ok)
+            last = PlanAt(input, dec, suggested: true, flipAfter);
+            if (last.Ok)
             {
-                return plan;
+                return last;
             }
         }
 
-        return first ?? Refuse("No declination between 0° and 30° is high enough above the horizon at the meridian.");
+        return last ?? Refuse("No declination between 0° and 30° is high enough above the horizon at the meridian.");
     }
 
     /// <summary>0°, then 1° steps toward the visible pole up to 30°.</summary>
@@ -154,80 +146,88 @@ public static class TargetPlanner
         }
     }
 
-    private static AutoPlan PlanAt(PlannerInput input, double declination, bool suggested)
+    private static AutoPlan PlanAt(PlannerInput input, double declination, bool suggested, double flipAfter)
     {
         PairTiming timing = input.Timing;
-        var steps = new List<PlannedStep>();
-        var violations = new List<LimitViolation>();
-        double halfWindow = Sidereal(timing.BetweenSidesSeconds / 2.0) * 15.0;
-        bool normalSidesOnly = Math.Min(
-            input.Limits.EffectivePastMeridianDegrees(PierSideLabel.East),
-            input.Limits.EffectivePastMeridianDegrees(PierSideLabel.West)) < halfWindow + AlternatingMarginDegrees;
-        PierSideLabel firstSide = normalSidesOnly ? PierSideLabel.West : input.CurrentSide ?? PierSideLabel.East;
-        PierSideLabel? previous = input.CurrentSide;
-        double maxAbsHa = 0.0;
+        var pairs = new List<PlannedPair>();
+        var problems = new List<string>();
         double elapsed = 0.0;
+
+        // both samples are within minutes of the meridian, where the target culminates
+        (double altitude, double azimuth) = Spherical.AltAz(0.0, declination, input.LatitudeDegrees);
 
         for (int pair = 0; pair < input.Repetitions; pair++)
         {
-            double slew = pair == 0
-                ? timing.SlewSeconds
-                : normalSidesOnly ? timing.FlipSeconds : Math.Min(timing.SlewSeconds, 30.0);
-            double firstMid = elapsed + slew + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
-            double secondMid = firstMid + timing.BetweenSidesSeconds;
-            double centre = (firstMid + secondMid) / 2.0;
+            // after the first pair the mount is on the east side and has to come back west
+            double slew = pair == 0 ? timing.SlewSeconds : timing.FlipSeconds;
+            Times t = PairTimes(timing, slew, flipAfter);
+            double westMid = elapsed + t.WestMid;
+            double ra = Spherical.WrapHours24(input.LocalSiderealTimeHours + Sidereal(westMid) + WestSampleMinutesBeforeMeridian / 60.0);
+            double westHa = -WestSampleMinutesBeforeMeridian / 60.0;
+            double eastHa = Spherical.HourAngle(input.LocalSiderealTimeHours + Sidereal(elapsed + t.EastMid), ra);
 
-            double raAtCentre = Spherical.WrapHours24(input.LocalSiderealTimeHours + Sidereal(centre));
-            PierSideLabel secondSide = ConeMath.Other(firstSide);
+            pairs.Add(new PlannedPair
+            {
+                Pair = pair,
+                RightAscensionHours = ra,
+                DeclinationDegrees = declination,
+                WestExposureUtc = input.NowUtc.AddSeconds(westMid),
+                WestHourAngle = westHa,
+                FlipUtc = input.NowUtc.AddSeconds(elapsed + t.Flip),
+                EastExposureUtc = input.NowUtc.AddSeconds(elapsed + t.EastMid),
+                EastHourAngle = eastHa,
+                Altitude = altitude,
+                Azimuth = azimuth
+            });
 
-            steps.Add(Step(input, pair, firstSide, previous == null || previous == firstSide ? "slew" : "flip", raAtCentre, declination, firstMid));
-            steps.Add(Step(input, pair, secondSide, "flip", raAtCentre, declination, secondMid));
-
-            maxAbsHa = Math.Max(maxAbsHa, halfWindow);
-            elapsed += slew + timing.FlipSeconds + 2.0 * timing.SampleSeconds;
-            previous = secondSide;
-            firstSide = normalSidesOnly ? PierSideLabel.West : secondSide;
+            elapsed += t.End;
         }
 
-        foreach (PlannedStep step in steps)
+        double minimum = input.MinAltitudeDegrees;
+        string source = "the minimum altitude";
+        if (input.HorizonAltitudeAt != null)
         {
-            violations.AddRange(step.Check.Violations);
+            double horizon = input.HorizonAltitudeAt(azimuth);
+            if (!double.IsNaN(horizon) && horizon > minimum)
+            {
+                minimum = horizon;
+                source = "the profile's custom horizon";
+            }
+        }
+
+        if (altitude < minimum)
+        {
+            problems.Add($"At declination {declination:F0}° the target culminates at {altitude:F1}°, below {source} of {minimum:F1}°.");
         }
 
         return new AutoPlan
         {
             DeclinationDegrees = declination,
             DeclinationSuggested = suggested,
-            Steps = steps,
-            MaxAbsHourAngleDegrees = maxAbsHa,
-            NormalSidesOnly = normalSidesOnly,
+            FlipAfterMinutes = flipAfter,
+            Pairs = pairs,
             EstimatedSeconds = elapsed,
-            Violations = violations.GroupBy(v => (v.Code, v.Source)).Select(g => g.First()).ToList()
+            Problems = problems
         };
     }
 
-    private static PlannedStep Step(PlannerInput input, int pair, PierSideLabel side, string kind, double ra, double dec, double secondsFromNow)
-    {
-        double lst = input.LocalSiderealTimeHours + Sidereal(secondsFromNow);
-        double ha = Spherical.HourAngle(lst, ra);
-        DateTime when = input.NowUtc.AddSeconds(secondsFromNow);
-        HaDec sun = input.SunAt(when);
-        EndpointCheck check = LimitValidator.ValidateEndpoint(input.Limits, side, ha, dec, input.LatitudeDegrees, new[] { sun });
+    /// <summary>Seconds from the start of a pair: west exposure midpoint, flip, east exposure midpoint, end.</summary>
+    public readonly record struct Times(double WestMid, double Flip, double EastMid, double End);
 
-        return new PlannedStep
-        {
-            Pair = pair,
-            Side = side,
-            Kind = kind,
-            RightAscensionHours = ra,
-            DeclinationDegrees = dec,
-            ExpectedExposureUtc = when,
-            Check = check
-        };
+    public static Times PairTimes(PairTiming timing, double slewSeconds, double flipAfterMinutes)
+    {
+        double westMid = slewSeconds + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
+        double westDone = westMid + timing.ExposureSeconds / 2.0 + timing.SolveSeconds;
+        // the target reaches the flip time this long after the west midpoint (sidereal minutes → seconds)
+        double untilFlip = (WestSampleMinutesBeforeMeridian + flipAfterMinutes) * 60.0 / Spherical.SiderealPerSolar;
+        double flip = Math.Max(westDone, westMid + untilFlip);
+        double eastMid = flip + timing.FlipSeconds + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
+        double end = eastMid + timing.ExposureSeconds / 2.0 + timing.SolveSeconds;
+        return new Times(westMid, flip, eastMid, end);
     }
 
     /// <summary>Sidereal hours elapsed in a number of solar seconds.</summary>
     public static double Sidereal(double solarSeconds) => solarSeconds / 3600.0 * Spherical.SiderealPerSolar;
 
-    private static AutoPlan Refuse(string reason) => new() { Refusal = reason };
+    private static AutoPlan Refuse(string reason) => new() { Problems = new[] { reason } };
 }

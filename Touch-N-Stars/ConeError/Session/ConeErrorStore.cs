@@ -10,30 +10,16 @@ namespace TouchNStars.ConeError.Session;
 /// <summary>Settings of the cone error wizard (TnsCache/cone-error/settings.json).</summary>
 public sealed class ConeErrorSettings
 {
-    public const double DefaultSunExclusionDegrees = 30.0;
-    public const double MinSunExclusionDegrees = 15.0;
-
-    public double SunExclusionDegrees { get; set; } = DefaultSunExclusionDegrees;
-
-    /// <summary>Minimum altitude of the automated measurement.</summary>
-    public double AutoMinAltitudeDegrees { get; set; } = 20.0;
-
-    /// <summary>Minimum altitude of the daytime check (landmarks are low).</summary>
-    public double ManualMinAltitudeDegrees { get; set; } = 0.0;
-
-    /// <summary>Also check the RA-first and Dec-first paths of a flip against the Sun.</summary>
-    public bool StrictPath { get; set; }
+    /// <summary>Minimum altitude of the measurement.</summary>
+    public double MinAltitudeDegrees { get; set; } = 20.0;
 
     public double? DovetailMm { get; set; }
 
-    public int Repetitions { get; set; } = 5;
+    public int Repetitions { get; set; } = 3;
 
     public double? ExposureSeconds { get; set; }
 
-    /// <summary>Distance of the optical axis from the RA axis, for the parallax of the daytime estimate.</summary>
-    public double? AxisOffsetMm { get; set; }
-
-    /// <summary>Mounts whose pier side labels the user has confirmed against the counterweight position.</summary>
+    /// <summary>Mounts whose pier side labels the user has confirmed against the counterweight.</summary>
     public List<string> VerifiedPierLabels { get; set; } = new();
 
     /// <summary>Clamps values a client may have sent out of range.</summary>
@@ -41,14 +27,10 @@ public sealed class ConeErrorSettings
     {
         return new ConeErrorSettings
         {
-            SunExclusionDegrees = Math.Clamp(double.IsNaN(SunExclusionDegrees) ? DefaultSunExclusionDegrees : SunExclusionDegrees, MinSunExclusionDegrees, 90.0),
-            AutoMinAltitudeDegrees = Math.Clamp(AutoMinAltitudeDegrees, 0.0, 80.0),
-            ManualMinAltitudeDegrees = Math.Clamp(ManualMinAltitudeDegrees, -10.0, 80.0),
-            StrictPath = StrictPath,
+            MinAltitudeDegrees = Math.Clamp(double.IsNaN(MinAltitudeDegrees) ? 20.0 : MinAltitudeDegrees, 0.0, 80.0),
             DovetailMm = DovetailMm is > 0 and < 2000 ? DovetailMm : null,
             Repetitions = Math.Clamp(Repetitions, 2, 10),
             ExposureSeconds = ExposureSeconds is > 0 and <= 120 ? ExposureSeconds : null,
-            AxisOffsetMm = AxisOffsetMm is > 0 and < 2000 ? AxisOffsetMm : null,
             VerifiedPierLabels = (VerifiedPierLabels ?? new List<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList()
         };
     }
@@ -76,7 +58,7 @@ public sealed class ConeResultRecord
 {
     public string Id { get; set; }
 
-    /// <summary>"auto" (plate solves) or "manual" (daytime estimate).</summary>
+    /// <summary>"auto": plate solves on both pier sides.</summary>
     public string Mode { get; set; }
 
     public DateTime TimestampUtc { get; set; }
@@ -98,26 +80,7 @@ public sealed class ConeResultRecord
     /// <summary>"Front", "Rear" or "None".</summary>
     public string ShimEnd { get; set; }
 
-    public double? ParallaxArcmin { get; set; }
     public List<ConePairRecord> Pairs { get; set; } = new();
-}
-
-/// <summary>
-/// Written before the sessions change the mount's preferred pier side or tracking, cleared after the
-/// restore (TnsCache/cone-error/restore.json). A leftover journal means the plugin stopped mid-session;
-/// the UI then offers to restore. Restoring only changes settings, it never moves the mount.
-/// </summary>
-public sealed class RestoreJournal
-{
-    public DateTime CreatedUtc { get; set; }
-    public string MountName { get; set; }
-    public string Mode { get; set; }
-
-    /// <summary>The preferred pier side before the session, as the pier side control reported it; null if unchanged.</summary>
-    public string PreferredPierSide { get; set; }
-
-    /// <summary>Tracking before the session; null if the session does not change it.</summary>
-    public bool? Tracking { get; set; }
 }
 
 /// <summary>JSON files of the wizard, in one directory, each written under a lock.</summary>
@@ -140,7 +103,6 @@ public sealed class ConeErrorStore
 
     private string SettingsPath => Path.Combine(Directory, "settings.json");
     private string ResultsPath => Path.Combine(Directory, "results.json");
-    private string JournalPath => Path.Combine(Directory, "restore.json");
 
     public ConeErrorSettings LoadSettings() => (Read<ConeErrorSettings>(SettingsPath) ?? new ConeErrorSettings()).Sanitized();
 
@@ -170,25 +132,6 @@ public sealed class ConeErrorStore
             .Where(r => r.Id != current.Id && r.Mode == current.Mode && r.ProfileId == current.ProfileId && r.MountName == current.MountName && r.TimestampUtc < current.TimestampUtc)
             .OrderByDescending(r => r.TimestampUtc)
             .FirstOrDefault();
-    }
-
-    public RestoreJournal LoadJournal() => Read<RestoreJournal>(JournalPath);
-
-    public void SaveJournal(RestoreJournal journal) => Write(JournalPath, journal);
-
-    public void ClearJournal()
-    {
-        lock (fileLock)
-        {
-            try
-            {
-                File.Delete(JournalPath);
-            }
-            catch (Exception ex)
-            {
-                Logger.Warning($"ConeError: could not delete the restore journal: {ex.Message}");
-            }
-        }
     }
 
     private T Read<T>(string path) where T : class

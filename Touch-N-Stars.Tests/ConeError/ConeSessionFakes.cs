@@ -3,7 +3,10 @@ using TouchNStars.ConeError.Session;
 
 namespace TouchNStars.Tests.ConeError;
 
-/// <summary>A virtual clock: short delays advance it and yield; delays of 5 minutes and more (timeouts) wait for cancellation.</summary>
+/// <summary>
+/// A virtual clock: short delays advance it and yield; delays of 5 minutes and more (timeouts) wait
+/// for cancellation, and so does every delay while <see cref="Hold"/> says so.
+/// </summary>
 public sealed class FakeClock : IClock
 {
     private readonly object sync = new();
@@ -25,6 +28,9 @@ public sealed class FakeClock : IClock
         }
     }
 
+    /// <summary>While this returns true, delays wait for cancellation (to catch a phase in a test).</summary>
+    public Func<bool>? Hold { get; set; }
+
     public void Advance(TimeSpan by)
     {
         lock (sync)
@@ -35,7 +41,7 @@ public sealed class FakeClock : IClock
 
     public async Task Delay(TimeSpan delay, CancellationToken token)
     {
-        if (delay >= TimeSpan.FromMinutes(5))
+        if (delay >= TimeSpan.FromMinutes(5) || Hold?.Invoke() == true)
         {
             await Task.Delay(Timeout.Infinite, token);
         }
@@ -46,33 +52,20 @@ public sealed class FakeClock : IClock
     }
 }
 
-public sealed class FakeSun : ISunProvider
+/// <summary>How the fake mount picks the pier side of a goto.</summary>
+public enum GotoSideChoice
 {
-    private readonly double longitude;
+    /// <summary>The counterweight-down side for the target's hour angle, like most mounts.</summary>
+    Normal,
 
-    public FakeSun(double longitude)
-    {
-        this.longitude = longitude;
-    }
-
-    /// <summary>Overrides the ephemeris, e.g. to put the Sun next to the telescope.</summary>
-    public HaDec? Fixed { get; set; }
-
-    public HaDec SunAt(DateTime utc)
-    {
-        if (Fixed is { } f)
-        {
-            return f;
-        }
-
-        (double ha, double dec) = SunEphemeris.HourAngleDeclination(utc, longitude);
-        return new HaDec(ha, dec);
-    }
+    /// <summary>Stays on the current side while the target is reachable there.</summary>
+    StayOnSide
 }
 
 /// <summary>
-/// A mount whose goto lands on the side the pier side control prefers (unless it refuses), tracks or
-/// stands still, and whose RA/Dec are what it believes (its own frame).
+/// A mount that behaves like NINA's drivers: a goto lands on the side <see cref="GotoSide"/> picks,
+/// a meridian flip moves to the side the target is expected on (NINA's ExpectedPierSide: HA 0..12 h
+/// east, else west) and does nothing when the mount is already there. RA/Dec are what it believes.
 /// </summary>
 public sealed class FakeMount : IConeMount
 {
@@ -83,10 +76,9 @@ public sealed class FakeMount : IConeMount
     private double ha;
     private double dec;
 
-    public FakeMount(FakeClock clock, double latitude, double longitude, PierSideLabel side, double hourAngle, double declination, bool tracking)
+    public FakeMount(FakeClock clock, double longitude, PierSideLabel side, double hourAngle, double declination, bool tracking)
     {
         this.clock = clock;
-        Latitude = latitude;
         this.longitude = longitude;
         Side = side;
         Tracking = tracking;
@@ -95,39 +87,21 @@ public sealed class FakeMount : IConeMount
         ra = Spherical.RightAscension(Lst, hourAngle);
     }
 
-    public double Latitude { get; }
     public PierSideLabel Side { get; private set; }
     public bool Tracking { get; private set; }
     public bool Slewing { get; private set; }
-    public FakePierSide? PierSide { get; set; }
-
-    /// <summary>The mount ignores the preferred pier side and stays where it is.</summary>
-    public bool IgnorePierSide { get; set; }
-
-    /// <summary>At home OnStepX ignores the preferred side and takes it from the sign of the hour angle (Goto.cpp).</summary>
-    public bool AtHome { get; set; }
-
-    /// <summary>NINA's settle time after a goto, during which the driver keeps tracking on.</summary>
-    public double SettleSeconds { get; set; }
-
-    /// <summary>A goto started by something else (another view or client) is running.</summary>
-    public bool ExternalSlew { get; set; }
-
     public bool Connected { get; set; } = true;
+    public GotoSideChoice GotoSide { get; set; } = GotoSideChoice.Normal;
 
-    /// <summary>The mount keeps tracking when asked to stop.</summary>
-    public bool RefuseTrackingOff { get; set; }
+    /// <summary>The mount cannot change its pier side with a meridian flip (it slews, but stays).</summary>
+    public bool CannotFlip { get; set; }
 
-
-    /// <summary>Degrees per second of a goto; the goto tracks meanwhile, like real drivers do.</summary>
-    public double SlewSpeed { get; set; } = 2.0;
-
-    /// <summary>Called when a slew starts, before it completes; can block on the token.</summary>
-    public Func<PierSideLabel, CancellationToken, Task>? OnSlew { get; set; }
+    /// <summary>Called when a slew or flip starts, before it completes; can block on the token.</summary>
+    public Func<string, PierSideLabel, CancellationToken, Task>? OnMove { get; set; }
 
     public Exception? SlewException { get; set; }
 
-    public List<(double Ra, double Dec, PierSideLabel Side)> Slews { get; } = new();
+    public List<(string Kind, double Ra, double Dec, double HourAngle, PierSideLabel Side)> Moves { get; } = new();
     public List<bool> TrackingCalls { get; } = new();
     public int StopCount { get; private set; }
 
@@ -155,7 +129,7 @@ public sealed class FakeMount : IConeMount
         }
     }
 
-    /// <summary>Puts the mount somewhere without a goto, e.g. the user re-centring or a sync.</summary>
+    /// <summary>Puts the mount somewhere without a goto (e.g. a move from elsewhere).</summary>
     public void Place(double hourAngle, double declination)
     {
         lock (sync)
@@ -172,29 +146,41 @@ public sealed class FakeMount : IConeMount
         {
             double lst = Lst;
             double currentRa = Tracking ? ra : Spherical.RightAscension(lst, ha);
-            return new MountSnapshot(Connected, false, Tracking, Slewing || ExternalSlew, Side, lst, currentRa, dec, Latitude, longitude, "Fake mount", clock.UtcNow, AtHome);
+            return new MountSnapshot(Connected, false, Tracking, Slewing, Side, lst, currentRa, dec, "Fake mount", clock.UtcNow);
         }
     }
 
-    public async Task SlewAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
+    private static PierSideLabel Expected(double hourAngle) => Spherical.WrapHours12(hourAngle) > 0.0 ? PierSideLabel.East : PierSideLabel.West;
+
+    public Task SlewAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
     {
-        PierSideLabel target = IgnorePierSide || PierSide == null ? Side : PierSide.Preferred ?? Side;
-        if (AtHome)
-        {
-            target = Spherical.HourAngle(Lst, rightAscensionHours) < 0.0 ? PierSideLabel.West : PierSideLabel.East;
-        }
+        double targetHa = Spherical.HourAngle(Lst, rightAscensionHours);
+        PierSideLabel target = GotoSide == GotoSideChoice.StayOnSide ? Side : Expected(targetHa);
+        return MoveAsync("slew", rightAscensionHours, declinationDegrees, target, 60.0, token);
+    }
+
+    public Task FlipAsync(double rightAscensionHours, double declinationDegrees, CancellationToken token)
+    {
+        double targetHa = Spherical.HourAngle(Lst, rightAscensionHours);
+        PierSideLabel expected = Expected(targetHa);
+        PierSideLabel target = CannotFlip ? Side : expected;
+        return MoveAsync("flip", rightAscensionHours, declinationDegrees, target, target == Side ? 1.0 : 90.0, token);
+    }
+
+    private async Task MoveAsync(string kind, double rightAscension, double declination, PierSideLabel target, double seconds, CancellationToken token)
+    {
         lock (sync)
         {
-            Slews.Add((rightAscensionHours, declinationDegrees, target));
+            Moves.Add((kind, rightAscension, declination, Spherical.HourAngle(Lst, rightAscension), target));
             Slewing = true;
             Tracking = true;
         }
 
         try
         {
-            if (OnSlew != null)
+            if (OnMove != null)
             {
-                await OnSlew(target, token);
+                await OnMove(kind, target, token);
             }
 
             if (SlewException != null)
@@ -202,21 +188,14 @@ public sealed class FakeMount : IConeMount
                 throw SlewException;
             }
 
-            double fromHa = HourAngle;
-            double distance = target != Side ? 180.0 : Spherical.SeparationDegrees(fromHa, Declination, Spherical.HourAngle(Lst, rightAscensionHours), declinationDegrees);
-            await clock.Delay(TimeSpan.FromSeconds(distance / SlewSpeed), token);
+            await clock.Delay(TimeSpan.FromSeconds(seconds), token);
             lock (sync)
             {
-                // the goto aimed at the RA of the command and tracks it on arrival
-                ra = rightAscensionHours;
-                dec = declinationDegrees;
+                ra = rightAscension;
+                dec = declination;
                 ha = Spherical.HourAngle(Lst, ra);
                 Side = target;
-                AtHome = false;
             }
-
-            // NINA waits the settle time with tracking still on
-            await clock.Delay(TimeSpan.FromSeconds(SettleSeconds), token);
         }
         finally
         {
@@ -241,11 +220,6 @@ public sealed class FakeMount : IConeMount
         lock (sync)
         {
             TrackingCalls.Add(enabled);
-            if (!enabled && RefuseTrackingOff)
-            {
-                return false;
-            }
-
             if (Tracking && !enabled)
             {
                 ha = Spherical.HourAngle(Lst, ra);
@@ -258,77 +232,6 @@ public sealed class FakeMount : IConeMount
             Tracking = enabled;
             return true;
         }
-    }
-}
-
-public sealed class FakePierSide : IPierSideControl
-{
-    public FakePierSide(string original = "Best")
-    {
-        Setting = original;
-        OriginalValue = original;
-    }
-
-    public string Setting { get; private set; }
-    public string OriginalValue { get; }
-    public bool Supported { get; init; } = true;
-    public string Description => "fake";
-    public string UnsupportedReason => Supported ? null! : "This mount cannot be told which pier side to use.";
-    public string? OriginalSetting { get; private set; }
-    public int Prepares { get; private set; }
-    public bool FailRestore { get; set; }
-
-    /// <summary>Reading the original setting fails (e.g. a serial error).</summary>
-    public bool FailRead { get; set; }
-
-    /// <summary>Called when the original setting is read (the start of a session).</summary>
-    public Action? OnRead { get; set; }
-
-    public PierSideLabel? Preferred => Setting switch
-    {
-        "East" => PierSideLabel.East,
-        "West" => PierSideLabel.West,
-        _ => null
-    };
-
-    public string ReadOriginal()
-    {
-        OnRead?.Invoke();
-        return FailRead ? throw new InvalidOperationException("serial read failed") : OriginalSetting ??= Setting;
-    }
-
-    public Task PrepareAsync(PierSideLabel side, CancellationToken token)
-    {
-        if (!Supported)
-        {
-            throw new ConeErrorException("PierSideUnsupported", UnsupportedReason);
-        }
-
-        ReadOriginal();
-        Setting = side.ToString();
-        Prepares++;
-        return Task.CompletedTask;
-    }
-
-    public Task RestoreAsync()
-    {
-        if (FailRestore)
-        {
-            throw new InvalidOperationException("restore failed");
-        }
-
-        if (OriginalSetting != null)
-        {
-            Setting = OriginalSetting;
-        }
-
-        return Task.CompletedTask;
-    }
-
-    public Task RestoreToAsync(string setting)
-    {
-        Setting = setting;
-        return Task.CompletedTask;
     }
 }
 
@@ -357,7 +260,6 @@ public sealed class FakeImager : IConeImager
     public Func<int, double> NoiseArcmin { get; set; } = _ => 0.0;
 
     public int AbortCount { get; private set; }
-    public int Calls => calls;
 
     public async Task<SolveOutcome> CaptureAndSolveAsync(double exposureSeconds, double hintRaHours, double hintDecDegrees, CancellationToken token)
     {
@@ -383,42 +285,36 @@ public sealed class FakeImager : IConeImager
     public void AbortExposure() => AbortCount++;
 }
 
-/// <summary>The automated test rig: a mount at 50° N, 10° E, at night, with a known tube tilt.</summary>
+/// <summary>The test rig: a mount at 50° N, 10° E, at night, with a known tube tilt.</summary>
 public sealed class AutoRig : IDisposable
 {
     public static readonly DateTime Night = new(2026, 10, 14, 21, 0, 0, DateTimeKind.Utc);
 
-    public AutoRig(double tiltArcmin = 5.0, PierSideLabel startSide = PierSideLabel.East, double pastMeridian = 2.5)
+    public static readonly PairTiming Timing = new(SlewSeconds: 120, FlipSeconds: 90, SettleSeconds: 2, ExposureSeconds: 5, SolveSeconds: 30);
+
+    public AutoRig(double tiltArcmin = 5.0, bool tracking = true)
     {
         Directory = Path.Combine(Path.GetTempPath(), "cone-error-tests-" + Guid.NewGuid().ToString("N"));
         Store = new ConeErrorStore(Directory);
         Clock = new FakeClock(Night);
-        Sun = new FakeSun(10.0);
         World = new ConeForwardModel { LatitudeDegrees = 50.0, TiltAwayFromSaddleArcmin = tiltArcmin };
-        PierSide = new FakePierSide();
-        Mount = new FakeMount(Clock, 50.0, 10.0, startSide, 1.0, 20.0, tracking: true) { PierSide = PierSide };
+        Mount = new FakeMount(Clock, 10.0, PierSideLabel.East, 1.0, 20.0, tracking);
         Imager = new FakeImager(Mount, Clock, World);
-        Limits = new LimitSet { MinAltitudeDegrees = 20.0, PinsPastMeridianDegrees = pastMeridian, SunExclusionDegrees = 30.0 };
     }
 
     public string Directory { get; }
     public ConeErrorStore Store { get; }
     public FakeClock Clock { get; }
-    public FakeSun Sun { get; }
     public ConeForwardModel World { get; }
-    public FakePierSide PierSide { get; }
     public FakeMount Mount { get; }
     public FakeImager Imager { get; }
-    public LimitSet Limits { get; set; }
 
-    public static readonly PairTiming Timing = new(SlewSeconds: 120, FlipSeconds: 90, SettleSeconds: 2, ExposureSeconds: 5, SolveSeconds: 30);
+    public static ProfileFacts Profile => new("test", "Test", 50.0, 10.0, null, 5.0, 10.0, 0.0, 5.0, 400.0, "ASTAP", null);
 
-    public AutoMeasurementSession Session(int repetitions = 4, bool askPierLabels = false, double maxAbsHa = 2.5, bool normalSidesOnly = false) => new(
+    public AutoMeasurementSession Session(int repetitions = 3, bool askPierLabels = false, double flipAfterMinutes = 5.0, double minAltitude = 20.0) => new(
         Mount,
-        PierSide,
         Imager,
         Clock,
-        Sun,
         Store,
         new AutoRunOptions
         {
@@ -427,20 +323,18 @@ public sealed class AutoRig : IDisposable
             ExposureSeconds = 5.0,
             DovetailMm = 200.0,
             Timing = Timing,
-            Limits = Limits,
             LatitudeDegrees = 50.0,
-            MaxAbsHourAngleDegrees = maxAbsHa,
+            MinAltitudeDegrees = minAltitude,
+            FlipAfterMinutes = flipAfterMinutes,
             AskPierLabels = askPierLabels,
-            NormalSidesOnly = normalSidesOnly,
             MountKey = "test|Fake mount",
-            Profile = new ProfileFacts("test", "Test", 50.0, 10.0, null, 10.0, 0.0, 5.0, 400.0, "ASTAP", null)
-        },
-        watchdogLoop: false);
+            Profile = Profile
+        });
 
     public static async Task<SessionStatus> Run(AutoMeasurementSession session)
     {
         session.Start();
-        await session.Completion.WaitAsync(TimeSpan.FromSeconds(20));
+        await session.Completion.WaitAsync(TimeSpan.FromSeconds(30));
         return session.GetStatus();
     }
 
