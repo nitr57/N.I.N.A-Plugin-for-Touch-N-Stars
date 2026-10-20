@@ -357,7 +357,7 @@ public sealed class AutoMeasurementSession
         {
             double expectedIn = (side == first ? slew : timing.FlipSeconds) + timing.SettleSeconds + timing.ExposureSeconds / 2.0;
             token.ThrowIfCancellationRequested();
-            SideSample sample = await MeasureSideAsync(p, side, ra, dec, expectedIn, token);
+            SideSample sample = await MeasureSideAsync(p, side, ra, dec, expectedIn, canArriveAtOnce: side == first, token);
             if (!sample.Ok)
             {
                 lock (sync)
@@ -393,7 +393,8 @@ public sealed class AutoMeasurementSession
         public static SideSample Failed(string problem) => new(false, double.NaN, double.NaN, problem);
     }
 
-    private async Task<SideSample> MeasureSideAsync(int p, PierSideLabel side, double ra, double dec, double expectedInSeconds, CancellationToken token)
+    /// <param name="canArriveAtOnce">A goto that keeps the pier side can arrive at once: check the limits at the command too.</param>
+    private async Task<SideSample> MeasureSideAsync(int p, PierSideLabel side, double ra, double dec, double expectedInSeconds, bool canArriveAtOnce, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         DateTime now = clock.UtcNow;
@@ -427,6 +428,22 @@ public sealed class AutoMeasurementSession
             return SideSample.Failed(LimitValidator.Describe(check.Violations) + " Pair skipped.");
         }
 
+        // the limits over the whole sample, as in the plan: from the goto (when it can be quick) to the end of the solve
+        IReadOnlyList<LimitViolation> window = TargetPlanner.WindowViolations(
+            options.Limits,
+            side,
+            ra,
+            dec,
+            options.LatitudeDegrees,
+            snap.LocalSiderealTimeHours,
+            canArriveAtOnce ? 0.0 : expectedInSeconds,
+            expectedInSeconds + options.Timing.ExposureSeconds / 2.0 + options.Timing.SolveSeconds,
+            suns[0]);
+        if (window.Count > 0)
+        {
+            return SideSample.Failed(LimitValidator.Describe(window) + " Pair skipped.");
+        }
+
         SetPhase(SessionPhase.Slewing, $"Pair {p + 1}: {(side == currentSide ? "slewing" : "flipping")} to the {side.ToString().ToLowerInvariant()} pier side");
         await pierSide.PrepareAsync(side, token);
         token.ThrowIfCancellationRequested();
@@ -442,6 +459,7 @@ public sealed class AutoMeasurementSession
 
         token.ThrowIfCancellationRequested();
         MountSnapshot arrived = mount.Snapshot();
+        RequireTracking(arrived, side);
         if (arrived.Side != side)
         {
             throw new ConeErrorException(
@@ -468,6 +486,7 @@ public sealed class AutoMeasurementSession
         {
             SetPhase(SessionPhase.Exposing, $"Pair {p + 1}, {side.ToString().ToLowerInvariant()} side: exposing and solving{(attempt > 0 ? " (second try)" : "")}");
             MountSnapshot before = mount.Snapshot();
+            RequireTracking(before, side);
             SolveOutcome solved = await imager.CaptureAndSolveAsync(options.ExposureSeconds, ra, dec, token);
             MountSnapshot after = mount.Snapshot();
             token.ThrowIfCancellationRequested();
@@ -500,6 +519,20 @@ public sealed class AutoMeasurementSession
         }
 
         return SideSample.Failed(problem);
+    }
+
+    /// <summary>
+    /// A mount that stops tracking (OnStepX does at its meridian limit, and reports the goto as done)
+    /// drifts through every exposure; stop with the reason instead of failing sample after sample.
+    /// </summary>
+    private static void RequireTracking(MountSnapshot snapshot, PierSideLabel side)
+    {
+        if (snapshot is { Connected: true, Tracking: false })
+        {
+            throw new ConeErrorException(
+                "TrackingStopped",
+                $"The mount stopped tracking on the {side.ToString().ToLowerInvariant()} pier side, most likely at its meridian limit. The measurement stopped; check the mount's limits.");
+        }
     }
 
     private async Task AskPierLabelsAsync(CancellationToken token)

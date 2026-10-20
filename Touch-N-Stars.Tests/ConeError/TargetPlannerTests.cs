@@ -128,6 +128,33 @@ public class TargetPlannerTests
     }
 
     [Fact]
+    public void AnEastSampleThatIsPastTheLimitAtTheGotoFallsBackToTheNormalSides()
+    {
+        // the 2026-10-20 UMi run: 1° east limit, 20 s settle; the counterweight-up East sample is 0.34°
+        // past the meridian at the planned exposure but 1.0° past it when the goto arrives at once
+        var timing = new PairTiming(SlewSeconds: 140, FlipSeconds: 110, SettleSeconds: 20, ExposureSeconds: 2, SolveSeconds: 30);
+        PlannerInput input = Input(side: PierSideLabel.East);
+        input = new PlannerInput
+        {
+            NowUtc = input.NowUtc,
+            LocalSiderealTimeHours = input.LocalSiderealTimeHours,
+            LatitudeDegrees = input.LatitudeDegrees,
+            CurrentSide = PierSideLabel.East,
+            Repetitions = 3,
+            Timing = timing,
+            Limits = new LimitSet { MinAltitudeDegrees = 20.0, PinsPastMeridianDegrees = 2.5, MountPastMeridianEastDegrees = 1.0, MountPastMeridianWestDegrees = 2.5, SunExclusionDegrees = 30.0 },
+            SunAt = input.SunAt
+        };
+
+        AutoPlan plan = TargetPlanner.Plan(input);
+
+        Assert.True(plan.Ok, plan.Refusal ?? LimitValidator.Describe(plan.Violations));
+        Assert.True(plan.NormalSidesOnly);
+        Assert.All(plan.Steps, s => Assert.Empty(s.WindowViolations));
+        Assert.All(plan.Steps, s => Assert.True(s.Check.PastMeridianDegrees <= 0.0));
+    }
+
+    [Fact]
     public void ARoomyMeridianLimitKeepsTheAlternatingOrder()
     {
         Assert.False(TargetPlanner.Plan(Input(pastMeridian: 2.5)).NormalSidesOnly);

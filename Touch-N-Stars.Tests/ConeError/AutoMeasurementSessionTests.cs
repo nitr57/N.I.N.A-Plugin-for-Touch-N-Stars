@@ -157,6 +157,52 @@ public class AutoMeasurementSessionTests
     }
 
     [Fact]
+    public async Task AMountThatStopsTrackingAtItsOwnLimitStopsTheRun()
+    {
+        // the mount's limit is stricter than the one the session knows: it arrives, then stops tracking
+        using var rig = new AutoRig();
+        rig.Mount.MeridianLimitDegrees = 0.0;
+
+        SessionStatus status = await AutoRig.Run(rig.Session());
+
+        Assert.Equal(SessionPhase.Failed, status.Phase);
+        Assert.Equal("TrackingStopped", status.Error.Code);
+        Assert.Single(rig.Mount.Slews);
+        Assert.Equal("Best", rig.PierSide.Setting);
+    }
+
+    [Fact]
+    public async Task AGotoThatCouldArriveAtOncePastTheLimitIsSkipped()
+    {
+        // Pair 1 East first, counterweight up: within 0.6° at the planned exposure after a 2 min goto,
+        // but a goto that keeps the side can arrive at once, with the target still further east. Later
+        // pairs plan at most 30 s for that goto and stay within the limit.
+        using var rig = new AutoRig(tiltArcmin: 3.0);
+        rig.Limits = new LimitSet { MinAltitudeDegrees = 20.0, PinsPastMeridianDegrees = 2.5, MountPastMeridianEastDegrees = 0.6, MountPastMeridianWestDegrees = 2.5, SunExclusionDegrees = 30.0 };
+        rig.Mount.MeridianLimitDegrees = 0.6;
+
+        SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 3));
+
+        Assert.Equal(SessionPhase.Complete, status.Phase);
+        Assert.Contains("past the meridian", status.Pairs[0].Problem);
+        Assert.Equal(2, status.Result.PairsUsed);
+        Assert.Equal(4, rig.Mount.Slews.Count);
+        Assert.Equal(-3.0, status.Result.ConeArcmin, 0.05);
+    }
+
+    [Fact]
+    public async Task OnTheNormalSidesAStrictMountLimitIsNeverReached()
+    {
+        using var rig = new AutoRig(tiltArcmin: 3.0);
+        rig.Mount.MeridianLimitDegrees = 0.0;
+
+        SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 2, normalSidesOnly: true));
+
+        Assert.Equal(SessionPhase.Complete, status.Phase);
+        Assert.Equal(-3.0, status.Result.ConeArcmin, 0.05);
+    }
+
+    [Fact]
     public async Task TargetOutsideTheLimitsIsNeverSlewedTo()
     {
         using var rig = new AutoRig(pastMeridian: 0.05);

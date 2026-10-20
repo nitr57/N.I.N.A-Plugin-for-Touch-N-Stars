@@ -118,6 +118,9 @@ public sealed class FakeMount : IConeMount
     /// <summary>The mount keeps tracking when asked to stop.</summary>
     public bool RefuseTrackingOff { get; set; }
 
+    /// <summary>Like OnStepX: a goto that ends further past the meridian than this (degrees) stops tracking.</summary>
+    public double? MeridianLimitDegrees { get; set; }
+
 
     /// <summary>Degrees per second of a goto; the goto tracks meanwhile, like real drivers do.</summary>
     public double SlewSpeed { get; set; } = 2.0;
@@ -213,6 +216,10 @@ public sealed class FakeMount : IConeMount
                 ha = Spherical.HourAngle(Lst, ra);
                 Side = target;
                 AtHome = false;
+                if (MeridianLimitDegrees is { } limit && ConeMath.PastMeridianDegrees(Side, ha) > limit)
+                {
+                    Tracking = false;
+                }
             }
 
             // NINA waits the settle time with tracking still on
