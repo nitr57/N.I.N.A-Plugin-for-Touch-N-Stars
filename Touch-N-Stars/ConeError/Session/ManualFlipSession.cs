@@ -109,9 +109,6 @@ public sealed class ManualFlipSession
 
     public const string CapsWarning = "Cap the finder and the guide scope; never look through the eyepiece while the mount moves.";
 
-    public const string OverrideWarning =
-        "Sun check overridden: on its way the tube may pass {0:F0}° from the Sun. Cap every optic; nobody may look through the eyepiece or the finder.";
-
     private readonly IConeMount mount;
     private readonly IPierSideControl pierSide;
     private readonly IClock clock;
@@ -387,9 +384,9 @@ public sealed class ManualFlipSession
             warnings.Add(CollisionWarning);
         }
 
+        // An override is reported through SunPathOverridden, which the panel shows as its own banner.
         if (overridden)
         {
-            warnings.Insert(0, string.Format(System.Globalization.CultureInfo.InvariantCulture, OverrideWarning, check.PathSunSeparationDegrees));
             Logger.Warning($"ConeError: sun path check overridden by the user for a move to the {target} side; closest approach {check.PathSunSeparationDegrees:F1}°, radius {options.Limits.SunExclusionDegrees:F0}°");
         }
 

@@ -292,7 +292,7 @@ public class ManualFlipSessionTests
         Assert.False(refused.SunPathOverridden);
         Assert.True(overridden.Ok);
         Assert.True(overridden.SunPathOverridden);
-        Assert.Contains(overridden.Warnings, w => w.StartsWith("Sun check overridden"));
+        Assert.DoesNotContain(overridden.Warnings, w => w.Contains("Sun"));
         Assert.Equal(PierSideLabel.West, rig.Mount.Side);
     }
 
