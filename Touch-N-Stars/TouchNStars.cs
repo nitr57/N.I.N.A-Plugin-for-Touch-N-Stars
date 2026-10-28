@@ -7,6 +7,7 @@ using NINA.Equipment.Equipment.MyTelescope;
 using NINA.Image.Interfaces;
 using NINA.Plugin;
 using NINA.Plugin.Interfaces;
+using NINA.PlateSolving.Interfaces;
 using NINA.Profile.Interfaces;
 using NINA.Sequencer.Interfaces.Mediator;
 using NINA.Sequencer.Logic;
@@ -51,7 +52,8 @@ namespace TouchNStars {
         ISymbolBroker symbolBroker,
         IFocuserMediator focuser,
         IOptionsVM options,
-        IAdvancedGuider internalGuider) {
+        IAdvancedGuider internalGuider,
+        IPlateSolverFactory plateSolverFactory = null) {
 
         public readonly IDeepSkyObjectSearchVM DeepSkyObjectSearchVM = DeepSkyObjectSearchVM;
         public readonly IImageDataFactory ImageDataFactory = ImageDataFactory;
@@ -74,6 +76,8 @@ namespace TouchNStars {
         public readonly IOptionsVM Options = options;
         // pins: the internal guider (also while another guider is selected), exported by pins to plugins.
         public readonly IAdvancedGuider InternalGuider = internalGuider;
+        // Plate solving for the cone error measurement (never the centering solver, which syncs).
+        public readonly IPlateSolverFactory PlateSolverFactory = plateSolverFactory;
     }
 
     [Export(typeof(IPluginManifest))]
@@ -115,7 +119,8 @@ namespace TouchNStars {
                     ISymbolBroker symbolBroker,
                     IFocuserMediator focuserMediator,
                     IOptionsVM optionsVM,
-                    IAdvancedGuider internalGuider) {
+                    IAdvancedGuider internalGuider,
+                    IPlateSolverFactory plateSolverFactory) {
             if (Settings.Default.UpdateSettings) {
                 Settings.Default.Upgrade();
                 Settings.Default.UpdateSettings = false;
@@ -143,7 +148,8 @@ namespace TouchNStars {
                             symbolBroker,
                             focuserMediator,
                             optionsVM,
-                            internalGuider);
+                            internalGuider,
+                            plateSolverFactory);
 
             // Raw data for the app's histogram: tracks the prepared image and saved frame paths.
             Server.Services.RawImageService.Attach(imagingMediator, imageSaveMediator);
@@ -231,6 +237,8 @@ namespace TouchNStars {
             // Close any open Wanderer ETA handles instead of leaving them to process exit
             Server.Services.TilterService.Instance.Disconnect();
             Server.Services.RawImageService.Detach();
+            // Stop a running cone error measurement and restore the mount's settings
+            ConeError.Session.ConeErrorService.Instance.Shutdown();
             return base.Teardown();
         }
 

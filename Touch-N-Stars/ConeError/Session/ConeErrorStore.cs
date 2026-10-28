@@ -1,0 +1,220 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using NINA.Core.Utility;
+
+namespace TouchNStars.ConeError.Session;
+
+/// <summary>Settings of the cone error wizard (TnsCache/cone-error/settings.json).</summary>
+public sealed class ConeErrorSettings
+{
+    public const double DefaultSunExclusionDegrees = 30.0;
+    public const double MinSunExclusionDegrees = 15.0;
+
+    public double SunExclusionDegrees { get; set; } = DefaultSunExclusionDegrees;
+
+    /// <summary>Minimum altitude of the automated measurement.</summary>
+    public double AutoMinAltitudeDegrees { get; set; } = 20.0;
+
+    /// <summary>Minimum altitude of the daytime check (landmarks are low).</summary>
+    public double ManualMinAltitudeDegrees { get; set; } = 0.0;
+
+    /// <summary>Also check the RA-first and Dec-first paths of a flip against the Sun.</summary>
+    public bool StrictPath { get; set; }
+
+    public double? DovetailMm { get; set; }
+
+    public int Repetitions { get; set; } = 5;
+
+    public double? ExposureSeconds { get; set; }
+
+    /// <summary>Distance of the optical axis from the RA axis, for the parallax of the daytime estimate.</summary>
+    public double? AxisOffsetMm { get; set; }
+
+    /// <summary>Mounts whose pier side labels the user has confirmed against the counterweight position.</summary>
+    public List<string> VerifiedPierLabels { get; set; } = new();
+
+    /// <summary>Clamps values a client may have sent out of range.</summary>
+    public ConeErrorSettings Sanitized()
+    {
+        return new ConeErrorSettings
+        {
+            SunExclusionDegrees = Math.Clamp(double.IsNaN(SunExclusionDegrees) ? DefaultSunExclusionDegrees : SunExclusionDegrees, MinSunExclusionDegrees, 90.0),
+            AutoMinAltitudeDegrees = Math.Clamp(AutoMinAltitudeDegrees, 0.0, 80.0),
+            ManualMinAltitudeDegrees = Math.Clamp(ManualMinAltitudeDegrees, -10.0, 80.0),
+            StrictPath = StrictPath,
+            DovetailMm = DovetailMm is > 0 and < 2000 ? DovetailMm : null,
+            Repetitions = Math.Clamp(Repetitions, 2, 10),
+            ExposureSeconds = ExposureSeconds is > 0 and <= 120 ? ExposureSeconds : null,
+            AxisOffsetMm = AxisOffsetMm is > 0 and < 2000 ? AxisOffsetMm : null,
+            VerifiedPierLabels = (VerifiedPierLabels ?? new List<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList()
+        };
+    }
+}
+
+/// <summary>One east/west pair of the automated measurement.</summary>
+public sealed class ConePairRecord
+{
+    public int Index { get; set; }
+    public double RightAscensionHours { get; set; }
+    public double DeclinationDegrees { get; set; }
+    public double? DeltaRaEastArcmin { get; set; }
+    public double? DeltaRaWestArcmin { get; set; }
+
+    /// <summary>ΔDec(W) − ΔDec(E): a Dec index error shows here, not in the cone.</summary>
+    public double? DeltaDecWestMinusEastArcmin { get; set; }
+
+    public double? ConeArcmin { get; set; }
+    public bool Rejected { get; set; }
+    public string Problem { get; set; }
+}
+
+/// <summary>A finished measurement, kept for the before/after comparison (TnsCache/cone-error/results.json).</summary>
+public sealed class ConeResultRecord
+{
+    public string Id { get; set; }
+
+    /// <summary>"auto" (plate solves) or "manual" (daytime estimate).</summary>
+    public string Mode { get; set; }
+
+    public DateTime TimestampUtc { get; set; }
+    public string ProfileId { get; set; }
+    public string ProfileName { get; set; }
+    public string MountName { get; set; }
+    public double DeclinationDegrees { get; set; }
+    public double? DovetailMm { get; set; }
+    public double ConeArcmin { get; set; }
+    public double? StdDevArcmin { get; set; }
+    public double? StdErrorArcmin { get; set; }
+    public double? MedianArcmin { get; set; }
+    public int PairsUsed { get; set; }
+    public int PairsTotal { get; set; }
+    public string Quality { get; set; }
+    public bool Significant { get; set; }
+    public double? ShimMm { get; set; }
+
+    /// <summary>"Front", "Rear" or "None".</summary>
+    public string ShimEnd { get; set; }
+
+    public double? ParallaxArcmin { get; set; }
+    public List<ConePairRecord> Pairs { get; set; } = new();
+}
+
+/// <summary>
+/// Written before the sessions change the mount's preferred pier side or tracking, cleared after the
+/// restore (TnsCache/cone-error/restore.json). A leftover journal means the plugin stopped mid-session;
+/// the UI then offers to restore. Restoring only changes settings, it never moves the mount.
+/// </summary>
+public sealed class RestoreJournal
+{
+    public DateTime CreatedUtc { get; set; }
+    public string MountName { get; set; }
+    public string Mode { get; set; }
+
+    /// <summary>The preferred pier side before the session, as the pier side control reported it; null if unchanged.</summary>
+    public string PreferredPierSide { get; set; }
+
+    /// <summary>Tracking before the session; null if the session does not change it.</summary>
+    public bool? Tracking { get; set; }
+}
+
+/// <summary>JSON files of the wizard, in one directory, each written under a lock.</summary>
+public sealed class ConeErrorStore
+{
+    public const int MaxResults = 50;
+
+    private static readonly JsonSerializerOptions Json = new() { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    private readonly object fileLock = new();
+
+    public ConeErrorStore(string directory)
+    {
+        Directory = directory;
+    }
+
+    public string Directory { get; }
+
+    public static string DefaultDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NINA", "TnsCache", "cone-error");
+
+    private string SettingsPath => Path.Combine(Directory, "settings.json");
+    private string ResultsPath => Path.Combine(Directory, "results.json");
+    private string JournalPath => Path.Combine(Directory, "restore.json");
+
+    public ConeErrorSettings LoadSettings() => (Read<ConeErrorSettings>(SettingsPath) ?? new ConeErrorSettings()).Sanitized();
+
+    public ConeErrorSettings SaveSettings(ConeErrorSettings settings)
+    {
+        ConeErrorSettings clean = settings.Sanitized();
+        Write(SettingsPath, clean);
+        return clean;
+    }
+
+    public List<ConeResultRecord> LoadResults() => Read<List<ConeResultRecord>>(ResultsPath) ?? new List<ConeResultRecord>();
+
+    public void AddResult(ConeResultRecord result)
+    {
+        lock (fileLock)
+        {
+            List<ConeResultRecord> results = LoadResults();
+            results.Add(result);
+            Write(ResultsPath, results.OrderByDescending(r => r.TimestampUtc).Take(MaxResults).OrderBy(r => r.TimestampUtc).ToList());
+        }
+    }
+
+    /// <summary>The latest earlier result of the same mode for the same profile and mount, for before/after.</summary>
+    public ConeResultRecord PreviousResult(ConeResultRecord current)
+    {
+        return LoadResults()
+            .Where(r => r.Id != current.Id && r.Mode == current.Mode && r.ProfileId == current.ProfileId && r.MountName == current.MountName && r.TimestampUtc < current.TimestampUtc)
+            .OrderByDescending(r => r.TimestampUtc)
+            .FirstOrDefault();
+    }
+
+    public RestoreJournal LoadJournal() => Read<RestoreJournal>(JournalPath);
+
+    public void SaveJournal(RestoreJournal journal) => Write(JournalPath, journal);
+
+    public void ClearJournal()
+    {
+        lock (fileLock)
+        {
+            try
+            {
+                File.Delete(JournalPath);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"ConeError: could not delete the restore journal: {ex.Message}");
+            }
+        }
+    }
+
+    private T Read<T>(string path) where T : class
+    {
+        lock (fileLock)
+        {
+            try
+            {
+                return File.Exists(path) ? JsonSerializer.Deserialize<T>(File.ReadAllText(path), Json) : null;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"ConeError: could not read {path}: {ex.Message}");
+                return null;
+            }
+        }
+    }
+
+    private void Write<T>(string path, T value)
+    {
+        lock (fileLock)
+        {
+            System.IO.Directory.CreateDirectory(Directory);
+            string temp = path + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(value, Json));
+            File.Move(temp, path, overwrite: true);
+        }
+    }
+}

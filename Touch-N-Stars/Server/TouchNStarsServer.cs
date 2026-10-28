@@ -80,7 +80,8 @@ namespace TouchNStars.Server {
                 .WithController<StellariumLandscapeController>()
                 .WithController<HipsSurveyController>()  // Atlas survey downloads (DSS, NSNS)
                 .WithController<NightSummaryController>()
-                .WithController<GroundStationController>());
+                .WithController<GroundStationController>()
+                .WithController<ConeErrorController>());  // Cone error measurement wizard
             WebServer = WebServer.WithModule(new MountControlSocket("/ws/mount-control")); // Manual (press-hold) mount slewing, INDI-direct
             WebServer = WebServer.WithModule(new InternalGuiderSocket("/ws/internal-guider")); // Live feed of the pins internal guider
             WebServer = WebServer.WithStaticFolder(
