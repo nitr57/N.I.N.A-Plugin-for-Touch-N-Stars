@@ -154,6 +154,9 @@ namespace TouchNStars {
             // Raw data for the app's histogram: tracks the prepared image and saved frame paths.
             Server.Services.RawImageService.Attach(imagingMediator, imageSaveMediator);
 
+            // Livestack's default working directory is the temp path, a RAM disk on current Linux.
+            Server.Services.LivestackSettingsService.Attach(profileService);
+
             UpdateDefaultPortCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(() => {
                 Port = CachedPort;
                 CachedPort = Port; // This may look useless, but that way the visibility only changes when cachedPort changes and not when the user enters a new port
@@ -237,6 +240,7 @@ namespace TouchNStars {
             // Close any open Wanderer ETA handles instead of leaving them to process exit
             Server.Services.TilterService.Instance.Disconnect();
             Server.Services.RawImageService.Detach();
+            Server.Services.LivestackSettingsService.Detach();
             // Stop a running cone error measurement and restore the mount's settings
             ConeError.Session.ConeErrorService.Instance.Shutdown();
             return base.Teardown();
