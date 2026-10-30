@@ -4,6 +4,7 @@ using EmbedIO.Routing;
 using EmbedIO.WebApi;
 using NINA.Core.Utility;
 using NINA.Equipment.Equipment.MyTelescope;
+using NINA.Equipment.Interfaces;
 using NINA.INDI;
 using NINA.INDI.Devices;
 using NINA.INDI.Model;
@@ -14,6 +15,7 @@ using System.IO;
 using System.IO.Ports;
 using System.Linq;
 using System.Threading.Tasks;
+using TouchNStars.Server.Services;
 
 namespace TouchNStars.Server.Controllers;
 
@@ -169,7 +171,13 @@ public class INDIController : WebApiController
                 string.IsNullOrWhiteSpace(device) ? null : device);
             if (mount == null)
             {
-                return ErrorResponse("No INDI mount is currently connected", 404);
+                if (GenericMount.Connected(device) is { } generic)
+                {
+                    HttpContext.Response.StatusCode = 200;
+                    return new ApiResponse { Success = true, Response = GenericMount.Capability(generic), StatusCode = 200, Type = "INDIMountSlewRates" };
+                }
+
+                return ErrorResponse("No mount is currently connected", 404);
             }
 
             var capability = mount.GetSlewRateCapability();
@@ -225,7 +233,12 @@ public class INDIController : WebApiController
                 string.IsNullOrWhiteSpace(device) ? null : device);
             if (mount == null)
             {
-                return ErrorResponse("No INDI mount is currently connected", 404);
+                if (GenericMount.Connected(device) is { } generic)
+                {
+                    return SetGenericMountSlewRate(generic, body);
+                }
+
+                return ErrorResponse("No mount is currently connected", 404);
             }
 
             var capability = mount.GetSlewRateCapability();
@@ -261,6 +274,40 @@ public class INDIController : WebApiController
             Logger.Error($"Error setting INDI mount slew rate: {ex}");
             return ErrorResponse("An unexpected error occurred while setting the mount slew rate");
         }
+    }
+
+    /// <summary>
+    /// POST /api/indi/mount/slew-rate for a mount that is neither OnStepX nor INDI (e.g. ASCOM Alpaca): 'index' or
+    /// 'value' must match the kind GenericMount.Capability reports.
+    /// </summary>
+    private ApiResponse SetGenericMountSlewRate(ITelescope mount, Dictionary<string, object> body)
+    {
+        string error;
+        if (body != null && body.TryGetValue("index", out var indexObj)
+            && int.TryParse(indexObj?.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
+        {
+            if (!GenericMount.TrySelectIndex(mount, index, out error))
+            {
+                return ErrorResponse(error, 400);
+            }
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse { Success = true, Response = new { device = mount.DisplayName, index }, StatusCode = 200, Type = "INDIMountSlewRate" };
+        }
+
+        if (body != null && body.TryGetValue("value", out var valueObj)
+            && double.TryParse(valueObj?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+        {
+            if (!GenericMount.TrySelectValue(mount, value, out error))
+            {
+                return ErrorResponse(error, 400);
+            }
+
+            HttpContext.Response.StatusCode = 200;
+            return new ApiResponse { Success = true, Response = new { device = mount.DisplayName, value }, StatusCode = 200, Type = "INDIMountSlewRate" };
+        }
+
+        return ErrorResponse("Body must contain an integer 'index' (discrete) or a numeric 'value' (continuous)", 400);
     }
 
     /// <summary>

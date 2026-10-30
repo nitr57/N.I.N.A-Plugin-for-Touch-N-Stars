@@ -15,6 +15,7 @@
   migrate existing app-local landscapes without overwriting user content.
 - Atlas NSNS narrowband survey (CC BY-NC-SA 4.0): the survey endpoints take an optional `survey` (`dss` default, `nsns` colour composite ohs8, `nsns-ha`, `nsns-oiii`, `nsns-sii` single lines); NSNS tiles inside its Moc.fits coverage are fetched from simg.de, stored as JPEG q85 and served at `/celestia-atlas-data/surveys/nsns`; only one survey download runs at a time
 - `/api/sequence/move` moves items, triggers and conditions across containers: the target sibling may sit in another container, and a container `targetId` without `insertAfter` moves into it; the object keeps its id, children and settings, a container cannot be moved into itself and the start/target/end areas stay in place
+- Manual mount control works with mounts that are neither INDI nor pins' native OnStepX driver, e.g. ASCOM Alpaca: `/ws/mount-control` moves them through NINA's telescope mediator and reports parked or fixed axes as errors, and `/api/indi/mount/slew-rates` describes their AxisRates (one range continuous, fixed or gapped rates as discrete steps) for `POST /api/indi/mount/slew-rate`; previously the pad answered "No mount is currently connected"
 
 ## 1.4.0.1
 - fix(filesystem-preview): read the Bayer pattern from the file header, so OSC FITS/XISF frames offer the debayer option and render with their actual pattern
