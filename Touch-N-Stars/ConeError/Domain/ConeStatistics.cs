@@ -6,11 +6,14 @@ namespace TouchNStars.ConeError.Domain;
 
 public enum ConeQuality
 {
-    /// <summary>Fewer than two usable values.</summary>
+    /// <summary>No usable value.</summary>
     Insufficient,
     Good,
     Fair,
-    Poor
+    Poor,
+
+    /// <summary>One pair: the cone error and the shim advice, but no spread to rate.</summary>
+    Single
 }
 
 /// <summary>Summary of the per-pair cone errors (arcminutes) of one measurement.</summary>
@@ -78,7 +81,8 @@ public static class ConeStatistics
         double medianUsed = Median(used);
         if (used.Count < 2)
         {
-            return new ConeSummary(values.Count, used.Count, mean, double.NaN, double.NaN, medianUsed, rejected, ConeQuality.Insufficient, false);
+            // without a spread there is nothing to test against; one pair stands as measured
+            return new ConeSummary(values.Count, used.Count, mean, double.NaN, double.NaN, medianUsed, rejected, ConeQuality.Single, true);
         }
 
         double stdDev = Math.Sqrt(used.Sum(v => (v - mean) * (v - mean)) / (used.Count - 1));

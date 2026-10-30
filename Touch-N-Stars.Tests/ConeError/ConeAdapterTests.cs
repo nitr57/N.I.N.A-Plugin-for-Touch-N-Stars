@@ -255,7 +255,17 @@ public class ConeErrorStoreTests : IDisposable
         ConeErrorSettings settings = new ConeErrorStore(directory).LoadSettings();
 
         Assert.Equal(30.0, settings.SunExclusionDegrees);
-        Assert.Equal(5, settings.Repetitions);
+        Assert.Equal(1, settings.Repetitions);
+    }
+
+    [Fact]
+    public void RepetitionsBelowOneAreRaisedToOne()
+    {
+        var store = new ConeErrorStore(directory);
+
+        store.SaveSettings(new ConeErrorSettings { Repetitions = 0 });
+
+        Assert.Equal(1, store.LoadSettings().Repetitions);
     }
 
     [Fact]

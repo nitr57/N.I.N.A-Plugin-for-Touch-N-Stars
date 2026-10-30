@@ -590,7 +590,7 @@ public sealed class AutoMeasurementSession
             valid = pairs.Where(r => r.ConeArcmin.HasValue).ToList();
         }
 
-        int required = Math.Max(2, (int)Math.Ceiling(options.Repetitions / 2.0));
+        int required = Math.Max(1, (int)Math.Ceiling(options.Repetitions / 2.0));
         if (valid.Count < required)
         {
             Fail(

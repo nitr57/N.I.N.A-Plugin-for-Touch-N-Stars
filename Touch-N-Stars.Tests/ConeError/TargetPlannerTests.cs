@@ -76,11 +76,21 @@ public class TargetPlannerTests
     }
 
     [Theory]
-    [InlineData(1)]
+    [InlineData(0)]
     [InlineData(11)]
     public void RefusesRepetitionsOutOfRange(int repetitions)
     {
         Assert.NotNull(TargetPlanner.Plan(Input(repetitions: repetitions)).Refusal);
+    }
+
+    [Fact]
+    public void ASinglePairIsPlanned()
+    {
+        AutoPlan plan = TargetPlanner.Plan(Input(repetitions: 1));
+
+        Assert.True(plan.Ok, plan.Refusal ?? LimitValidator.Describe(plan.Violations));
+        Assert.Equal(2, plan.Steps.Count);
+        Assert.NotEqual(plan.Steps[0].Side, plan.Steps[1].Side);
     }
 
     [Fact]

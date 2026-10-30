@@ -139,13 +139,24 @@ public class ConeStatisticsTests
     }
 
     [Fact]
-    public void SingleValueIsInsufficient()
+    public void ASingleValueStandsAsMeasuredWithoutASpread()
     {
         ConeSummary summary = ConeStatistics.Summarize(new List<double> { 2.0 });
 
+        Assert.Equal(ConeQuality.Single, summary.Quality);
+        Assert.True(summary.Significant);
+        Assert.Equal(2.0, summary.Mean);
+        Assert.True(double.IsNaN(summary.StdDev));
+        Assert.True(double.IsNaN(summary.StdError));
+    }
+
+    [Fact]
+    public void NoValueIsInsufficient()
+    {
+        ConeSummary summary = ConeStatistics.Summarize(new List<double>());
+
         Assert.Equal(ConeQuality.Insufficient, summary.Quality);
         Assert.False(summary.Significant);
-        Assert.Equal(2.0, summary.Mean);
     }
 
     [Theory]

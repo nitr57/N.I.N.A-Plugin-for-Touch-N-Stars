@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using NINA.Core.Utility;
+using TouchNStars.ConeError.Domain;
 
 namespace TouchNStars.ConeError.Session;
 
@@ -26,7 +27,7 @@ public sealed class ConeErrorSettings
 
     public double? DovetailMm { get; set; }
 
-    public int Repetitions { get; set; } = 5;
+    public int Repetitions { get; set; } = 1;
 
     public double? ExposureSeconds { get; set; }
 
@@ -46,7 +47,7 @@ public sealed class ConeErrorSettings
             ManualMinAltitudeDegrees = Math.Clamp(ManualMinAltitudeDegrees, -10.0, 80.0),
             StrictPath = StrictPath,
             DovetailMm = DovetailMm is > 0 and < 2000 ? DovetailMm : null,
-            Repetitions = Math.Clamp(Repetitions, 2, 10),
+            Repetitions = Math.Clamp(Repetitions, TargetPlanner.MinRepetitions, TargetPlanner.MaxRepetitions),
             ExposureSeconds = ExposureSeconds is > 0 and <= 120 ? ExposureSeconds : null,
             AxisOffsetMm = AxisOffsetMm is > 0 and < 2000 ? AxisOffsetMm : null,
             VerifiedPierLabels = (VerifiedPierLabels ?? new List<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList()

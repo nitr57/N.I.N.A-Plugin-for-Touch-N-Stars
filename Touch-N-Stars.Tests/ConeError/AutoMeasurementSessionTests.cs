@@ -94,6 +94,36 @@ public class AutoMeasurementSessionTests
         Assert.Equal(2, status.Result.PairsUsed);
     }
 
+    [Theory]
+    [InlineData(5.0, "Rear")]
+    [InlineData(-5.0, "Front")]
+    public async Task ASinglePairGivesTheConeAndTheShimEnd(double tilt, string end)
+    {
+        using var rig = new AutoRig(tiltArcmin: tilt);
+
+        SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 1));
+
+        Assert.Equal(SessionPhase.Complete, status.Phase);
+        Assert.Equal(-tilt, status.Result.ConeArcmin, 0.05);
+        Assert.Equal(end, status.Result.ShimEnd);
+        Assert.Equal("Single", status.Result.Quality);
+        Assert.Null(status.Result.StdDevArcmin);
+        Assert.Equal(1, status.Result.PairsUsed);
+    }
+
+    [Fact]
+    public async Task OfTwoPairsOneIsEnough()
+    {
+        using var rig = new AutoRig(tiltArcmin: 3.0);
+        int failuresLeft = 2;
+        rig.Imager.Fail = (_, _) => failuresLeft-- > 0;
+
+        SessionStatus status = await AutoRig.Run(rig.Session(repetitions: 2));
+
+        Assert.Equal(SessionPhase.Complete, status.Phase);
+        Assert.Equal(1, status.Result.PairsUsed);
+    }
+
     [Fact]
     public async Task FailsWithTooFewPairsWhenNothingSolves()
     {

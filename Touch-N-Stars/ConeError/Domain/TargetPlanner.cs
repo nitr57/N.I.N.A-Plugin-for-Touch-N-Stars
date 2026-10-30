@@ -106,7 +106,7 @@ public sealed class AutoPlan
 public static class TargetPlanner
 {
     public const double MaxAbsDeclinationDegrees = 30.0;
-    public const int MinRepetitions = 2;
+    public const int MinRepetitions = 1;
     public const int MaxRepetitions = 10;
 
     /// <summary>Extra altitude kept above the minimum when the declination is suggested.</summary>
