@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using TouchNStars.Server.Services;
 
 namespace TouchNStars.Server.Controllers;
 
@@ -4732,6 +4733,13 @@ public class PinsController : WebApiController
                     StatusCode = 404,
                     Type = "Error"
                 };
+            }
+
+            // The calibration sweeps the lens's focus through its range: not while a sequence or a focusing job runs.
+            if (ImagingActivity.BusyReason(RigDevices.Focuser) is string busy)
+            {
+                HttpContext.Response.StatusCode = 409;
+                return new ApiResponse { Success = false, Error = busy, StatusCode = 409, Type = "Error" };
             }
 
             var calibrateMethod = lensControl.GetType().GetMethod(

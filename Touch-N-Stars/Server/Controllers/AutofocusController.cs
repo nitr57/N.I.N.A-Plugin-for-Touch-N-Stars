@@ -9,6 +9,7 @@ using System.Net.Http.Json;
 using System.Threading.Tasks;
 using TouchNStars.Server.Infrastructure;
 using TouchNStars.Server.Models;
+using TouchNStars.Server.Services;
 using TouchNStars.Utility;
 
 namespace TouchNStars.Server.Controllers;
@@ -34,6 +35,17 @@ public class AutofocusController : WebApiController
         }
         if (start)
         {
+            // HTTP 200 with Success false and the reason, as the app reads a refused start (backendErrors.js).
+            if (ImagingActivity.BusyReason(RigDevices.Camera | RigDevices.Focuser, ActivityNames.Autofocus) is string busy)
+            {
+                return new Dictionary<string, object>()
+                {
+                    { "Success", false },
+                    { "Error", busy },
+                    { "message", $"Fehler beim Starten des Autofokus: {busy}" },
+                };
+            }
+
             bool wasRunning = DataContainer.afRun;
             DataContainer.afRun = true;
             DataContainer.newAfGraph = false;

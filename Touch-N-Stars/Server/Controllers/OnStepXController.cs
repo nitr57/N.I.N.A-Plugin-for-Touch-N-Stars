@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Threading.Tasks;
 using TouchNStars.Server.Models;
+using TouchNStars.Server.Services;
 
 namespace TouchNStars.Server.Controllers;
 
@@ -118,6 +119,11 @@ public class OnStepXController : WebApiController
         if (INDIController.NativeOnStepXMount() is not { } mount)
         {
             return NotConnected();
+        }
+        // It stops tracking and clears the alignment: not under a running sequence or another job on the mount.
+        if (ImagingActivity.BusyReason(RigDevices.Mount) is string busy)
+        {
+            return Error(busy, 409);
         }
         return await Run(() =>
         {

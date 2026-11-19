@@ -488,26 +488,15 @@ public class HocusFocusController : WebApiController
     {
         try
         {
-            // A live run moves the focuser and takes exposures, so it must not start in the middle of a sequence.
-            if (ImagingActivity.IsSequenceRunning())
+            // A live run moves the focuser and takes exposures: not in the middle of a sequence, the optimizer's live
+            // sweep (the desktop wizard is modal, so the two never overlap there) or another job on these devices.
+            if (ImagingActivity.BusyReason(RigDevices.Camera | RigDevices.Focuser, ActivityNames.InspectorAnalysis) is string busy)
             {
                 HttpContext.Response.StatusCode = 409;
                 return new Dictionary<string, object>()
                 {
                     { "Success", false },
-                    { "Error", ImagingActivity.SequenceRunningMessage }
-                };
-            }
-
-            // The optimizer's live sweep drives the focuser too; the desktop wizard is modal, so the two never
-            // overlap there.
-            if (StarDetectionOptimizerSession.IsDrivingFocuser)
-            {
-                HttpContext.Response.StatusCode = 409;
-                return new Dictionary<string, object>()
-                {
-                    { "Success", false },
-                    { "Error", "The star detection optimizer is running a live sweep. Let it finish or cancel it first: both would drive the focuser." }
+                    { "Error", busy }
                 };
             }
 

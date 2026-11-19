@@ -261,10 +261,20 @@ public sealed class NinaObservatory : IObservatory
             Logger.Debug($"ConeError: reading the internal guider state failed: {ex.Message}");
         }
 
+        bool sequenceRunning = ImagingActivity.IsSequenceRunning();
+
+        // The sequence has its own precondition; anything else that holds the mount, or the mount or the camera.
+        string mountJob = sequenceRunning ? null : ImagingActivity.BusyReason(RigDevices.Mount, ActivityNames.ConeError);
+        string imagingJob = sequenceRunning || mountJob != null
+            ? null
+            : ImagingActivity.BusyReason(RigDevices.Mount | RigDevices.Camera, ActivityNames.ConeError);
+
         return new ObservatoryState(
             camera?.Connected == true,
             camera?.IsExposing == true,
-            ImagingActivity.IsSequenceRunning(),
-            guiding);
+            sequenceRunning,
+            guiding,
+            mountJob,
+            imagingJob);
     }
 }

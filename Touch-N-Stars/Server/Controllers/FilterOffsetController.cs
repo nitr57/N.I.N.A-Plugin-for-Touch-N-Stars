@@ -17,6 +17,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TouchNStars.Server.Infrastructure;
 using TouchNStars.Server.Models;
+using TouchNStars.Server.Services;
 using TouchNStars.Utility;
 
 namespace TouchNStars.Server.Controllers;
@@ -186,6 +187,14 @@ public partial class FilterOffsetController : WebApiController
         {
             HttpContext.Response.StatusCode = 400;
             return new ApiResponse { Success = false, Error = "No matching filters found in profile", StatusCode = 400, Type = "Error" };
+        }
+
+        // Autofocus, filter changes and exposures for every filter: not while something else uses those devices. Read
+        // before this run's own lock, which the busy check also takes through IsCalculationRunning.
+        if (ImagingActivity.BusyReason(RigDevices.Camera | RigDevices.Focuser | RigDevices.FilterWheel, ActivityNames.FilterOffset) is string busy)
+        {
+            HttpContext.Response.StatusCode = 409;
+            return new ApiResponse { Success = false, Error = busy, StatusCode = 409, Type = "Error" };
         }
 
         CancellationToken token;

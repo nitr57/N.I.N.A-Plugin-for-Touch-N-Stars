@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using EmbedIO;
 using EmbedIO.Routing;
 using NINA.Equipment.Equipment.MyGuider.Advanced;
+using NINA.Equipment.Equipment.MyTelescope;
 using NINA.Equipment.Interfaces;
 using TouchNStars.Server.Services;
 
@@ -48,7 +49,8 @@ public partial class InternalGuiderController
                     await SendError(400, "InvalidRequest", "'slew' must be stay, east or west.");
                     return;
                 }
-                string blocker = CalibrationSlew.Blocker(Service.Telescope?.GetInfo());
+                TelescopeInfo info = Service.Telescope?.GetInfo();
+                string blocker = CalibrationSlew.Blocker(info);
                 if (blocker != null)
                 {
                     await SendError(409, "Rejected", blocker);
@@ -65,6 +67,12 @@ public partial class InternalGuiderController
                 if (busy != null)
                 {
                     await SendError(409, "Rejected", busy, "coach.busy", new Dictionary<string, object>());
+                    return;
+                }
+                string problem = CalibrationSlew.StartProblem(info, side);
+                if (problem != null)
+                {
+                    await SendError(409, "Rejected", problem);
                     return;
                 }
                 slew = side;

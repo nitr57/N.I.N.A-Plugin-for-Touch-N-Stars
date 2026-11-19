@@ -189,9 +189,28 @@ public sealed class StarDetectionOptimizerSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// An Aberration Inspector analysis that takes exposures is in flight (a live run or an exposure analysis); false
+    /// for a replay of a saved run, which only re-reads its frames, and without HocusFocus.
+    /// </summary>
+    internal static bool InspectorCaptureInProgress()
+    {
+        var hocusFocus = Type.GetType(PluginTypeName);
+        if (hocusFocus == null || !InspectorAnalysisRunning(hocusFocus))
+        {
+            return false;
+        }
+
+        var inspectorVM = hocusFocus.GetProperty("InspectorVM", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+        var replay = inspectorVM?.GetType().GetProperty("RerunSavedAutoFocusAnalysisCommand")?.GetValue(inspectorVM);
+        return replay?.GetType().GetProperty("IsRunning")?.GetValue(replay) as bool? != true;
+    }
+
+    private bool InspectorAnalysisRunning() => InspectorAnalysisRunning(pluginType);
+
     // Any Aberration Inspector analysis in flight (live run, exposure analysis or saved-run replay). Read from its
     // private task field: its command availability is also false when a device is simply disconnected.
-    private bool InspectorAnalysisRunning()
+    private static bool InspectorAnalysisRunning(Type pluginType)
     {
         var inspectorVM = pluginType.GetProperty("InspectorVM", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
         var analyzeTask = inspectorVM?.GetType()
@@ -427,13 +446,14 @@ public sealed class StarDetectionOptimizerSession : IDisposable
         // Both of these take exposures and move the focuser: a live sweep, and a new sweep from the summary.
         var movesFocuser = commandName == "CaptureNewSweepCommand"
             || (commandName == "StartCommand" && Get(vm, "IsLive") as bool? == true);
-        if (movesFocuser && ImagingActivity.IsSequenceRunning())
+        if (movesFocuser && ImagingActivity.BusyReason(RigDevices.Camera | RigDevices.Focuser, ActivityNames.OptimizerSweep) is string busy)
         {
-            return ImagingActivity.SequenceRunningMessage;
+            return busy;
         }
+        // A replay of a saved run takes no exposures, but the optimizer and the inspector share HocusFocus's detector.
         if (movesFocuser && InspectorAnalysisRunning())
         {
-            return "An Aberration Inspector analysis is running. Let it finish or cancel it first: both would drive the focuser.";
+            return "An Aberration Inspector analysis is running. Let it finish or cancel it first.";
         }
         if (commandName == "AcceptCommand")
         {

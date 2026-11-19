@@ -154,7 +154,9 @@ public sealed record ObservatoryState(
     bool CameraConnected,
     bool CameraExposing,
     bool SequenceRunning,
-    bool InternalGuiderGuiding);
+    bool InternalGuiderGuiding,
+    string MountJobRunning = null,
+    string ImagingJobRunning = null);
 
 public interface IObservatory
 {

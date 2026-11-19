@@ -122,10 +122,10 @@ public static class FlatWizardService
             return (409, "Camera not connected");
         }
 
-        // The run would switch filters and the panel light under the sequence's lights.
-        if (ImagingActivity.IsSequenceRunning())
+        // The run would switch filters and the panel light under the sequence's lights, or under another job's.
+        if (ImagingActivity.BusyReason(RigDevices.Camera | RigDevices.FilterWheel | RigDevices.FlatPanel, ActivityNames.Flats) is string busy)
         {
-            return (409, "A sequence is running. Stop it before starting a flat run.");
+            return (409, busy);
         }
 
         lock (gate)

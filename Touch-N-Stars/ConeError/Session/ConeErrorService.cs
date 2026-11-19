@@ -201,6 +201,11 @@ public sealed class ConeErrorService
             common.Add("A sequence is running; stop it first.");
         }
 
+        if (state.MountJobRunning != null)
+        {
+            common.Add(state.MountJobRunning);
+        }
+
         if (state.InternalGuiderGuiding)
         {
             common.Add("The internal guider is guiding; stop guiding first.");
@@ -239,6 +244,12 @@ public sealed class ConeErrorService
 
         auto.AddRange(common);
         manualBlockers.AddRange(common);
+
+        // The manual check only moves the mount; the measurement also exposes.
+        if (state.MountJobRunning == null && state.ImagingJobRunning != null)
+        {
+            auto.Add(state.ImagingJobRunning);
+        }
 
         if (mount is { Connected: true, AtPark: false, Tracking: false })
         {

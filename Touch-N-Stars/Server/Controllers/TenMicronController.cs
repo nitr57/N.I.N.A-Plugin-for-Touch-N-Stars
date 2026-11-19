@@ -8,6 +8,7 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using TouchNStars.Server.Services;
 
 namespace TouchNStars.Server.Controllers;
 
@@ -293,6 +294,25 @@ public class TenMicronController : WebApiController
         }
         catch { return null; }
     }
+
+    /// <summary>A model build of the TenMicron plugin runs (it slews the mount and exposes); false without the plugin.</summary>
+    internal static bool IsModelBuildRunning()
+    {
+        if (TenMicronPluginType == null) return false;
+        try
+        {
+            var vm = GetMediatorHandler(GetBuilderMediator());
+            return vm != null && GetProp<bool>(vm, "BuildInProgress");
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning($"TenMicron: reading whether a model build runs failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private object BuildRunningError() => Error(
+        "A 10micron model build is running. It sets refraction correction and dual-axis tracking itself and slews to its points: change the mount's settings after it has finished.", 409);
 
     private static bool IsPluginLoaded() => TenMicronPluginType != null &&
                                             GetMountModelMediator() != null;
@@ -630,6 +650,7 @@ public class TenMicronController : WebApiController
     public async Task<object> SetDualAxisTracking()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        if (IsModelBuildRunning()) return BuildRunningError();
         try
         {
             var body = await HttpContext.GetRequestBodyAsStringAsync();
@@ -670,6 +691,7 @@ public class TenMicronController : WebApiController
     public async Task<object> SetRefractionCorrection()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        if (IsModelBuildRunning()) return BuildRunningError();
         try
         {
             var body = await HttpContext.GetRequestBodyAsStringAsync();
@@ -710,6 +732,7 @@ public class TenMicronController : WebApiController
     public object DisableUnattendedFlip()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        if (IsModelBuildRunning()) return BuildRunningError();
         try
         {
             var mountVMMediator = GetMountVMMediator();
@@ -747,6 +770,7 @@ public class TenMicronController : WebApiController
     public object ResetMeridianLimit()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        if (IsModelBuildRunning()) return BuildRunningError();
         try
         {
             var mountVMMediator = GetMountVMMediator();
@@ -837,6 +861,7 @@ public class TenMicronController : WebApiController
     public async Task<object> SetHorizonHigh()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        if (IsModelBuildRunning()) return BuildRunningError();
         try
         {
             var body = await HttpContext.GetRequestBodyAsStringAsync();
@@ -873,6 +898,7 @@ public class TenMicronController : WebApiController
     public async Task<object> SetHorizonLow()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        if (IsModelBuildRunning()) return BuildRunningError();
         try
         {
             var body = await HttpContext.GetRequestBodyAsStringAsync();
@@ -1482,6 +1508,11 @@ public class TenMicronController : WebApiController
     public object BuildModel()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        // It slews the mount and exposes: not under a running sequence or another job on the mount or the camera.
+        if (ImagingActivity.BusyReason(RigDevices.Mount | RigDevices.Camera, ActivityNames.TenMicronBuild) is string busy)
+        {
+            return Error(busy, 409);
+        }
         try
         {
             var builderMediator = GetBuilderMediator();
@@ -1576,6 +1607,8 @@ public class TenMicronController : WebApiController
     public async Task<object> LoadModel()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        // It changes the active pointing model: not under a running sequence, a build, a cone error measurement or a calibration slew.
+        if (ImagingActivity.BusyReason(RigDevices.Mount) is string busy) return Error(busy, 409);
         try
         {
             var name = await ReadStringField("name").ConfigureAwait(false);
@@ -1739,6 +1772,8 @@ public class TenMicronController : WebApiController
     public async Task<object> DeleteWorstStar()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        // It changes the active pointing model: not under a running sequence, a build, a cone error measurement or a calibration slew.
+        if (ImagingActivity.BusyReason(RigDevices.Mount) is string busy) return Error(busy, 409);
         try
         {
             int? expectedIndex = null;
@@ -1972,6 +2007,8 @@ public class TenMicronController : WebApiController
     public object ClearAlignment()
     {
         if (!IsPluginLoaded()) return PluginNotLoaded();
+        // It changes the active pointing model: not under a running sequence, a build, a cone error measurement or a calibration slew.
+        if (ImagingActivity.BusyReason(RigDevices.Mount) is string busy) return Error(busy, 409);
         try
         {
             if (!ModelEditGate.Wait(0))

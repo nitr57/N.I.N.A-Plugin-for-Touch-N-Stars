@@ -11,6 +11,7 @@ using EmbedIO.Routing;
 using EmbedIO.WebApi;
 using NINA.Core.Utility;
 using NINA.Equipment.Equipment.MyGuider.Advanced;
+using NINA.Equipment.Equipment.MyTelescope;
 using NINA.Equipment.Interfaces;
 using TouchNStars.Server.Services;
 using TouchNStars.Server.Models;
@@ -250,10 +251,21 @@ public partial class InternalGuiderController : WebApiController
                 {
                     return SendError(400, "InvalidRequest", "'slew' needs calibrate=true.");
                 }
-                string blocker = CalibrationSlew.Blocker(Service.Telescope?.GetInfo());
+                TelescopeInfo info = Service.Telescope?.GetInfo();
+                string blocker = CalibrationSlew.Blocker(info);
                 if (blocker != null)
                 {
                     return SendError(409, "Rejected", blocker);
+                }
+                // Before the start check: our own slew moves the mount too.
+                if (Service.CalibrationSlewInProgress)
+                {
+                    return SendError(409, "Rejected", "The mount is slewing to the calibration position.");
+                }
+                string problem = CalibrationSlew.StartProblem(info, side);
+                if (problem != null)
+                {
+                    return SendError(409, "Rejected", problem);
                 }
                 slew = side;
             }
