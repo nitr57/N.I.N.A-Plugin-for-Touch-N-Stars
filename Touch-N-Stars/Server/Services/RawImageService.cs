@@ -120,8 +120,9 @@ namespace TouchNStars.Server.Services {
             }
 
             string imageId = $"prepared-{sequence}";
-            return EncodeCachedAsync($"{imageId}|{ProfilePattern()}|{maxDim}|{gzip}", ct,
-                () => EncodeImageData(image, imageId, maxDim, gzip));
+            var bayer = ImagePreviewService.CaptureBayerSource.Read();
+            return EncodeCachedAsync($"{imageId}|{bayer.CacheKey}|{maxDim}|{gzip}", ct,
+                () => EncodeImageData(image, bayer, imageId, maxDim, gzip));
         }
 
         /// <summary>
@@ -153,9 +154,10 @@ namespace TouchNStars.Server.Services {
             }
 
             string imageId = $"file-{path}-{File.GetLastWriteTimeUtc(path).Ticks}";
-            return await EncodeCachedAsync($"{imageId}|{ProfilePattern()}|{maxDim}|{gzip}", ct, async () => {
+            var bayer = ImagePreviewService.CaptureBayerSource.Read();
+            return await EncodeCachedAsync($"{imageId}|{bayer.CacheKey}|{maxDim}|{gzip}", ct, async () => {
                 IImageData data = await LoadFileAsync(path).ConfigureAwait(false);
-                return EncodeImageData(data, imageId, maxDim, gzip);
+                return EncodeImageData(data, bayer, imageId, maxDim, gzip);
             }).ConfigureAwait(false);
         }
 
@@ -229,11 +231,10 @@ namespace TouchNStars.Server.Services {
         private static Task<byte[]> EncodeCachedAsync(string key, CancellationToken ct, Func<byte[]> encode) =>
             EncodeCachedAsync(key, ct, () => Task.FromResult(encode()));
 
-        // Part of the cache key of captured frames: their encoding follows the profile's bayer pattern.
-        private static BayerPatternEnum ProfilePattern() =>
-            TouchNStars.Mediators.Profile.ActiveProfile.CameraSettings.BayerPattern;
-
-        private static byte[] EncodeImageData(IImageData data, string imageId, int maxDim, bool gzip) {
+        // Captured frames: the encoding follows bayer, which is read once, before the encode gate, and is
+        // part of the cache key.
+        private static byte[] EncodeImageData(IImageData data, ImagePreviewService.CaptureBayerSource bayer,
+                                              string imageId, int maxDim, bool gzip) {
             int width = data.Properties.Width;
             int height = data.Properties.Height;
             ushort[] flat = data.Data.FlatArray;
@@ -241,7 +242,7 @@ namespace TouchNStars.Server.Services {
             // Frames NINA captured: the pattern the Advanced API's image history and NINA's preview use.
             SensorType pattern = SensorType.Monochrome;
             if (data.Properties.IsBayered) {
-                pattern = ImagePreviewService.ResolveCapturePattern(data);
+                pattern = ImagePreviewService.ResolveCapturePattern(data, bayer);
             }
 
             if (ImagePreviewService.IsDebayerablePattern(pattern)) {

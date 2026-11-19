@@ -202,16 +202,16 @@ namespace TouchNStars.Server.Services {
         /// Auto the frame's own pattern with its bayer offsets, else the connected camera's with its
         /// offsets. None, or Auto with no pattern anywhere, is monochrome (Monochrome: not debayerable).
         /// Only the eight 2x2 patterns count as the frame's own: a CMYG or LRGB frame, which NINA's
-        /// Debayer can't take, falls through to the camera.
+        /// Debayer can't take, falls through to the camera. <paramref name="source"/> is the profile
+        /// and camera state read once, which is also the cache key of the result.
         /// </summary>
-        public static SensorType ResolveCapturePattern(IImageData imageData) {
-            BayerPatternEnum profilePattern = TouchNStars.Mediators.Profile.ActiveProfile.CameraSettings.BayerPattern;
-            if (profilePattern == BayerPatternEnum.None) {
+        public static SensorType ResolveCapturePattern(IImageData imageData, CaptureBayerSource source) {
+            if (source.ProfilePattern == BayerPatternEnum.None) {
                 return SensorType.Monochrome;
             }
 
-            if (profilePattern != BayerPatternEnum.Auto) {
-                return (SensorType)profilePattern;
+            if (source.ProfilePattern != BayerPatternEnum.Auto) {
+                return (SensorType)source.ProfilePattern;
             }
 
             var frameCamera = imageData.MetaData.Camera;
@@ -219,12 +219,39 @@ namespace TouchNStars.Server.Services {
                 return ApplyOffsets(frameCamera.SensorType, frameCamera.BayerOffsetX, frameCamera.BayerOffsetY);
             }
 
-            var camera = TouchNStars.Mediators.Camera?.GetInfo();
-            if (camera?.Connected == true) {
-                return ApplyOffsets(camera.SensorType, camera.BayerOffsetX, camera.BayerOffsetY);
+            if (source.CameraConnected) {
+                return ApplyOffsets(source.CameraSensor, source.CameraOffsetX, source.CameraOffsetY);
             }
 
             return SensorType.Monochrome;
+        }
+
+        /// <summary>
+        /// What <see cref="ResolveCapturePattern"/> reads besides the frame: the profile's bayer pattern
+        /// and, with Auto, the connected camera's sensor type and offsets (its fallback).
+        /// </summary>
+        public sealed record CaptureBayerSource(
+            BayerPatternEnum ProfilePattern,
+            bool CameraConnected,
+            SensorType CameraSensor,
+            int CameraOffsetX,
+            int CameraOffsetY) {
+
+            public static CaptureBayerSource Read() {
+                BayerPatternEnum profilePattern = TouchNStars.Mediators.Profile.ActiveProfile.CameraSettings.BayerPattern;
+                if (profilePattern != BayerPatternEnum.Auto) {
+                    return new CaptureBayerSource(profilePattern, false, SensorType.Monochrome, 0, 0);
+                }
+
+                var camera = TouchNStars.Mediators.Camera?.GetInfo();
+                if (camera?.Connected != true) {
+                    return new CaptureBayerSource(profilePattern, false, SensorType.Monochrome, 0, 0);
+                }
+
+                return new CaptureBayerSource(profilePattern, true, camera.SensorType, camera.BayerOffsetX, camera.BayerOffsetY);
+            }
+
+            public string CacheKey => $"{ProfilePattern}:{CameraConnected}:{CameraSensor}:{CameraOffsetX}:{CameraOffsetY}";
         }
 
         // NINA's BayerPatternUtility (upstream #377) is newer than the NINA 3.1.2 packages of the
