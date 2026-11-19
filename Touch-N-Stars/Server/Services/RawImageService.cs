@@ -120,7 +120,7 @@ namespace TouchNStars.Server.Services {
             }
 
             string imageId = $"prepared-{sequence}";
-            return EncodeCachedAsync($"{imageId}|{maxDim}|{gzip}", ct,
+            return EncodeCachedAsync($"{imageId}|{ProfilePattern()}|{maxDim}|{gzip}", ct,
                 () => EncodeImageData(image, imageId, maxDim, gzip));
         }
 
@@ -153,7 +153,7 @@ namespace TouchNStars.Server.Services {
             }
 
             string imageId = $"file-{path}-{File.GetLastWriteTimeUtc(path).Ticks}";
-            return await EncodeCachedAsync($"{imageId}|{maxDim}|{gzip}", ct, async () => {
+            return await EncodeCachedAsync($"{imageId}|{ProfilePattern()}|{maxDim}|{gzip}", ct, async () => {
                 IImageData data = await LoadFileAsync(path).ConfigureAwait(false);
                 return EncodeImageData(data, imageId, maxDim, gzip);
             }).ConfigureAwait(false);
@@ -229,13 +229,22 @@ namespace TouchNStars.Server.Services {
         private static Task<byte[]> EncodeCachedAsync(string key, CancellationToken ct, Func<byte[]> encode) =>
             EncodeCachedAsync(key, ct, () => Task.FromResult(encode()));
 
+        // Part of the cache key of captured frames: their encoding follows the profile's bayer pattern.
+        private static BayerPatternEnum ProfilePattern() =>
+            TouchNStars.Mediators.Profile.ActiveProfile.CameraSettings.BayerPattern;
+
         private static byte[] EncodeImageData(IImageData data, string imageId, int maxDim, bool gzip) {
             int width = data.Properties.Width;
             int height = data.Properties.Height;
             ushort[] flat = data.Data.FlatArray;
 
+            // Frames NINA captured: the pattern the Advanced API's image history and NINA's preview use.
+            SensorType pattern = SensorType.Monochrome;
             if (data.Properties.IsBayered) {
-                var pattern = ImagePreviewService.ResolveBayerPattern(data);
+                pattern = ImagePreviewService.ResolveCapturePattern(data);
+            }
+
+            if (ImagePreviewService.IsDebayerablePattern(pattern)) {
                 ushort[][] rgb = RawImageEncoder.Superpixel(flat, width, height, pattern.ToString(), out int w, out int h);
                 return RawImageEncoder.Encode(rgb, w, h, data.Properties.BitDepth, maxDim, imageId,
                     width, height, isBayered: true, bayerPattern: pattern.ToString(), gzip);

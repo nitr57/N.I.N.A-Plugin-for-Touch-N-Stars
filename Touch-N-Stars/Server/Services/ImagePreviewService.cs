@@ -5,6 +5,9 @@ using System.Threading.Tasks;
 using NINA.Core.Enum;
 using NINA.Image.Interfaces;
 using NINA.Core.Utility;
+#if PINS
+using NINA.Image.ImageAnalysis;
+#endif
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
@@ -172,12 +175,13 @@ namespace TouchNStars.Server.Services {
         /// profile. NINA's own live view does it the other way round (ImageControlVM.cs), but that
         /// renders the connected camera's frame - the file browser routinely shows frames from
         /// another camera, or from a session where the profile has since changed, and there the
-        /// file's own BAYERPAT is the more trustworthy source.
+        /// file's own BAYERPAT is the more trustworthy source. Its XBAYROFF/YBAYROFF are applied as
+        /// NINA applies a driver's bayer offsets.
         /// </summary>
         public static SensorType ResolveBayerPattern(IImageData imageData) {
-            SensorType fromFile = imageData.MetaData.Camera.SensorType;
-            if (IsDebayerablePattern(fromFile)) {
-                return fromFile;
+            var fileCamera = imageData.MetaData.Camera;
+            if (IsDebayerablePattern(fileCamera.SensorType)) {
+                return ApplyOffsets(fileCamera.SensorType, fileCamera.BayerOffsetX, fileCamera.BayerOffsetY);
             }
 
             // BayerPatternEnum's values are deliberately kept identical to SensorType's, so the
@@ -190,6 +194,47 @@ namespace TouchNStars.Server.Services {
             // Debayer()'s own default - reached when a file is flagged bayered but names no usable
             // pattern anywhere, e.g. a raw whose converter reported no concrete phase.
             return SensorType.RGGB;
+        }
+
+        /// <summary>
+        /// The pattern for a frame NINA captured (the prepared image, a frame of the image history), as
+        /// NINA's own preview and the Advanced API pick it: a pattern set in the profile as it is; with
+        /// Auto the frame's own pattern with its bayer offsets, else the connected camera's with its
+        /// offsets. None, or Auto with no pattern anywhere, is monochrome (Monochrome: not debayerable).
+        /// Only the eight 2x2 patterns count as the frame's own: a CMYG or LRGB frame, which NINA's
+        /// Debayer can't take, falls through to the camera.
+        /// </summary>
+        public static SensorType ResolveCapturePattern(IImageData imageData) {
+            BayerPatternEnum profilePattern = TouchNStars.Mediators.Profile.ActiveProfile.CameraSettings.BayerPattern;
+            if (profilePattern == BayerPatternEnum.None) {
+                return SensorType.Monochrome;
+            }
+
+            if (profilePattern != BayerPatternEnum.Auto) {
+                return (SensorType)profilePattern;
+            }
+
+            var frameCamera = imageData.MetaData.Camera;
+            if (IsDebayerablePattern(frameCamera.SensorType)) {
+                return ApplyOffsets(frameCamera.SensorType, frameCamera.BayerOffsetX, frameCamera.BayerOffsetY);
+            }
+
+            var camera = TouchNStars.Mediators.Camera?.GetInfo();
+            if (camera?.Connected == true) {
+                return ApplyOffsets(camera.SensorType, camera.BayerOffsetX, camera.BayerOffsetY);
+            }
+
+            return SensorType.Monochrome;
+        }
+
+        // NINA's BayerPatternUtility (upstream #377) is newer than the NINA 3.1.2 packages of the
+        // Windows build, whose NINA ignores bayer offsets too.
+        private static SensorType ApplyOffsets(SensorType pattern, int offsetX, int offsetY) {
+#if PINS
+            return BayerPatternUtility.ApplyOffsets(pattern, offsetX, offsetY);
+#else
+            return pattern;
+#endif
         }
 
         // -------------------------------------------------------------------------
