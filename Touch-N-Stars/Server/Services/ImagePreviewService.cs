@@ -248,7 +248,12 @@ namespace TouchNStars.Server.Services {
                     return new CaptureBayerSource(profilePattern, false, SensorType.Monochrome, 0, 0);
                 }
 
-                return new CaptureBayerSource(profilePattern, true, camera.SensorType, camera.BayerOffsetX, camera.BayerOffsetY);
+                return new CaptureBayerSource(
+                    profilePattern,
+                    true,
+                    camera.SensorType,
+                    camera.BayerOffsetX,
+                    camera.BayerOffsetY);
             }
 
             public string CacheKey => $"{ProfilePattern}:{CameraConnected}:{CameraSensor}:{CameraOffsetX}:{CameraOffsetY}";
