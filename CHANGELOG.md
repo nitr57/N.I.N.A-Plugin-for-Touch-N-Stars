@@ -8,22 +8,33 @@
 - Internal guider API: `GET /api/internal-guider/logs` lists the guide logs of the internal guider (one per night, newest first, with size, last write, whether it is being written and the host's time zone) and `GET /api/internal-guider/logs/{name}` sends one as text, gzip-compressed when the client accepts it; both also while the guider is not connected; see `INTERNAL_GUIDER_API.md`
 - Internal guider API: `POST /api/internal-guider/coach/start?slew=stay|east|west` slews to a calibration position before the Guiding Coach starts, as before a calibration; Stop or `coach/cancel` cancel the slew; a running session, calibration or dark library build is refused before the mount moves; see `INTERNAL_GUIDER_API.md`
 - Internal guider API: `POST /api/internal-guider/coach/start` takes `exposureTrial` (default true) to switch the coach's shorter-exposure trials (E, E2) on or off; dismissing the one-time `hint.longExposure` hides it for good; see `INTERNAL_GUIDER_API.md`
-- Atlas: new survey `nsns-cont` (NSNS DR0.2 RGB continuum, rgb8), orders 3–5
-- Raw image data: `GET /api/raw-image/prepared`, `/api/raw-image/history` and `/api/raw-image/livestack` serve 16-bit preview planes plus an exact full-resolution histogram (65536 bins per channel) and statistics for the app's histogram and client-side stretch; OSC frames are superpixel-debayered, responses are gzip-compressed
-- Multi-mode flats: `GET /api/flats/status` also reports `BitDepth`, the bit depth of the image `CurrentADU` was measured on (null while there is no ADU), so the app can scale the ADU correctly for RAW frames, e.g. a 14-bit NEF while the camera profile says 16 bit
 - Internal guider API: `POST /api/internal-guider/start-guiding?calibrate=true&slew=stay|east|west` slews to a calibration position (5° from the meridian on the celestial equator, like PHD2's Calibration Assistant) before calibrating; `stay` keeps the mount's side of pier; `/status` reports `calibrationSlew` while it runs; see `INTERNAL_GUIDER_API.md`
 - Internal guider API: `POST /api/internal-guider/select-star` makes the star nearest a position in the guide frame the guide star while the guider is looping, for choosing the guide star by tapping it; see `INTERNAL_GUIDER_API.md`
+- Keep advertising the `_touchnstars._tcp` service and its active port on
+  Linux while sharing hostname ownership with the system Avahi daemon.
+- Manual mount control works with mounts that are neither INDI nor pins' native OnStepX driver, e.g. ASCOM Alpaca: `/ws/mount-control` moves them through NINA's telescope mediator and reports parked or fixed axes as errors, and `/api/indi/mount/slew-rates` describes their AxisRates (one range continuous, fixed or gapped rates as discrete steps) for `POST /api/indi/mount/slew-rate`; previously the pad answered "No mount is currently connected"
+
+## 1.6.3.0
+- Atlas: new survey `nsns-cont` (NSNS DR0.2 RGB continuum, rgb8), orders 3–5
+
+## 1.6.2.0
+- Flat assistant runs on the plugin side (`/api/flats/multimode`, `/api/flats/status`, `/api/flats/stop`, `/api/flats/confirm-cover`): one or more filters with AutoExposure, AutoBrightness or SkyFlat, then optional dark flats per successful filter with the determined exposure time and the right filter. The run keeps going while the app is closed; the status reports `Workflow: 2`, the phase, per-filter results, the live ADU and its bit depth. Before the darks the run waits for a cover confirmation unless a flip-flat panel can close itself. An optional target name is stamped on the run's flat and dark frames. Same routes as the PINS fork's multi-filter controller.
+- Linux/PINS builds define the `PINS` compile constant (NINA sources are ahead of the 3.1.2 packages, e.g. `ISymbolBroker`).
+- Raw image data (`/api/raw-image/prepared`, `/history`, `/livestack`): 16-bit preview planes plus an exact full-resolution histogram (65536 bins per channel) and statistics for the app's histogram and client-side stretch; OSC frames are superpixel-debayered, responses are gzip-compressed
+- Webapp: add AAPA Plugin
+- fix(phd2): no more "PHD2 not connected" ERROR in the log when a client opens before the PHD2 connection is up (#1467)
+- `/api/sequence/move` moves items, triggers and conditions across containers: the target sibling may sit in another container, and a container `targetId` without `insertAfter` moves into it; the object keeps its id, children and settings, a container cannot be moved into itself and the start/target/end areas stay in place
+
+## ## 1.6.0.0 
+- Atlas NSNS narrowband survey (CC BY-NC-SA 4.0): the survey endpoints take an optional `survey` (`dss` default, `nsns` colour composite ohs8, `nsns-ha`, `nsns-oiii`, `nsns-sii` single lines); NSNS tiles inside its Moc.fits coverage are fetched from simg.de, stored as JPEG q85 and served at `/celestia-atlas-data/surveys/nsns`; only one survey download runs at a time
+- Sequencer API (`/api/sequence/*`): the SequenceController now runs on NINA and exposes the sequence as a tree — catalogue endpoints (`items`, `triggers`, `conditions`, `date-time-providers`, `metadata`), sequence files (`files`, `load`, `save`, `delete`), editing (`add`, `duplicate`, `move`, `remove`, `set`, `fields`, `enable`, `clear`, `info`) and run control (`start`, `stop`, `reset`, `reset-status`, `skip-to-end`, `skip-current-item`, `current`, `current-running-item`)
+- New lightweight `/api/sequence/status` endpoint for polling the running sequence; item ids are kept in a thread-safe registry and the serializer is guarded against cycles
+- Added `tools/sequence-roundtrip.mjs` to test sequence load/serialize round trips against a running plugin
+
+## ## 1.5.0.0
 - Persistent Celestia Atlas data (landscapes, DSS survey) now lives in `NINA\TnsCache` next to the other plugin data; an existing `NINA\Touch-N-Stars` tree is moved there once
 - Atlas DSS survey download: new `/api/atlas/survey/*` endpoints (status, download, cancel, delete) fetch the DSS colour HiPS tile by tile onto the host as 512 px JPEG and serve it at `/celestia-atlas-data/surveys/dss` from the persistent data directory; resumable, one job at a time
 - Atlas DSS survey delete now accepts an optional `keepOrder` to downgrade to a lower order instead of always wiping the whole survey
-- Keep advertising the `_touchnstars._tcp` service and its active port on
-  Linux while sharing hostname ownership with the system Avahi daemon.
-- Package and serve the `celestia-atlas-data` application directory.
-- Keep generated Celestia Atlas landscapes in persistent N.I.N.A. user data and
-  migrate existing app-local landscapes without overwriting user content.
-- Atlas NSNS narrowband survey (CC BY-NC-SA 4.0): the survey endpoints take an optional `survey` (`dss` default, `nsns` colour composite ohs8, `nsns-ha`, `nsns-oiii`, `nsns-sii` single lines); NSNS tiles inside its Moc.fits coverage are fetched from simg.de, stored as JPEG q85 and served at `/celestia-atlas-data/surveys/nsns`; only one survey download runs at a time
-- `/api/sequence/move` moves items, triggers and conditions across containers: the target sibling may sit in another container, and a container `targetId` without `insertAfter` moves into it; the object keeps its id, children and settings, a container cannot be moved into itself and the start/target/end areas stay in place
-- Manual mount control works with mounts that are neither INDI nor pins' native OnStepX driver, e.g. ASCOM Alpaca: `/ws/mount-control` moves them through NINA's telescope mediator and reports parked or fixed axes as errors, and `/api/indi/mount/slew-rates` describes their AxisRates (one range continuous, fixed or gapped rates as discrete steps) for `POST /api/indi/mount/slew-rate`; previously the pad answered "No mount is currently connected"
 
 ## 1.4.0.1
 - fix(filesystem-preview): read the Bayer pattern from the file header, so OSC FITS/XISF frames offer the debayer option and render with their actual pattern
@@ -40,6 +51,108 @@
 ## 1.3.0.0
 - Generated Celestia Atlas landscapes are now stored in the persistent N.I.N.A. user data; existing app-local landscapes are migrated without overwriting user content
 - The `celestia-atlas-data` directory is now packaged and served
+
+## 1.2.7.6
+
+- Fixed PHD2 RPC responses being matched by id, to survive an event flood while guiding
+
+## 1.2.7.5
+
+- Fixed a missing DLL in the plugin package
+
+## 1.2.7.4
+
+- Added a Stellarium-Web landscape generator with automatic installation of new landscapes
+- Fixed landscape generator path parsing
+
+## 1.2.7.3
+
+- Added an adjustable image stretch slider to the PHD2 settings
+
+## 1.2.7.1
+
+- Added filesystem/filebrowser endpoints and a FITS analysis / plate solve endpoint
+- Added a generic proxy endpoint (`GET /api/proxy`)
+- Added an endpoint to read file content as text
+- Extended the plugin passthrough endpoints (plugin9-plugin59)
+- Fixed JSON serialization for NINA 3.2.0 compatibility
+
+## 1.2.7.0
+
+- Added LX200 GPS mount support
+
+## 1.2.6.0
+
+- Added INDI driver list endpoints
+
+## 1.2.5.0
+
+- Various PHD2 fixes
+
+## 1.2.4.0
+
+- Added PHD2 shared-memory (SHM) communication and profile management (create/rename/select) endpoints
+- Added reboot/shutdown support for PINS boxes and Linux
+
+## 1.2.3.2
+
+- Added Linux support
+
+## 1.2.3.0
+
+- Added a Metrics endpoint
+- Added Bahtinov mask focuser support
+
+## 1.2.2.0
+
+- Filtered AvalonDock panes out of dialog handling
+
+## 1.2.1.0
+
+- Added mDNS discovery for automatic server detection
+- Instance name now gets a suffix when the port changes
+
+## 1.2.0.0
+
+- Reworked dialog handling and the slew & center flow
+
+## 1.1.6.0
+
+- Added a Framing Assistant controller and Target Search endpoints
+- Standardized dialog handling (confirm/cancel/timeout) across mount actions
+- Added slew & center with cancel support
+- Added a Meridian Flip dialog with step tracking
+
+## 1.1.2.0 - 1.1.3.0
+
+- Added filter wheel and rotator endpoints
+- Added a Telescopius proxy integration
+- Fixed PHD2 connection stability issues
+
+## 1.1.1.0
+
+- Added an endpoint to save settings
+- Added autofocus-run detection
+
+## 1.1.0.0
+
+- Added comprehensive PHD2 guiding integration (REST API, star lost detection, parameter control, equipment status)
+- Reworked image loading (no longer mirror-inverted); added guide star image/stats endpoints
+
+## 1.0.5.0 - 1.0.9.0
+
+- Added Favorites API endpoints (including rotation info, persisted to favorites.json)
+- Reworked CORS handling (EmbedIO-based, preflight support)
+- Added automatic port discovery, advanced-API-port and version endpoints
+- Added Stellarium integration endpoints; fixed app reload routing (404 on refresh)
+- Added shutdown/restart of the host PC (incl. forced shutdown, and while PHD2 is running)
+- Added flats support, autofocus-finished indicator and AF watcher
+
+## 1.0.0.2 - 1.0.4.4
+
+- Initial REST API: proxy, network connection details, app endpoints, guiding start/stop, switch control
+- Made CORS configurable
+- Added Android app info
 
 ## 1.0.0.1
 

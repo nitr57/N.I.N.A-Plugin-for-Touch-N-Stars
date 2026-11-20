@@ -53,7 +53,7 @@
   <PropertyGroup />
   <Target Name="PostBuild" AfterTargets="PostBuildEvent" Condition="'$(UsePinsSource)' != 'true' and '$(SkipPluginDeployment)' != 'true'">
     <PropertyGroup>
-      <WindowsPluginDeployDir>$([System.IO.Path]::Combine($([System.Environment]::GetEnvironmentVariable('LOCALAPPDATA')), 'NINA', 'Plugins', '3.0.0', 'Touch ''N'' Stars'))</WindowsPluginDeployDir>
+      <WindowsPluginDeployDir>$(LOCALAPPDATA)\NINA\Plugins\3.0.0\Touch %27N%27 Stars</WindowsPluginDeployDir>
     </PropertyGroup>
     <Message Text="Copying plugin output to $(WindowsPluginDeployDir)" Importance="High" />
     <MakeDir Directories="$(WindowsPluginDeployDir)" />
