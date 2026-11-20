@@ -2580,13 +2580,13 @@ namespace TouchNStars.Server.Controllers
         {
             try
             {
-                Logger.Info($"DEBUG CloneSequenceItem: Source type={source.GetType().Name}");
+                Logger.Debug($"CloneSequenceItem: Source type={source.GetType().Name}");
 
                 if (source is ISequenceContainer container)
                 {
                     var triggersCount = (container as SequenceContainer)?.Triggers.Count ?? 0;
                     var conditionsCount = (container as SequenceContainer)?.Conditions.Count ?? 0;
-                    Logger.Info($"  Container has {container.Items.Count} items, {triggersCount} triggers, {conditionsCount} conditions");
+                    Logger.Debug($"  Container has {container.Items.Count} items, {triggersCount} triggers, {conditionsCount} conditions");
                 }
 
                 // For most items, use the built-in Clone() which handles code-generated patterns
@@ -2603,7 +2603,7 @@ namespace TouchNStars.Server.Controllers
                 {
                     var triggersCount = (cloned as SequenceContainer)?.Triggers.Count ?? 0;
                     var conditionsCount = (cloned as SequenceContainer)?.Conditions.Count ?? 0;
-                    Logger.Info($"  Cloned container has {clonedContainer.Items.Count} items, {triggersCount} triggers, {conditionsCount} conditions");
+                    Logger.Debug($"  Cloned container has {clonedContainer.Items.Count} items, {triggersCount} triggers, {conditionsCount} conditions");
                 }
 
                 // Ensure parent references are set correctly for all nested items

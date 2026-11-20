@@ -778,18 +778,21 @@ public sealed class HipsSurveyService
             Directory.CreateDirectory(Path.Combine(root, $"Norder{order}", $"Dir{dirStart}"));
         }
 
-        using SemaphoreSlim gate = new(ParallelDownloads);
         int consecutiveFailures = 0;
         Exception abortReason = null;
         using CancellationTokenSource abort = CancellationTokenSource.CreateLinkedTokenSource(token);
-
-        Task[] workers = missing.Select(async npix =>
+        ParallelOptions options = new()
         {
-            await gate.WaitAsync(abort.Token).ConfigureAwait(false);
-            try
+            MaxDegreeOfParallelism = ParallelDownloads,
+            CancellationToken = abort.Token
+        };
+
+        try
+        {
+            await Parallel.ForEachAsync(missing, options, async (npix, ct) =>
             {
-                abort.Token.ThrowIfCancellationRequested();
-                TileResult result = await DownloadTileAsync(root, order, npix, abort.Token).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+                TileResult result = await DownloadTileAsync(root, order, npix, ct).ConfigureAwait(false);
                 if (result.Success)
                 {
                     Interlocked.Exchange(ref consecutiveFailures, 0);
@@ -806,16 +809,7 @@ public sealed class HipsSurveyService
                         abort.Cancel();
                     }
                 }
-            }
-            finally
-            {
-                gate.Release();
-            }
-        }).ToArray();
-
-        try
-        {
-            await Task.WhenAll(workers).ConfigureAwait(false);
+            }).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (abortReason != null && !token.IsCancellationRequested)
         {

@@ -31,6 +31,9 @@ namespace TouchNStars.Server.Controllers;
 /// </summary>
 internal class FitsAnalysisController : WebApiController
 {
+    private static readonly SemaphoreSlim SolveGate = new(1, 1);
+    private static readonly TimeSpan SolveTimeout = TimeSpan.FromSeconds(110);
+
     private Task SendJson(object data, int statusCode = 200)
     {
         HttpContext.Response.StatusCode = statusCode;
@@ -147,6 +150,9 @@ internal class FitsAnalysisController : WebApiController
     [Route(HttpVerbs.Post, "/fits/analyze")]
     public async Task Analyze()
     {
+        using var timeout = new CancellationTokenSource(SolveTimeout);
+        using var solveCancel = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, HttpContext.CancellationToken);
+
         try
         {
             var body = await HttpContext.GetRequestDataAsync<Dictionary<string, object>>();
@@ -248,9 +254,44 @@ internal class FitsAnalysisController : WebApiController
             var blindSolver = PlateSolverFactory.GetBlindSolver(solveSettings);
             var imageSolver = new ImageSolver(plateSolver, blindSolver);
 
-            Logger.Info($"[FitsAnalysisController] Starting plate solve (FL={focalLength}mm, PS={pixelSize}µm, Bin={binning})");
-            var progress = new Progress<ApplicationStatus>();
-            var result = await imageSolver.Solve(imageData, parameter, progress, CancellationToken.None);
+            if (!SolveGate.Wait(0))
+            {
+                Logger.Info($"[FitsAnalysisController] Another FITS plate solve is running, refused: {fullPath}");
+                await SendJson(new FitsSolveResult
+                {
+                    Success = false,
+                    Error = "A plate solve of a FITS file is already running. Wait for it to finish."
+                }, 409);
+                return;
+            }
+
+            PlateSolveResult result;
+            try
+            {
+                Logger.Info($"[FitsAnalysisController] Starting plate solve (FL={focalLength}mm, PS={pixelSize}µm, Bin={binning})");
+                var progress = new Progress<ApplicationStatus>();
+
+                result = await imageSolver.Solve(imageData, parameter, progress, solveCancel.Token);
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            {
+                result = null;
+            }
+            finally
+            {
+                SolveGate.Release();
+            }
+
+            if (result?.Success != true && timeout.IsCancellationRequested)
+            {
+                Logger.Warning($"[FitsAnalysisController] Plate solve stopped after {SolveTimeout.TotalSeconds:F0} s: {fullPath}");
+                await SendJson(new FitsSolveResult
+                {
+                    Success = false,
+                    Error = $"The plate solve took longer than {SolveTimeout.TotalSeconds:F0} seconds and was stopped."
+                }, 504);
+                return;
+            }
 
             if (result.Success)
             {
